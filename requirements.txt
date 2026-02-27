@@ -1,0 +1,7 @@
+numpy
+tifffile
+PyQt5
+Pillow
+openslide-python
+openslide-bin
+zarr
