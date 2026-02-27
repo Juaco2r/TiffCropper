@@ -14,6 +14,7 @@ It supports:
 
 The Windows release requires **no Python installation**.
 
+![WSI Cropper Concept Screenshot](assets/screenshots/WSICropper_concept.png)
 ------------------------------------------------------------------------
 
 ## 🔬 Why TiffCropper?
@@ -63,6 +64,8 @@ Output file naming:
     original_name_crop_suffix.ome.tif
 
 If no suffix is provided, `"final"` is used.
+
+![WSI Cropper Screenshot](assets/screenshots/WSICropper.png)
 
 ------------------------------------------------------------------------
 
