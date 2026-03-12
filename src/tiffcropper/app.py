@@ -1,6 +1,10 @@
+from PyQt5.QtGui import QFont, QPixmap, QImage, QIcon
+import sys, os
 
-import os
-import sys
+def resource_path(relative_path):
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
 
 def _setup_openslide_dll_path():
     # When frozen with PyInstaller, binaries are unpacked under sys._MEIPASS
@@ -263,7 +267,8 @@ def crop_openslide_multilevel_robust(
 class CropWSIGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("🔬 WSI Cropper - TIFF / OME-TIFF / NDPI")
+        self.setWindowIcon(QIcon(resource_path("assets/icon/cropper.ico")))
+        self.setWindowTitle("WSI Cropper - TIFF / OME-TIFF / NDPI")
         self.setGeometry(100, 100, 980, 620)
         self.setStyleSheet("background-color: #f0f0f0;")
         self._tiff_via_openslide = False
