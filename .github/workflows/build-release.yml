@@ -1,13 +1,20 @@
-name: Build Windows Release
+name: Build TiffCropper
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
 
     steps:
       - name: Checkout repository
@@ -18,26 +25,59 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openslide-tools libopenslide0
+
+      - name: Install macOS system dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install openslide
+
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Locate openslide_bin
-        id: openslide
+      - name: Build Windows
+        if: runner.os == 'Windows'
         run: |
-          python -c "import openslide_bin, os; print(os.path.dirname(openslide_bin.__file__))" > openslide_path.txt
-          echo "path=$(type openslide_path.txt)" >> $env:GITHUB_OUTPUT
+          pyinstaller --clean --noconfirm TiffCropper.spec
 
-      - name: Build executable
+      - name: Build Linux
+        if: runner.os == 'Linux'
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed ^
-            --name TiffCropper ^
-            --add-data "${{ steps.openslide.outputs.path }};openslide_bin" ^
-            src\tiffcropper\app.py
+          pyinstaller --clean --noconfirm --name TiffCropper --windowed src/tiffcropper/app.py
 
-      - name: Upload Release Asset
-        uses: softprops/action-gh-release@v2
+      - name: Build macOS
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --clean --noconfirm --name TiffCropper --windowed src/tiffcropper/app.py
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/TiffCropper.exe -DestinationPath TiffCropper-Windows.zip
+
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          cd dist
+          zip -r ../TiffCropper-Linux.zip TiffCropper
+
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          zip -r ../TiffCropper-macOS.zip TiffCropper.app
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: dist/TiffCropper.exe
+          name: TiffCropper-${{ runner.os }}
+          path: |
+            TiffCropper-*.zip
