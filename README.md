@@ -1,221 +1,263 @@
 # TiffCropper
 
-### Robust ROI extraction for Whole Slide Images (WSI)
+### WSI Crop, Tile and Merge Tool for Digital Pathology Images
 
-TiffCropper is a standalone Windows application for extracting
-high-resolution Regions of Interest (ROIs) from large digital pathology
-images while preserving calibration metadata.
+TiffCropper is a standalone Windows application for working with large digital pathology and microscopy images. It supports ROI cropping, square tiling for efficient downstream processing, and reconstruction of tiled images.
 
-It supports:
-
--   TIFF (.tif, .tiff)
--   OME-TIFF (.ome.tif, .ome.tiff)
--   NDPI (Hamamatsu, via OpenSlide)
-
-The Windows release requires **no Python installation**.
+The Windows release is designed to run without a separate Python installation.
 
 ![WSI Cropper Concept Screenshot](assets/screenshots/WSICropper_concept.png)
-------------------------------------------------------------------------
 
-## 🔬 Why TiffCropper?
+---
 
-Whole Slide Images (WSI) are often multi-gigapixel and difficult to
-process interactively.\
-TiffCropper enables precise pixel-level ROI extraction while:
+## Main Features
 
--   Preserving physical resolution (DPI / µm per pixel)
--   Supporting OME-TIFF export
--   Handling multi-resolution pyramidal images
--   Writing BigTIFF outputs for large crops
--   Providing interactive preview
--   Recovering from partially corrupted pyramid tiles
+- Crop high-resolution ROIs from large WSI files.
+- Select the full image area automatically for whole-slide export/downsampling.
+- Downsample crops before saving.
+- Generate square tiles with optional overlap.
+- Bulk tile multiple images with the same parameters.
+- Add black or white padding to incomplete border tiles.
+- Save outputs as TIFF or JPEG.
+- Merge tiles automatically from names such as `ImageName_A1.tif`, `ImageName_B1.tif`, `ImageName_A2.tif`.
+- Merge tiles manually using a row/column grid when filenames do not encode tile position.
+- Preserve calibration metadata when available.
+- Support BigTIFF output and lossless DEFLATE compression.
 
-Designed for digital pathology and microscopy research workflows.
+---
 
-------------------------------------------------------------------------
+## Supported Input Formats
 
-## 📥 Download (v1.0)
+| Format | Backend | Notes |
+|---|---|---|
+| TIFF / pyramidal TIFF | tifffile / OpenSlide | Pyramid support when available |
+| OME-TIFF | tifffile | Physical pixel size preserved when available |
+| NDPI | OpenSlide | Requires OpenSlide binaries bundled in the Windows executable |
+| JPEG / PNG | Pillow | Mainly useful for tiles or simple raster inputs |
 
-Go to the **Releases** page and download:
+---
 
--   `TiffCropper.exe`
--   `TiffCropper_Protocol_v1.0.pdf`
+## Quick Start
 
-➡ No installation required.\
-➡ Fully offline application.
+1. Launch `TiffCropper.exe`.
+2. Select a mode from the top menu:
+   - `Crop`
+   - `Tiles`
+   - `Merge Tiles`
+3. Load one or more images.
+4. Configure parameters.
+5. Preview when needed.
+6. Save the result.
 
-------------------------------------------------------------------------
+---
 
-## 🚀 Quick Start
+## Crop Mode
 
-1.  Launch `TiffCropper.exe`
-2.  Click **Browse** and select a WSI file
-3.  Enter ROI coordinates:
-    -   **X** (horizontal start)
-    -   **Y** (vertical start)
-    -   **Width**
-    -   **Height**
-4.  (Optional) Click **Preview Crop**
-5.  Click **CROP & SAVE**
+Crop mode extracts one ROI from the selected image.
 
-Output file naming:
+Parameters:
 
-    original_name_crop_suffix.tif
-    original_name_crop_suffix.ome.tif
+- `X`: left coordinate in pixels.
+- `Y`: top coordinate in pixels.
+- `Width`: ROI width in pixels.
+- `Height`: ROI height in pixels.
+- `Select full area`: automatically sets `X=0`, `Y=0`, `Width=image width`, `Height=image height`.
+- `Downsample`: default `1`. A value of `2` saves the crop at half width and half height.
+- Output format: TIFF, OME-TIFF or JPEG.
 
-If no suffix is provided, `"final"` is used.
+Output examples:
 
-![WSI Cropper Screenshot](assets/screenshots/WSICropper.png)
+```text
+ImageName_crop_final.tif
+ImageName_crop_finalDS2.tif
+ImageName_crop_ROI1.ome.tif
+```
 
-------------------------------------------------------------------------
+---
 
-## 🖼 Supported Formats
+## Tiles Mode
 
-  Format     Backend                Notes
-  ---------- ---------------------- --------------------------------
-  TIFF       tifffile / OpenSlide   Pyramid support when available
-  OME-TIFF   tifffile               Physical size preserved
-  NDPI       OpenSlide              Multi-level pyramid
+Tiles mode creates square tiles from one image or multiple selected images.
 
-------------------------------------------------------------------------
+Parameters:
 
-## ⚙ Output Options
+- `Square tile size px`: default `1024`.
+- `Overlap`: percentage overlap between neighboring tiles. Default `0%`.
+- `Downsample`: default `1`. Applied after the original-resolution tile is extracted.
+- `Padding`: black or white padding for border tiles.
+- Output format: TIFF or JPEG.
 
-### Format
+Tiles are saved inside a subfolder with the same name as the image, created beside the input file.
 
--   TIFF (.tif)
--   OME-TIFF (.ome.tif)
+Naming convention:
 
-### Compression
+```text
+ImageName_A1.tif
+ImageName_B1.tif
+ImageName_A2.tif
+ImageName_A1Ov10.tif
+ImageName_A1Ov10DS2.tif
+```
 
-Optional **lossless DEFLATE compression** (recommended).
+Columns use letters (`A`, `B`, `C`, ...), rows use numbers (`1`, `2`, `3`, ...).
 
-### Large Output Support
+---
 
--   BigTIFF enabled
--   256×256 tiling
--   RGB photometric format
+## Merge Tiles Mode
 
-------------------------------------------------------------------------
+Merge mode reconstructs a tiled image.
 
-## 🔍 Preview System
+### Auto mode
 
-The preview system:
+Use when tiles follow the naming convention:
 
--   Automatically selects an appropriate pyramid level
--   Downsamples large ROIs for responsiveness
--   Avoids full-resolution decoding during preview
--   Enables interactive ROI refinement
+```text
+ImageName_A1.tif
+ImageName_B1.tif
+ImageName_A2.tif
+```
 
-------------------------------------------------------------------------
+If the tile names include overlap, for example `Ov10`, the program can read it automatically when overlap is set to `auto`.
 
-## 🧠 Robust Cropping Strategy
+### Manual grid mode
 
-For OpenSlide-supported formats (NDPI and pyramidal TIFF):
+Use when tile names do not encode their position.
 
-1.  Attempts full-resolution (level 0) block reading.
-2.  If decoding fails (e.g., corrupted JPEG tiles):
-    -   Reopens the slide handle
-    -   Attempts fallback from alternative pyramid levels
-    -   Upscales blocks when required
-    -   Warns the user if partial recovery was used
+Workflow:
 
-This improves reliability when working with imperfect WSI files.
+1. Select tile files or a folder.
+2. Choose `Manual grid` mode.
+3. Click `Preview Reconstruction`.
+4. Enter number of rows and columns.
+5. Assign tiles to grid cells manually, or use auto-fill by selected order.
+6. Save the merged image.
 
-------------------------------------------------------------------------
+Manual mode assumes all tiles have the same square size.
 
-## 📏 Metadata Preservation
+---
 
-When available, TiffCropper preserves:
+## Important Note About Overlap
 
--   XResolution
--   YResolution
--   ResolutionUnit
--   Physical pixel size (µm per pixel)
+The merge operation is geometric. It does not perform image registration or intelligent stitching.
 
-When exporting NDPI → OME-TIFF:
+For overlap:
 
--   OpenSlide properties are embedded as OME MapAnnotations.
+```text
+stride = tile_size - overlap_px
+```
 
-------------------------------------------------------------------------
+Neighboring tiles are placed using this stride. In overlapping regions, the later tile overwrites the previous tile. This works correctly when tiles were generated from the same source image using the same tile size, overlap and downsample.
 
-## 🖥 System Requirements
+---
 
--   Windows 10 / 11
--   ≥ 4 GB RAM (≥ 16 GB recommended for large WSI)
--   Sufficient disk space for large outputs
--   No internet connection required
+## Development Setup
 
-------------------------------------------------------------------------
+Clone the repository:
 
-## 🧪 Development
-
-Clone repository:
-
-``` bash
+```bash
 git clone https://github.com/Juaco2r/TiffCropper.git
 cd TiffCropper
 ```
 
-Create environment:
+Create and activate a virtual environment:
 
-``` bash
-python -m venv .venv
-.venv\Scripts\activate
+```bat
+python -m venv venv
+venv\Scripts\activate
+```
+
+Install dependencies:
+
+```bat
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Run:
+Run the app:
 
-``` bash
-python src/tiffcropper/app.py
+```bat
+python src\tiffcropper\app.py
 ```
 
-------------------------------------------------------------------------
+---
 
-## 🏗 Build Windows Executable
+## Windows Executable Build
 
-Example PyInstaller command:
+Recommended: build on Windows 10/11 using Python 3.10 or 3.11.
 
-``` bash
-pyinstaller --noconfirm --clean --onefile --windowed ^
-  --name TiffCropper ^
-  --add-data "<path_to_openslide_bin>;openslide_bin" ^
-  src\tiffcropper\app.py
+From the repository root:
+
+```bat
+venv\Scripts\activate
+build_windows.bat
 ```
 
-Executable will appear in:
+The executable will be created at:
 
-    dist/TiffCropper.exe
+```text
+dist\TiffCropper.exe
+```
 
-------------------------------------------------------------------------
+The build script bundles the OpenSlide DLLs from the `openslide-bin` wheel into the executable under `openslide_bin`, which matches the runtime DLL-loading logic in the app.
 
-## 📘 Documentation
+Alternative using the spec file:
 
--   Official protocol (PDF): available in the Releases section.
--   Technical documentation (Markdown):
-    `protocol/TiffCropper_Protocol.md`
+```bat
+pyinstaller --noconfirm --clean TiffCropper.spec
+```
 
-------------------------------------------------------------------------
+---
 
-## ⚖ License
+## Recommended Repository Files
 
-MIT License\
+```text
+requirements.txt
+build_windows.bat
+TiffCropper.spec
+README.md
+src/tiffcropper/app.py
+assets/icon/cropper.ico
+```
+
+---
+
+## System Requirements
+
+For the Windows executable:
+
+- Windows 10 or 11.
+- 8 GB RAM minimum; 16 GB or more recommended for large WSI.
+- Sufficient disk space for large crops or tile sets.
+- No internet connection required after download.
+
+For development/building:
+
+- Windows 10 or 11.
+- Python 3.10 or 3.11.
+- Visual C++ runtime normally included with Windows or installed by common scientific Python packages.
+
+---
+
+## License
+
+MIT License  
 © 2026 Jose Rodriguez-Rojas
 
 See `LICENSE` for details.
 
-------------------------------------------------------------------------
+---
 
-## 📎 Third-Party Notices
+## Third-Party Dependencies
 
 This project depends on:
 
--   NumPy (BSD)
--   tifffile (BSD)
--   Pillow (HPND)
--   zarr (MIT)
--   PyQt5 (GPL/commercial)
--   OpenSlide (LGPL)
+- NumPy
+- tifffile
+- imagecodecs
+- Pillow
+- zarr
+- PyQt5
+- OpenSlide / openslide-python / openslide-bin
+- PyInstaller for building the executable
 
 See `THIRD_PARTY_NOTICES.md` for additional information.

@@ -1,7 +1,11 @@
-numpy
-tifffile
-PyQt5
-Pillow
-openslide-python
-openslide-bin
-zarr
+numpy>=1.26,<3
+Pillow>=10.0
+PyQt5>=5.15.10,<5.16
+tifffile>=2024.8.10
+imagecodecs>=2024.6.1
+zarr>=2.16,<3
+openslide-python>=1.3.1
+openslide-bin>=4.0.0.8; platform_system == "Windows"
+
+# Build dependency for creating the standalone Windows executable
+pyinstaller>=6.10
