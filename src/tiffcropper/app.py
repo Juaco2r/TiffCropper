@@ -3,6 +3,9 @@ import os
 import sys
 import re
 import math
+import csv
+import traceback
+from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
@@ -14,10 +17,29 @@ from PyQt5.QtWidgets import (
     QWidget, QPushButton, QLineEdit, QLabel, QFileDialog,
     QSpinBox, QMessageBox, QComboBox, QCheckBox, QGroupBox,
     QStackedWidget, QDoubleSpinBox, QProgressBar, QDialog,
-    QTableWidget, QTableWidgetItem
+    QTableWidget, QTableWidgetItem, QTextBrowser, QDialogButtonBox
 )
 from PyQt5.QtCore import Qt, QRect, QPoint
 from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor
+
+
+# ============================================================
+# App metadata
+# ============================================================
+
+APP_NAME = "TiffCropper"
+APP_VERSION = "1.2"
+APP_TITLE = "TiffCropper: WSI Crop, Tile and Merge Tool for Digital Pathology Images"
+APP_DOI = "10.5281/zenodo.20316535"
+APP_GITHUB = "https://github.com/Juaco2r/TiffCropper"
+APP_AUTHOR = "José Rodriguez-Rojas"
+APP_YEAR = "2026"
+APP_LICENSE = "MIT License"
+APP_CITATION = (
+    f"Rodriguez-Rojas J. {APP_TITLE}. "
+    f"Version {APP_VERSION}. Zenodo; {APP_YEAR}. "
+    f"doi:{APP_DOI}"
+)
 
 
 # ============================================================
@@ -455,7 +477,7 @@ def _parse_tile_name(path: Path):
         stem = Path(stem).stem
 
     pattern_fixed = re.compile(
-        r"^(?P<base>.+)_(?P<col>[A-Z]+)(?P<row>\d+)"
+        r"^(?P<base>.+?)_(?P<col>[A-Z]+)(?P<row>\d+)"
         r"(?:Ov(?P<ov>\d+(?:\.\d+)?))?"
         r"(?:DS(?P<ds>\d+(?:\.\d+)?))?"
         r"(?:_X(?P<x>\d+)_Y(?P<y>\d+)_W(?P<w>\d+)_H(?P<h>\d+))?$"
@@ -476,7 +498,7 @@ def _parse_tile_name(path: Path):
         }
 
     pattern_div = re.compile(
-        r"^(?P<base>.+)_R(?P<row>\d+)_C(?P<col>\d+)"
+        r"^(?P<base>.+?)_R(?P<row>\d+)_C(?P<col>\d+)"
         r"(?:Div(?P<rows>\d+)x(?P<cols>\d+))?"
         r"(?:DS(?P<ds>\d+(?:\.\d+)?))?"
         r"(?:_X(?P<x>\d+)_Y(?P<y>\d+)_W(?P<w>\d+)_H(?P<h>\d+))?$"
@@ -520,15 +542,34 @@ def _division_bounds(base_x, base_y, base_w, base_h, rows, cols, row_idx, col_id
 
 
 def _crop_external_padding(rgb: np.ndarray, padding_color: str = "black") -> np.ndarray:
+    """
+    Crop uniform external padding without allocating coordinate arrays.
+
+    Previous versions used np.where(mask), which can allocate huge int64
+    coordinate arrays for large merged images. Here we reduce the mask to
+    occupied rows/columns first, which is much more memory efficient.
+    """
     rgb = _to_uint8_rgb(rgb)
-    if padding_color.lower() == "white":
-        mask = np.any(rgb < 250, axis=2)
-    else:
-        mask = np.any(rgb > 5, axis=2)
-    ys, xs = np.where(mask)
-    if len(xs) == 0 or len(ys) == 0:
+    if rgb.size == 0:
         return rgb
-    return rgb[ys.min():ys.max() + 1, xs.min():xs.max() + 1, :]
+
+    if padding_color.lower() == "white":
+        content_mask = np.any(rgb < 250, axis=2)
+    else:
+        content_mask = np.any(rgb > 5, axis=2)
+
+    rows = np.any(content_mask, axis=1)
+    cols = np.any(content_mask, axis=0)
+
+    if not rows.any() or not cols.any():
+        return rgb
+
+    y0 = int(np.argmax(rows))
+    y1 = int(len(rows) - np.argmax(rows[::-1]))
+    x0 = int(np.argmax(cols))
+    x1 = int(len(cols) - np.argmax(cols[::-1]))
+
+    return rgb[y0:y1, x0:x1, :]
 
 
 # ============================================================
@@ -546,8 +587,19 @@ class ImageBackend:
         self.source_mpp = None
         self.openslide_props = {}
         self._fail_log = []
+        self._openslide_obj = None
+        self._os_level_count = None
+        self._os_downsamples = None
+        self._os_level_dimensions = None
+        self._tif_obj = None
+        self._tif_series = None
+        self._tif_axes = None
+        self._zarr_array = None
+        self._zarr_error = None
 
     def load(self, path: str):
+        # Close any cached reader before loading a new file.
+        self.close()
         self.path = path
         self.path_obj = Path(path)
         self.reader = None
@@ -557,6 +609,15 @@ class ImageBackend:
         self.source_mpp = None
         self.openslide_props = {}
         self._fail_log = []
+        self._openslide_obj = None
+        self._os_level_count = None
+        self._os_downsamples = None
+        self._os_level_dimensions = None
+        self._tif_obj = None
+        self._tif_series = None
+        self._tif_axes = None
+        self._zarr_array = None
+        self._zarr_error = None
 
         lower_name = self.path_obj.name.lower()
 
@@ -616,6 +677,66 @@ class ImageBackend:
             "  pip install tifffile zarr\n"
         )
         raise RuntimeError("\n".join(msg))
+
+    def close(self):
+        """Close any cached image reader handles.
+
+        Keeping an OpenSlide handle open is much faster for repeated tile reads,
+        but it should be closed when switching files or after batch jobs.
+        """
+        if getattr(self, "_openslide_obj", None) is not None:
+            try:
+                self._openslide_obj.close()
+            except Exception:
+                pass
+        self._openslide_obj = None
+        if getattr(self, "_tif_obj", None) is not None:
+            try:
+                self._tif_obj.close()
+            except Exception:
+                pass
+        self._tif_obj = None
+        self._tif_series = None
+        self._tif_axes = None
+        self._zarr_array = None
+        self._zarr_error = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _get_openslide(self):
+        openslide = _try_import_openslide()
+        if openslide is None:
+            raise RuntimeError("OpenSlide not available.")
+        if self._openslide_obj is None:
+            self._openslide_obj = openslide.OpenSlide(self.path)
+            self._os_level_count = self._openslide_obj.level_count
+            self._os_downsamples = list(self._openslide_obj.level_downsamples)
+            self._os_level_dimensions = list(self._openslide_obj.level_dimensions)
+        return self._openslide_obj
+
+    def _reopen_openslide(self):
+        self.close()
+        return self._get_openslide()
+
+    def _get_tiff_zarr(self):
+        """Open a TIFF/OME-TIFF once and reuse its zarr view for repeated crops."""
+        if self._tif_obj is None:
+            self._tif_obj = tifffile.TiffFile(self.path)
+            self._tif_series = self._tif_obj.series[0]
+            self._tif_axes = getattr(self._tif_series, "axes", "")
+            try:
+                z = self._tif_series.aszarr()
+                import zarr
+                self._zarr_array = zarr.open(z, mode="r")
+                self._zarr_error = None
+            except Exception as e:
+                self._zarr_array = None
+                self._zarr_error = e
+        return self._zarr_array, self._tif_series, self._tif_axes, self._zarr_error
 
     def _read_with_pil(self, path: str) -> np.ndarray:
         Image = _try_import_pil()
@@ -694,7 +815,7 @@ class ImageBackend:
         full_w, full_h = self.slide_dims
         x, y, w, h = self.clip_roi(x, y, w, h, full_w, full_h)
         if self.reader == "openslide":
-            return self._crop_openslide_robust(self.path, x, y, w, h, fill=fill)
+            return self._crop_openslide_robust(x, y, w, h, fill=fill)
         if self.reader == "tifffile":
             return self._crop_tifffile(self.path, x, y, w, h)
         if self.reader == "pil":
@@ -716,30 +837,22 @@ class ImageBackend:
         out[:crop_h, :crop_w, :] = _to_uint8_rgb(roi)
         return out
 
-    def _crop_openslide_robust(self, path, x0, y0, w, h, block=1024, fill=255, prefer_levels=(2, 3)):
+    def _crop_openslide_robust(self, x0, y0, w, h, block=1024, fill=255, prefer_levels=(2, 3)):
         """
-        Robust OpenSlide crop.
+        Robust OpenSlide crop using a cached OpenSlide handle.
 
         Important behavior:
         - Edge padding is handled outside this function by read_tile_with_padding().
         - This function should NOT silently fill failed internal blocks with black/white.
         - If OpenSlide cannot read a block at level 0 and also cannot recover it from a fallback level,
           it raises an error instead of creating artificial padding in the middle of the tile.
+        - For performance, the OpenSlide handle is kept open across repeated crops/tiles.
+          If OpenSlide enters a latched error state, the handle is reopened automatically.
         """
-        openslide = _try_import_openslide()
-        if openslide is None:
-            raise RuntimeError("OpenSlide not available.")
-
-        s0 = openslide.OpenSlide(path)
-        try:
-            level_count = s0.level_count
-            downsamples = list(s0.level_downsamples)
-            W0, H0 = s0.level_dimensions[0]
-        finally:
-            try:
-                s0.close()
-            except Exception:
-                pass
+        s = self._get_openslide()
+        level_count = self._os_level_count
+        downsamples = self._os_downsamples
+        W0, H0 = self._os_level_dimensions[0]
 
         if x0 < 0 or y0 < 0 or x0 + w > W0 or y0 + h > H0:
             raise ValueError(f"ROI out of bounds. Slide=({W0},{H0}), ROI=({x0},{y0},{w},{h})")
@@ -756,7 +869,6 @@ class ImageBackend:
         failed0 = 0
         recovered = 0
         min_lvl_used = None
-        s = openslide.OpenSlide(path)
 
         try:
             for by in range(0, h, block):
@@ -771,11 +883,7 @@ class ImageBackend:
                         continue
                     except Exception as level0_error:
                         failed0 += 1
-                        try:
-                            s.close()
-                        except Exception:
-                            pass
-                        s = openslide.OpenSlide(path)
+                        s = self._reopen_openslide()
 
                     block_recovered = False
                     last_recovery_error = None
@@ -796,17 +904,13 @@ class ImageBackend:
                             break
                         except Exception as recovery_error:
                             last_recovery_error = recovery_error
-                            try:
-                                s.close()
-                            except Exception:
-                                pass
-                            s = openslide.OpenSlide(path)
+                            s = self._reopen_openslide()
 
                     if not block_recovered:
                         raise RuntimeError(
                             "OpenSlide failed to read an internal block and fallback recovery also failed.\n"
                             "To avoid artificial black/white padding inside the image, the tile was not saved.\n\n"
-                            f"Slide: {path}\n"
+                            f"Slide: {self.path}\n"
                             f"Requested crop: X={x0}, Y={y0}, W={w}, H={h}\n"
                             f"Failed block inside crop: local X={bx}, local Y={by}, W={bw}, H={bh}\n"
                             f"Slide-level block origin: X={sx}, Y={sy}\n\n"
@@ -814,31 +918,29 @@ class ImageBackend:
                             f"Last fallback error: {last_recovery_error}"
                         )
         finally:
-            try:
-                s.close()
-            except Exception:
-                pass
+            # Keep the cached OpenSlide handle open for repeated tile reads.
+            pass
 
         return out, {"used": failed0 > 0, "failed0": failed0, "recovered": recovered, "fallback_level": min_lvl_used}
 
     def _crop_tifffile(self, path, x, y, w, h):
         fallback_info = {"used": False}
-        with tifffile.TiffFile(path) as tif:
-            s0 = tif.series[0]
-            axes = getattr(s0, "axes", "")
-            try:
-                z = s0.aszarr()
-                import zarr
-                za = zarr.open(z, mode="r")
-                slicer = self._build_spatial_slicer(za.ndim, axes, x, y, w, h)
-                arr = za[tuple(slicer)]
-                return _to_uint8_rgb(np.asarray(arr)), fallback_info
-            except Exception as zarr_error:
-                fallback_info = {"used": True, "reason": f"zarr crop failed, used full read fallback: {zarr_error}"}
-                arr = s0.asarray()
-                slicer = self._build_spatial_slicer(arr.ndim, axes, x, y, w, h)
-                arr = arr[tuple(slicer)]
-                return _to_uint8_rgb(np.asarray(arr)), fallback_info
+        za, series, axes, zarr_error = self._get_tiff_zarr()
+        if za is not None:
+            slicer = self._build_spatial_slicer(za.ndim, axes, x, y, w, h)
+            arr = za[tuple(slicer)]
+            return _to_uint8_rgb(np.asarray(arr)), fallback_info
+
+        # Fallback: read the full series only when tiled/zarr access is unavailable.
+        # This is less efficient for very large files, so the reason is returned.
+        fallback_info = {
+            "used": True,
+            "reason": f"zarr crop failed, used full read fallback: {zarr_error}"
+        }
+        arr = series.asarray()
+        slicer = self._build_spatial_slicer(arr.ndim, axes, x, y, w, h)
+        arr = arr[tuple(slicer)]
+        return _to_uint8_rgb(np.asarray(arr)), fallback_info
 
     def _build_spatial_slicer(self, ndim, axes, x, y, w, h):
         slicer = []
@@ -945,14 +1047,14 @@ def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, loss
         )
         tifffile.imwrite(
             str(output_path), rgb, bigtiff=True, tile=(256, 256), photometric="rgb",
-            description=_ascii_safe(ome_xml), software="WSI-Crop-Tile-Merge-GUI",
+            description=_ascii_safe(ome_xml), software=f"{APP_NAME} v{APP_VERSION}",
             resolution=resolution, resolutionunit=resolutionunit, **compression_kwargs
         )
     else:
         tifffile.imwrite(
             str(output_path), rgb, bigtiff=True, tile=(256, 256), photometric="rgb",
-            description=_ascii_safe("Generated by WSI Crop / Tile / Merge GUI"),
-            software="WSI-Crop-Tile-Merge-GUI", resolution=resolution,
+            description=_ascii_safe(f"Generated by {APP_NAME} v{APP_VERSION}"),
+            software=f"{APP_NAME} v{APP_VERSION}", resolution=resolution,
             resolutionunit=resolutionunit, **compression_kwargs
         )
 
@@ -1100,7 +1202,7 @@ class ManualGridDialog(QDialog):
 class WSICropTileMergeGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WSI Crop / Tile / Merge - Multi-format WSI")
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Tile / Merge")
         self.setGeometry(100, 80, 1180, 820)
         self.setStyleSheet("background-color: #f0f0f0;")
 
@@ -1113,7 +1215,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
 
-        title = QLabel("WSI Crop / Tile / Merge Tool")
+        title = QLabel(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Tile / Merge Tool")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("color: #2c3e50; margin: 12px;")
@@ -1123,9 +1225,16 @@ class WSICropTileMergeGUI(QMainWindow):
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Crop", "Tiles", "Merge Tiles"])
         self.mode_combo.setMaximumWidth(180)
+
         menu_row.addWidget(QLabel("Mode:"))
         menu_row.addWidget(self.mode_combo)
         menu_row.addStretch()
+
+        help_btn = QPushButton("Help / About")
+        help_btn.setToolTip("Show app information, citation, DOI, and usage notes.")
+        help_btn.clicked.connect(self.show_help_about)
+        menu_row.addWidget(help_btn)
+
         root.addLayout(menu_row)
 
         self.info_label = QLabel("")
@@ -1151,6 +1260,25 @@ class WSICropTileMergeGUI(QMainWindow):
         for w in widgets:
             w.setVisible(visible)
             w.setEnabled(visible)
+
+    def _write_batch_log(self, output_folder: Path, rows):
+        """Write a CSV log for batch tiling operations."""
+        if not rows:
+            return None
+        output_folder = Path(output_folder)
+        output_folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = output_folder / f"TiffCropper_batch_log_{stamp}.csv"
+        fieldnames = [
+            "timestamp", "operation", "status", "image", "reader",
+            "output_folder", "tiles_expected", "tiles_written", "message"
+        ]
+        with open(log_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in fieldnames})
+        return log_path
 
     def _draw_fixed_grid_on_thumb(self, thumb_rgb, full_w, full_h, tile_size, overlap):
         pm = _numpy_rgb_to_qpixmap(thumb_rgb)
@@ -1197,6 +1325,88 @@ class WSICropTileMergeGUI(QMainWindow):
         box.addWidget(sp)
         parent_layout.addLayout(box)
         return sp
+
+    def _help_about_html(self):
+        supported = ", ".join(SUPPORTED_EXTENSIONS)
+        return f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; font-size: 10pt;">
+          <h2>{APP_NAME} v{APP_VERSION}</h2>
+          <p><b>{APP_TITLE}</b></p>
+
+          <p>
+            TiffCropper is a standalone Windows application for cropping, tiling,
+            and reconstructing large digital pathology and microscopy images.
+          </p>
+
+          <h3>Main features</h3>
+          <ul>
+            <li>ROI cropping from large WSI and microscopy images.</li>
+            <li>Full-area selection for whole-slide export or downsampling.</li>
+            <li>Fixed-size square tile generation with optional overlap.</li>
+            <li>Row/column-based image division for structured tiling.</li>
+            <li>Bulk tiling of multiple images using the same parameters.</li>
+            <li>Automatic tile merging from encoded tile names.</li>
+            <li>Manual grid-based tile merging when filenames do not encode position.</li>
+            <li>OME-TIFF export with physical pixel size preservation when available.</li>
+            <li>BigTIFF output and optional lossless DEFLATE compression.</li>
+          </ul>
+
+          <h3>Supported input formats</h3>
+          <p>{supported}</p>
+
+          <h3>Important tiling note</h3>
+          <p>
+            In fixed square tile mode, padding is applied only to true border tiles.
+            Internal tiles are extracted as direct crops to avoid introducing artificial
+            black or white padding inside the image.
+          </p>
+
+          <h3>Merge note</h3>
+          <p>
+            Tile merging is geometric. It does not perform image registration or
+            intelligent stitching. For best results, merge tiles generated from the
+            same source image using the same tile size, overlap, and downsample settings.
+          </p>
+
+          <h3>Performance and logs</h3>
+          <p>
+            For repeated WSI tiling, TiffCropper keeps OpenSlide and TIFF/zarr readers
+            open during each image job to reduce repeated file-opening overhead. Batch
+            tiling also writes a CSV log with status, expected tile counts, written tile
+            counts, output folders, and error messages when failures occur.
+          </p>
+
+          <h3>Citation</h3>
+          <p>{APP_CITATION}</p>
+
+          <p>
+            <b>DOI:</b> <a href="https://doi.org/{APP_DOI}">https://doi.org/{APP_DOI}</a><br>
+            <b>GitHub:</b> <a href="{APP_GITHUB}">{APP_GITHUB}</a><br>
+            <b>License:</b> {APP_LICENSE}<br>
+            <b>Author:</b> {APP_AUTHOR}
+          </p>
+        </body>
+        </html>
+        """
+
+    def show_help_about(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"About {APP_NAME}")
+        dlg.resize(720, 620)
+
+        layout = QVBoxLayout(dlg)
+
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(True)
+        browser.setHtml(self._help_about_html())
+        layout.addWidget(browser)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+
+        dlg.exec_()
 
     # ========================================================
     # Crop page
@@ -1624,20 +1834,24 @@ class WSICropTileMergeGUI(QMainWindow):
         if not self.bulk_paths:
             QMessageBox.warning(self, "Error", "Load one or more images first.")
             return
+        log_rows = []
         try:
             params = self._tile_params()
             jobs = []
             total_tiles = 0
             for p in self.bulk_paths:
                 b = ImageBackend().load(str(p))
-                w, h = b.slide_dims
-                if params["mode"].startswith("Fixed"):
-                    xs, ys, _, _ = _compute_tile_grid(w, h, params["tile_size"], params["overlap"])
-                    n_tiles = len(xs) * len(ys)
-                else:
-                    n_tiles = params["rows"] * params["cols"]
-                jobs.append((p, b.reader, n_tiles))
-                total_tiles += n_tiles
+                try:
+                    w, h = b.slide_dims
+                    if params["mode"].startswith("Fixed"):
+                        xs, ys, _, _ = _compute_tile_grid(w, h, params["tile_size"], params["overlap"])
+                        n_tiles = len(xs) * len(ys)
+                    else:
+                        n_tiles = params["rows"] * params["cols"]
+                    jobs.append((p, b.reader, n_tiles))
+                    total_tiles += n_tiles
+                finally:
+                    b.close()
 
             if total_tiles == 0:
                 QMessageBox.warning(self, "No tiles", "No tiles would be generated with the current settings.")
@@ -1649,18 +1863,75 @@ class WSICropTileMergeGUI(QMainWindow):
             QApplication.processEvents()
 
             written = 0
-            for p, _, _ in jobs:
-                if params["mode"].startswith("Fixed"):
-                    count = self._save_fixed_tiles_one_image(p, params, written)
-                else:
-                    count = self._save_division_tiles_one_image(p, params, written)
-                written += count
+            failed = 0
+            log_base = self.bulk_paths[0].parent if self.bulk_paths else Path.cwd()
 
+            for p, reader_name, expected_tiles in jobs:
+                try:
+                    if params["mode"].startswith("Fixed"):
+                        count = self._save_fixed_tiles_one_image(p, params, written)
+                        operation = "fixed_tiles"
+                        out_folder = p.parent / p.stem
+                    else:
+                        count = self._save_division_tiles_one_image(p, params, written)
+                        operation = "division_tiles"
+                        out_folder = p.parent / f"{p.stem}_{_suffix_for_division_tile(params['rows'], params['cols'], params['downsample'])}"
+                    written += count
+                    log_rows.append({
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "operation": operation,
+                        "status": "success",
+                        "image": str(p),
+                        "reader": reader_name,
+                        "output_folder": str(out_folder),
+                        "tiles_expected": expected_tiles,
+                        "tiles_written": count,
+                        "message": "",
+                    })
+                except Exception as image_error:
+                    failed += 1
+                    message = f"{image_error}\n{traceback.format_exc()}"
+                    log_rows.append({
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "operation": "fixed_tiles" if params["mode"].startswith("Fixed") else "division_tiles",
+                        "status": "failed",
+                        "image": str(p),
+                        "reader": reader_name,
+                        "output_folder": "",
+                        "tiles_expected": expected_tiles,
+                        "tiles_written": 0,
+                        "message": message,
+                    })
+                    self.info_label.setText(f"Failed: {p.name}. Continuing with remaining files...")
+                    QApplication.processEvents()
+
+            log_path = self._write_batch_log(log_base, log_rows)
             self.progress.setVisible(False)
-            self.info_label.setText(f"Done: saved {written} tiles from {len(self.bulk_paths)} image(s).")
-            QMessageBox.information(self, "Done", f"Saved {written} tiles from {len(self.bulk_paths)} image(s).")
+
+            if failed:
+                self.info_label.setText(f"Done with warnings: saved {written} tiles; {failed} image(s) failed. Log: {log_path}")
+                QMessageBox.warning(
+                    self,
+                    "Done with warnings",
+                    f"Saved {written} tiles from {len(self.bulk_paths) - failed} image(s).\n"
+                    f"Failed images: {failed}\n\nLog saved to:\n{log_path}"
+                )
+            else:
+                self.info_label.setText(f"Done: saved {written} tiles from {len(self.bulk_paths)} image(s). Log: {log_path}")
+                QMessageBox.information(
+                    self,
+                    "Done",
+                    f"Saved {written} tiles from {len(self.bulk_paths)} image(s).\n\nLog saved to:\n{log_path}"
+                )
         except Exception as e:
             self.progress.setVisible(False)
+            if log_rows:
+                try:
+                    log_path = self._write_batch_log(self.bulk_paths[0].parent, log_rows)
+                    QMessageBox.critical(self, "Tiling Error", f"{e}\n\nPartial log saved to:\n{log_path}")
+                    return
+                except Exception:
+                    pass
             QMessageBox.critical(self, "Tiling Error", str(e))
 
     def _save_fixed_tiles_one_image(self, image_path, params, start_progress):
@@ -1723,6 +1994,7 @@ class WSICropTileMergeGUI(QMainWindow):
                     )
                     QApplication.processEvents()
 
+        backend.close()
         QApplication.processEvents()
         return count
 
@@ -1763,6 +2035,7 @@ class WSICropTileMergeGUI(QMainWindow):
                     self.info_label.setText(f"Saving division tiles: {image_path.name} | {count}/{total} | Reader: {backend.reader}")
                     QApplication.processEvents()
 
+        backend.close()
         QApplication.processEvents()
         return count
 
@@ -1908,12 +2181,55 @@ class WSICropTileMergeGUI(QMainWindow):
         return True
 
     def _tile_canvas_geometry(self, metas, overlap):
-        # More robust than assuming all tiles have the first tile size.
-        # This handles partial edge tiles correctly.
-        sizes = {}
+        """
+        Compute merged canvas size and tile placements.
+
+        When tiles include _X#_Y# coordinate metadata generated by TiffCropper,
+        the merge uses those coordinates. This is safer than relying only on
+        row/column labels because it handles partial edge tiles and downsampled
+        tiles more robustly. If coordinates are missing, it falls back to the
+        classic row/column + overlap geometry.
+
+        Returns:
+            out_w, out_h, stride_x, stride_y, placements
+
+        placements[path] = (tile_width_px, tile_height_px, x_px, y_px)
+        """
+        placements = {}
         max_right = 0
         max_bottom = 0
 
+        use_coordinates = all(m.get("x") is not None and m.get("y") is not None for m in metas)
+
+        if use_coordinates:
+            # Normalize coordinates so a crop/tile set that starts away from (0, 0)
+            # still reconstructs into a compact canvas. Coordinates are stored in
+            # original-resolution pixels, so divide by the tile downsample factor.
+            scaled_xs = []
+            scaled_ys = []
+            for m in metas:
+                ds = float(m.get("downsample") or 1.0)
+                if ds <= 0:
+                    ds = 1.0
+                scaled_xs.append(int(round(float(m["x"]) / ds)))
+                scaled_ys.append(int(round(float(m["y"]) / ds)))
+
+            min_x = min(scaled_xs) if scaled_xs else 0
+            min_y = min(scaled_ys) if scaled_ys else 0
+
+            for m, sx, sy in zip(metas, scaled_xs, scaled_ys):
+                tile = self._read_tile_file(m["path"])
+                th, tw = tile.shape[:2]
+                x = sx - min_x
+                y = sy - min_y
+                placements[m["path"]] = (tw, th, x, y)
+                max_right = max(max_right, x + tw)
+                max_bottom = max(max_bottom, y + th)
+
+            # Informational only in coordinate mode.
+            return int(max_right), int(max_bottom), 0, 0, placements
+
+        # Fallback for older tile names without coordinate metadata.
         first = self._read_tile_file(metas[0]["path"])
         base_h, base_w = first.shape[:2]
         stride_x = base_w - int(round(base_w * overlap / 100.0))
@@ -1924,13 +2240,12 @@ class WSICropTileMergeGUI(QMainWindow):
         for m in metas:
             tile = self._read_tile_file(m["path"])
             th, tw = tile.shape[:2]
-            sizes[m["path"]] = (tw, th)
-            x = m["col"] * stride_x
-            y = m["row"] * stride_y
+            _, _, x, y = placements[m["path"]]
+            placements[m["path"]] = (tw, th, x, y)
             max_right = max(max_right, x + tw)
             max_bottom = max(max_bottom, y + th)
 
-        return int(max_right), int(max_bottom), stride_x, stride_y, sizes
+        return int(max_right), int(max_bottom), stride_x, stride_y, placements
 
     def _reconstruct_tiles_manual(self, preview=False):
         if not self.manual_layout:
@@ -1980,7 +2295,7 @@ class WSICropTileMergeGUI(QMainWindow):
                 canvas[y:min(y+hh, prev_h), x:min(x+ww, prev_w), :] = small[:max(0, min(hh, prev_h-y)), :max(0, min(ww, prev_w-x)), :]
             if self.merge_crop_padding_chk.isChecked():
                 canvas = _crop_external_padding(canvas, self.merge_padding_combo.currentText())
-            return canvas, base, overlap, min(stride_x, stride_y)
+            return canvas, base, overlap, min(stride_x, stride_y) if stride_x and stride_y else 0
 
         merged = np.zeros((out_h, out_w, 3), dtype=np.uint8)
         self.progress.setVisible(True)
@@ -1997,7 +2312,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.progress.setVisible(False)
         if self.merge_crop_padding_chk.isChecked():
             merged = _crop_external_padding(merged, self.merge_padding_combo.currentText())
-        return merged, base, overlap, min(stride_x, stride_y)
+        return merged, base, overlap, min(stride_x, stride_y) if stride_x and stride_y else 0
 
     def _reconstruct_tiles(self, preview=False):
         if self.merge_mode_combo.currentText().startswith("Manual"):
@@ -2005,7 +2320,7 @@ class WSICropTileMergeGUI(QMainWindow):
 
         metas, base = self._collect_tile_metadata()
         overlap = self._merge_overlap_value(metas)
-        out_w, out_h, stride_x, stride_y, sizes = self._tile_canvas_geometry(metas, overlap)
+        out_w, out_h, stride_x, stride_y, placements = self._tile_canvas_geometry(metas, overlap)
 
         if preview:
             scale = min(820 / out_w, 430 / out_h, 1.0)
@@ -2018,21 +2333,21 @@ class WSICropTileMergeGUI(QMainWindow):
                 small_w = max(1, int(round(tile.shape[1] * scale)))
                 small_h = max(1, int(round(tile.shape[0] * scale)))
                 small = np.asarray(Image.fromarray(tile).resize((small_w, small_h), Image.Resampling.BILINEAR), dtype=np.uint8)
-                x = int(round(m["col"] * stride_x * scale))
-                y = int(round(m["row"] * stride_y * scale))
+                _, _, x0, y0 = placements[m["path"]]
+                x = int(round(x0 * scale))
+                y = int(round(y0 * scale))
                 hh, ww = small.shape[:2]
                 canvas[y:min(y+hh, prev_h), x:min(x+ww, prev_w), :] = small[:max(0, min(hh, prev_h-y)), :max(0, min(ww, prev_w-x)), :]
             if self.merge_crop_padding_chk.isChecked():
                 canvas = _crop_external_padding(canvas, self.merge_padding_combo.currentText())
-            return canvas, base, overlap, min(stride_x, stride_y)
+            return canvas, base, overlap, min(stride_x, stride_y) if stride_x and stride_y else 0
 
         merged = np.zeros((out_h, out_w, 3), dtype=np.uint8)
         self.progress.setVisible(True)
         self.progress.setRange(0, len(metas))
         for i, m in enumerate(metas, start=1):
             tile = self._read_tile_file(m["path"])
-            x = m["col"] * stride_x
-            y = m["row"] * stride_y
+            _, _, x, y = placements[m["path"]]
             th, tw = tile.shape[:2]
             merged[y:y+th, x:x+tw, :] = tile
             self.progress.setValue(i)
@@ -2041,7 +2356,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.progress.setVisible(False)
         if self.merge_crop_padding_chk.isChecked():
             merged = _crop_external_padding(merged, self.merge_padding_combo.currentText())
-        return merged, base, overlap, min(stride_x, stride_y)
+        return merged, base, overlap, min(stride_x, stride_y) if stride_x and stride_y else 0
 
     def preview_merge(self):
         if not self.tile_files:

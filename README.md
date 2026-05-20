@@ -272,6 +272,4 @@ See `THIRD_PARTY_NOTICES.md` for additional information.
 
 If you use this software, please cite:
 
-Rodriguez-Rojas J. TiffCropper: WSI Crop, Tile and Merge Tool for Digital Pathology Images. Version 1.0.0. Zenodo; 2026.
-
-A DOI will be added after Zenodo archives the GitHub release.
+Rodriguez-Rojas J. TiffCropper: WSI Crop, Tile and Merge Tool for Digital Pathology Images. Version 1.2. Zenodo; 2026. doi:10.5281/zenodo.20316535

@@ -21,8 +21,9 @@ authors:
   - given-names: José
     family-names: Rodriguez-Rojas
     orcid: "https://orcid.org/0000-0003-4373-5480"
-version: 1.1
+version: 1.2
 date-released: 2026-05-20
+doi: 10.5281/zenodo.20316535
 url: "https://github.com/Juaco2r/TiffCropper"
 repository-code: "https://github.com/Juaco2r/TiffCropper"
 repository-artifact: "https://github.com/Juaco2r/TiffCropper/releases"
@@ -35,5 +36,6 @@ preferred-citation:
       family-names: Rodriguez-Rojas
       orcid: "https://orcid.org/0000-0003-4373-5480"
   title: "TiffCropper: WSI Crop, Tile and Merge Tool for Digital Pathology Images"
-  version: 1.1
+  version: 1.2
+  doi: 10.5281/zenodo.20316535
   year: 2026

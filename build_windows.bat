@@ -1,17 +1,21 @@
-@@echo off
+@echo off
 echo ===============================
 echo Building TiffCropper EXE
 echo ===============================
 
-REM Activate venv (optional)
-call venv\Scripts\activate
+REM Activate venv
+if exist venv\Scripts\activate (
+    call venv\Scripts\activate
+) else (
+    echo WARNING: venv not found. Using current Python environment.
+)
 
 REM Clean previous builds
-rmdir /s /q build
-rmdir /s /q dist
+if exist build rmdir /s /q build
+if exist dist rmdir /s /q dist
 
 REM Build using spec file
-pyinstaller TiffCropper.spec
+pyinstaller --clean --noconfirm TiffCropper.spec
 
 echo ===============================
 echo BUILD COMPLETE
