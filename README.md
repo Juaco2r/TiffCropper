@@ -31,10 +31,13 @@ The Windows release is designed to run without a separate Python installation.
 | Format | Backend | Notes |
 |---|---|---|
 | TIFF / pyramidal TIFF | tifffile / OpenSlide | Pyramid support when available |
-| OME-TIFF | tifffile | Physical pixel size preserved when available |
+| OME-TIFF | tifffile / OpenSlide | Physical pixel size preserved when available |
+| SVS | OpenSlide / tifffile fallback | Common digital pathology format |
 | NDPI | OpenSlide | Requires OpenSlide binaries bundled in the Windows executable |
+| MRXS | OpenSlide | The `.mrxs` file must remain beside its associated data folder |
+| SCN / VMS / VMU / BIF / SVSlide | OpenSlide | Support depends on the OpenSlide backend |
+| DICOM / DCM | OpenSlide | Support depends on OpenSlide compatibility |
 | JPEG / PNG | Pillow | Mainly useful for tiles or simple raster inputs |
-
 ---
 
 ## Quick Start
@@ -101,6 +104,9 @@ ImageName_A1Ov10DS2.tif
 
 Columns use letters (`A`, `B`, `C`, ...), rows use numbers (`1`, `2`, `3`, ...).
 
+### Divide image by rows/columns
+
+In addition to fixed square tiles, TiffCropper can divide an image into a user-defined number of rows and columns. This mode produces tiles that may be rectangular and does not add artificial padding. Output names include row, column, division grid size, and original pixel coordinates.
 ---
 
 ## Merge Tiles Mode
@@ -261,3 +267,11 @@ This project depends on:
 - PyInstaller for building the executable
 
 See `THIRD_PARTY_NOTICES.md` for additional information.
+
+## Citation
+
+If you use this software, please cite:
+
+Rodriguez-Rojas J. TiffCropper: WSI Crop, Tile and Merge Tool for Digital Pathology Images. Version 1.0.0. Zenodo; 2026.
+
+A DOI will be added after Zenodo archives the GitHub release.

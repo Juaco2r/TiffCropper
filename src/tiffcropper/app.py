@@ -1,3 +1,4 @@
+
 import os
 import sys
 import re
@@ -5,6 +6,23 @@ import math
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
+import numpy as np
+import tifffile
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QWidget, QPushButton, QLineEdit, QLabel, QFileDialog,
+    QSpinBox, QMessageBox, QComboBox, QCheckBox, QGroupBox,
+    QStackedWidget, QDoubleSpinBox, QProgressBar, QDialog,
+    QTableWidget, QTableWidgetItem
+)
+from PyQt5.QtCore import Qt, QRect, QPoint
+from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor
+
+
+# ============================================================
+# OpenSlide DLL helper
+# ============================================================
 
 def _setup_openslide_dll_path():
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -19,30 +37,70 @@ def _setup_openslide_dll_path():
 
 _setup_openslide_dll_path()
 
-import numpy as np
-import tifffile
 
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QWidget, QPushButton, QLineEdit, QLabel, QFileDialog,
-    QSpinBox, QMessageBox, QComboBox, QCheckBox, QGroupBox,
-    QStackedWidget, QDoubleSpinBox, QProgressBar, QDialog,
-    QTableWidget, QTableWidgetItem
+# ============================================================
+# Supported formats
+# ============================================================
+
+SUPPORTED_EXTENSIONS = (
+    ".tif", ".tiff", ".ome.tif", ".ome.tiff",
+    ".svs", ".ndpi", ".mrxs", ".scn", ".vms", ".vmu",
+    ".bif", ".svslide", ".dcm",
+    ".jpg", ".jpeg", ".png"
 )
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor
+
+OPENSLIDE_EXTENSIONS = (
+    ".tif", ".tiff", ".ome.tif", ".ome.tiff",
+    ".svs", ".ndpi", ".mrxs", ".scn", ".vms", ".vmu",
+    ".bif", ".svslide", ".dcm"
+)
+
+TIFF_EXTENSIONS = (
+    ".tif", ".tiff", ".ome.tif", ".ome.tiff", ".svs"
+)
+
+RASTER_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png"
+)
 
 
-SUPPORTED_EXTENSIONS = (".tif", ".tiff", ".ome.tif", ".ome.tiff", ".ndpi", ".jpg", ".jpeg", ".png")
+def _has_ext(path_or_name, exts):
+    name = str(path_or_name).lower()
+    return any(name.endswith(e) for e in exts)
 
+
+def _image_file_filter():
+    exts = " ".join(f"*{e}" for e in SUPPORTED_EXTENSIONS)
+    return f"Image Files ({exts});;All Files (*)"
+
+
+def _tile_file_filter():
+    return "Tile Files (*.tif *.tiff *.ome.tif *.ome.tiff *.jpg *.jpeg *.png);;All Files (*)"
+
+
+# ============================================================
+# Optional imports
+# ============================================================
 
 def _try_import_openslide():
     try:
-        import openslide  # type: ignore
+        import openslide
         return openslide
     except Exception:
         return None
 
+
+def _try_import_pil():
+    try:
+        from PIL import Image
+        return Image
+    except Exception:
+        return None
+
+
+# ============================================================
+# Metadata helpers
+# ============================================================
 
 def _mpp_to_dpi(mpp: float) -> float:
     return 25400.0 / float(mpp)
@@ -115,24 +173,72 @@ def _build_ome_xml_rgb(size_x, size_y, physical_size_x_um, physical_size_y_um, i
 """
 
 
+# ============================================================
+# Image helpers
+# ============================================================
+
+def _normalize_to_uint8(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr)
+    if arr.dtype == np.uint8:
+        return arr
+    if arr.dtype == np.bool_:
+        return arr.astype(np.uint8) * 255
+
+    arr_float = arr.astype(np.float32, copy=False)
+    if arr_float.size == 0:
+        return arr_float.astype(np.uint8)
+
+    finite = np.isfinite(arr_float)
+    if not np.any(finite):
+        return np.zeros(arr_float.shape, dtype=np.uint8)
+
+    valid = arr_float[finite]
+    vmin = float(np.percentile(valid, 1))
+    vmax = float(np.percentile(valid, 99))
+
+    if vmax <= vmin:
+        vmax = float(np.max(valid))
+        vmin = float(np.min(valid))
+    if vmax <= vmin:
+        return np.zeros(arr_float.shape, dtype=np.uint8)
+
+    arr_float = np.clip((arr_float - vmin) / (vmax - vmin), 0, 1)
+    return (arr_float * 255).astype(np.uint8)
+
+
 def _to_uint8_rgb(arr: np.ndarray) -> np.ndarray:
     arr = np.asarray(arr)
-    if arr.ndim == 3 and arr.shape[0] in (3, 4) and arr.shape[-1] not in (3, 4):
+    arr = np.squeeze(arr)
+
+    if arr.ndim == 3 and arr.shape[0] in (1, 2, 3, 4) and arr.shape[-1] not in (1, 2, 3, 4):
         arr = np.moveaxis(arr, 0, -1)
+
     if arr.ndim == 2:
+        arr = _normalize_to_uint8(arr)
         arr = np.stack([arr, arr, arr], axis=-1)
-    elif arr.ndim == 3 and arr.shape[2] == 4:
-        arr = arr[:, :, :3]
-    elif arr.ndim == 3 and arr.shape[2] > 3:
-        arr = arr[:, :, :3]
-    elif arr.ndim != 3:
-        raise ValueError(f"Unsupported image array shape: {arr.shape}")
-    if arr.dtype != np.uint8:
-        arr = np.clip(arr, 0, 255).astype(np.uint8, copy=False)
-    return np.ascontiguousarray(arr)
+    elif arr.ndim == 3:
+        if arr.shape[2] == 1:
+            arr = _normalize_to_uint8(arr[:, :, 0])
+            arr = np.stack([arr, arr, arr], axis=-1)
+        elif arr.shape[2] == 2:
+            arr = _normalize_to_uint8(arr[:, :, 0])
+            arr = np.stack([arr, arr, arr], axis=-1)
+        elif arr.shape[2] == 3:
+            arr = _normalize_to_uint8(arr)
+        elif arr.shape[2] == 4:
+            arr = _normalize_to_uint8(arr[:, :, :3])
+        elif arr.shape[2] > 4:
+            arr = _normalize_to_uint8(arr[:, :, :3])
+        else:
+            raise ValueError(f"Unsupported image array shape: {arr.shape}")
+    else:
+        raise ValueError(f"Unsupported image array shape after squeeze: {arr.shape}")
+
+    return np.ascontiguousarray(arr.astype(np.uint8, copy=False))
 
 
 def _downsample_for_preview(rgb: np.ndarray, max_side: int = 512) -> np.ndarray:
+    rgb = _to_uint8_rgb(rgb)
     h, w = rgb.shape[:2]
     m = max(h, w)
     if m <= max_side:
@@ -142,11 +248,166 @@ def _downsample_for_preview(rgb: np.ndarray, max_side: int = 512) -> np.ndarray:
 
 
 def _numpy_rgb_to_qpixmap(rgb: np.ndarray) -> QPixmap:
-    rgb = np.ascontiguousarray(rgb)
+    rgb = np.ascontiguousarray(_to_uint8_rgb(rgb))
     h, w = rgb.shape[:2]
     qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
     return QPixmap.fromImage(qimg.copy())
 
+
+# ============================================================
+# Crop rectangle widget
+# ============================================================
+
+class CropSelectionLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMouseTracking(True)
+        self._pixmap_original = None
+        self._thumb_w = None
+        self._thumb_h = None
+        self._full_w = None
+        self._full_h = None
+        self._dragging = False
+        self._start = QPoint()
+        self._end = QPoint()
+        self._selection_rect_widget = None
+        self.selection_callback = None
+        self.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
+
+    def set_image(self, rgb, full_w, full_h, callback=None):
+        rgb = _to_uint8_rgb(rgb)
+        self._thumb_h, self._thumb_w = rgb.shape[:2]
+        self._full_w = int(full_w)
+        self._full_h = int(full_h)
+        self.selection_callback = callback
+        self._pixmap_original = _numpy_rgb_to_qpixmap(rgb)
+        self._selection_rect_widget = None
+        self.update()
+
+    def has_image(self):
+        return self._pixmap_original is not None and self._full_w is not None and self._full_h is not None
+
+    def _display_rect(self):
+        if self._pixmap_original is None:
+            return QRect(0, 0, 0, 0)
+        label_w = self.width()
+        label_h = self.height()
+        img_w = self._pixmap_original.width()
+        img_h = self._pixmap_original.height()
+        if img_w <= 0 or img_h <= 0 or label_w <= 0 or label_h <= 0:
+            return QRect(0, 0, 0, 0)
+        scale = min(label_w / img_w, label_h / img_h)
+        disp_w = int(round(img_w * scale))
+        disp_h = int(round(img_h * scale))
+        x0 = int(round((label_w - disp_w) / 2))
+        y0 = int(round((label_h - disp_h) / 2))
+        return QRect(x0, y0, disp_w, disp_h)
+
+    def _clamp_point_to_display_rect(self, p: QPoint):
+        r = self._display_rect()
+        x = max(r.left(), min(p.x(), r.right()))
+        y = max(r.top(), min(p.y(), r.bottom()))
+        return QPoint(x, y)
+
+    def _widget_rect_to_full_coords(self, rect: QRect):
+        if not self.has_image():
+            return None
+        disp = self._display_rect()
+        if disp.width() <= 0 or disp.height() <= 0:
+            return None
+        inter = rect.normalized().intersected(disp)
+        if inter.width() <= 1 or inter.height() <= 1:
+            return None
+
+        x0_img = (inter.left() - disp.left()) / disp.width() * self._thumb_w
+        y0_img = (inter.top() - disp.top()) / disp.height() * self._thumb_h
+        x1_img = (inter.right() - disp.left()) / disp.width() * self._thumb_w
+        y1_img = (inter.bottom() - disp.top()) / disp.height() * self._thumb_h
+
+        x0_full = int(round(x0_img / self._thumb_w * self._full_w))
+        y0_full = int(round(y0_img / self._thumb_h * self._full_h))
+        x1_full = int(round(x1_img / self._thumb_w * self._full_w))
+        y1_full = int(round(y1_img / self._thumb_h * self._full_h))
+
+        x0_full = max(0, min(x0_full, self._full_w - 1))
+        y0_full = max(0, min(y0_full, self._full_h - 1))
+        x1_full = max(1, min(x1_full, self._full_w))
+        y1_full = max(1, min(y1_full, self._full_h))
+
+        x = min(x0_full, x1_full)
+        y = min(y0_full, y1_full)
+        w = abs(x1_full - x0_full)
+        h = abs(y1_full - y0_full)
+        return x, y, max(1, w), max(1, h)
+
+    def set_selection_from_full_coords(self, x, y, w, h):
+        if not self.has_image():
+            return
+        disp = self._display_rect()
+        if disp.width() <= 0 or disp.height() <= 0:
+            return
+        x0 = float(x)
+        y0 = float(y)
+        x1 = float(x + w)
+        y1 = float(y + h)
+        px0 = disp.left() + (x0 / self._full_w) * disp.width()
+        py0 = disp.top() + (y0 / self._full_h) * disp.height()
+        px1 = disp.left() + (x1 / self._full_w) * disp.width()
+        py1 = disp.top() + (y1 / self._full_h) * disp.height()
+        self._selection_rect_widget = QRect(
+            int(round(px0)),
+            int(round(py0)),
+            int(round(px1 - px0)),
+            int(round(py1 - py0))
+        ).normalized()
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.has_image():
+            disp = self._display_rect()
+            if disp.contains(event.pos()):
+                self._dragging = True
+                self._start = self._clamp_point_to_display_rect(event.pos())
+                self._end = self._start
+                self._selection_rect_widget = QRect(self._start, self._end)
+                self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and self.has_image():
+            self._end = self._clamp_point_to_display_rect(event.pos())
+            self._selection_rect_widget = QRect(self._start, self._end).normalized()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            self._end = self._clamp_point_to_display_rect(event.pos())
+            self._selection_rect_widget = QRect(self._start, self._end).normalized()
+            coords = self._widget_rect_to_full_coords(self._selection_rect_widget)
+            if coords is not None and self.selection_callback is not None:
+                x, y, w, h = coords
+                self.selection_callback(x, y, w, h)
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("white"))
+        if self._pixmap_original is not None:
+            disp = self._display_rect()
+            scaled = self._pixmap_original.scaled(disp.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            painter.drawPixmap(disp.topLeft(), scaled)
+        if self._selection_rect_widget is not None:
+            pen = QPen(QColor(255, 0, 0), 2)
+            painter.setPen(pen)
+            painter.drawRect(self._selection_rect_widget.normalized())
+            painter.fillRect(self._selection_rect_widget.normalized(), QColor(255, 0, 0, 35))
+        painter.end()
+
+
+# ============================================================
+# Tile helpers
+# ============================================================
 
 def _col_to_letters(col_index: int) -> str:
     letters = ""
@@ -173,6 +434,13 @@ def _suffix_for_tile(overlap_percent: float, downsample: float) -> str:
     return suffix
 
 
+def _suffix_for_division_tile(rows: int, cols: int, downsample: float) -> str:
+    suffix = f"Div{rows}x{cols}"
+    if float(downsample) != 1:
+        suffix += f"DS{int(downsample)}" if float(downsample).is_integer() else f"DS{downsample:g}"
+    return suffix
+
+
 def _extension_from_combo(text: str) -> str:
     return ".jpg" if "JPEG" in text.upper() or "JPG" in text.upper() else ".tif"
 
@@ -185,22 +453,50 @@ def _parse_tile_name(path: Path):
     stem = path.stem
     if stem.endswith(".ome"):
         stem = Path(stem).stem
-    pattern = re.compile(
+
+    pattern_fixed = re.compile(
         r"^(?P<base>.+)_(?P<col>[A-Z]+)(?P<row>\d+)"
         r"(?:Ov(?P<ov>\d+(?:\.\d+)?))?"
-        r"(?:DS(?P<ds>\d+(?:\.\d+)?))?$"
+        r"(?:DS(?P<ds>\d+(?:\.\d+)?))?"
+        r"(?:_X(?P<x>\d+)_Y(?P<y>\d+)_W(?P<w>\d+)_H(?P<h>\d+))?$"
     )
-    m = pattern.match(stem)
-    if not m:
-        return None
-    return {
-        "path": path,
-        "base": m.group("base"),
-        "col": _letters_to_col(m.group("col")),
-        "row": int(m.group("row")) - 1,
-        "overlap": float(m.group("ov")) if m.group("ov") else 0.0,
-        "downsample": float(m.group("ds")) if m.group("ds") else 1.0,
-    }
+    m = pattern_fixed.match(stem)
+    if m:
+        return {
+            "path": path,
+            "base": m.group("base"),
+            "col": _letters_to_col(m.group("col")),
+            "row": int(m.group("row")) - 1,
+            "overlap": float(m.group("ov")) if m.group("ov") else 0.0,
+            "downsample": float(m.group("ds")) if m.group("ds") else 1.0,
+            "x": int(m.group("x")) if m.group("x") else None,
+            "y": int(m.group("y")) if m.group("y") else None,
+            "w": int(m.group("w")) if m.group("w") else None,
+            "h": int(m.group("h")) if m.group("h") else None,
+        }
+
+    pattern_div = re.compile(
+        r"^(?P<base>.+)_R(?P<row>\d+)_C(?P<col>\d+)"
+        r"(?:Div(?P<rows>\d+)x(?P<cols>\d+))?"
+        r"(?:DS(?P<ds>\d+(?:\.\d+)?))?"
+        r"(?:_X(?P<x>\d+)_Y(?P<y>\d+)_W(?P<w>\d+)_H(?P<h>\d+))?$"
+    )
+    m = pattern_div.match(stem)
+    if m:
+        return {
+            "path": path,
+            "base": m.group("base"),
+            "col": int(m.group("col")) - 1,
+            "row": int(m.group("row")) - 1,
+            "overlap": 0.0,
+            "downsample": float(m.group("ds")) if m.group("ds") else 1.0,
+            "x": int(m.group("x")) if m.group("x") else None,
+            "y": int(m.group("y")) if m.group("y") else None,
+            "w": int(m.group("w")) if m.group("w") else None,
+            "h": int(m.group("h")) if m.group("h") else None,
+        }
+
+    return None
 
 
 def _compute_tile_grid(width: int, height: int, tile_size: int, overlap_percent: float):
@@ -208,9 +504,19 @@ def _compute_tile_grid(width: int, height: int, tile_size: int, overlap_percent:
     stride = tile_size - overlap_px
     if stride <= 0:
         raise ValueError("Overlap must be lower than 100%.")
+
     x_positions = list(range(0, width, stride))
     y_positions = list(range(0, height, stride))
+
     return x_positions, y_positions, stride, overlap_px
+
+
+def _division_bounds(base_x, base_y, base_w, base_h, rows, cols, row_idx, col_idx):
+    x0 = base_x + int(math.floor(col_idx * base_w / cols))
+    x1 = base_x + int(math.floor((col_idx + 1) * base_w / cols))
+    y0 = base_y + int(math.floor(row_idx * base_h / rows))
+    y1 = base_y + int(math.floor((row_idx + 1) * base_h / rows))
+    return x0, y0, max(1, x1 - x0), max(1, y1 - y0)
 
 
 def _crop_external_padding(rgb: np.ndarray, padding_color: str = "black") -> np.ndarray:
@@ -225,72 +531,125 @@ def _crop_external_padding(rgb: np.ndarray, padding_color: str = "black") -> np.
     return rgb[ys.min():ys.max() + 1, xs.min():xs.max() + 1, :]
 
 
+# ============================================================
+# Image backend
+# ============================================================
+
 class ImageBackend:
     def __init__(self):
         self.path = None
         self.path_obj = None
+        self.reader = None
         self.file_kind = None
         self.slide_dims = None
         self.source_resolution = None
         self.source_mpp = None
         self.openslide_props = {}
-        self.tiff_via_openslide = False
+        self._fail_log = []
 
     def load(self, path: str):
         self.path = path
         self.path_obj = Path(path)
+        self.reader = None
+        self.file_kind = None
+        self.slide_dims = None
+        self.source_resolution = None
+        self.source_mpp = None
+        self.openslide_props = {}
+        self._fail_log = []
+
         lower_name = self.path_obj.name.lower()
-        ext = self.path_obj.suffix.lower()
-        is_ome = lower_name.endswith(".ome.tif") or lower_name.endswith(".ome.tiff")
 
-        if ext in [".tif", ".tiff"] or is_ome:
-            self.file_kind = "tiff"
-            w, h, res, mpp = self._probe_tiff(path)
-            if not self.tiff_via_openslide:
+        if _has_ext(lower_name, OPENSLIDE_EXTENSIONS):
+            try:
+                w, h, res, mpp, props = self._probe_openslide(path)
+                self.reader = "openslide"
+                self.file_kind = "wsi"
+                self.slide_dims = (int(w), int(h))
+                self.source_resolution = res
+                self.source_mpp = mpp
+                self.openslide_props = props or {}
+                return self
+            except Exception as e:
+                self._fail_log.append(("OpenSlide", str(e)))
+
+        if _has_ext(lower_name, TIFF_EXTENSIONS):
+            try:
+                w, h, res, mpp = self._probe_tifffile(path)
+                self.reader = "tifffile"
+                self.file_kind = "tiff"
+                self.slide_dims = (int(w), int(h))
+                self.source_resolution = res
+                self.source_mpp = mpp
                 self.openslide_props = {}
-        elif ext == ".ndpi":
-            self.file_kind = "ndpi"
-            w, h, res, mpp, props = self._probe_ndpi(path)
-            self.openslide_props = props or {}
-        elif ext in [".jpg", ".jpeg", ".png"]:
-            self.file_kind = "raster"
-            arr = self._read_with_pil(path)
-            h, w = arr.shape[:2]
-            res, mpp = None, None
-            self.tiff_via_openslide = False
-        else:
-            raise ValueError(f"Unsupported extension: {ext}")
+                return self
+            except Exception as e:
+                self._fail_log.append(("tifffile", str(e)))
 
-        self.slide_dims = (int(w), int(h))
-        self.source_resolution = res
-        self.source_mpp = mpp
-        return self
+        if _has_ext(lower_name, RASTER_EXTENSIONS):
+            try:
+                arr = self._read_with_pil(path)
+                h, w = arr.shape[:2]
+                self.reader = "pil"
+                self.file_kind = "raster"
+                self.slide_dims = (int(w), int(h))
+                self.source_resolution = None
+                self.source_mpp = None
+                self.openslide_props = {}
+                return self
+            except Exception as e:
+                self._fail_log.append(("PIL", str(e)))
+
+        msg = [f"Could not open image:\n{path}\n"]
+        msg.append(f"Detected extension: {self.path_obj.suffix}")
+        msg.append("\nTried the following readers:")
+        for reader_name, err in self._fail_log:
+            msg.append(f"\n- {reader_name} failed:\n  {err}")
+        msg.append(
+            "\n\nSupported extensions:\n"
+            f"{SUPPORTED_EXTENSIONS}\n\n"
+            "Suggestions:\n"
+            "- Install OpenSlide support:\n"
+            "  pip install openslide-python openslide-bin\n\n"
+            "- For MRXS, make sure the .mrxs file is beside its associated data folder.\n"
+            "- For TIFF/OME-TIFF, make sure tifffile and zarr are installed:\n"
+            "  pip install tifffile zarr\n"
+        )
+        raise RuntimeError("\n".join(msg))
 
     def _read_with_pil(self, path: str) -> np.ndarray:
-        from PIL import Image
+        Image = _try_import_pil()
+        if Image is None:
+            raise RuntimeError("PIL/Pillow is not installed. Install with: pip install pillow")
         return np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
 
-    def _probe_tiff(self, path: str):
+    def _probe_openslide(self, path: str):
         openslide = _try_import_openslide()
-        if openslide is not None:
+        if openslide is None:
+            raise RuntimeError(
+                "OpenSlide is not installed or cannot be imported.\n"
+                "Install with:\n"
+                "pip install openslide-python openslide-bin"
+            )
+        slide = openslide.OpenSlide(path)
+        try:
+            w, h = slide.dimensions
+            props = dict(slide.properties or {})
+            mpp_x = _safe_float(props.get("openslide.mpp-x"))
+            mpp_y = _safe_float(props.get("openslide.mpp-y"))
+            res_tuple = None
+            mpp = None
+            if mpp_x and mpp_y:
+                res_tuple = (_mpp_to_dpi(mpp_x), _mpp_to_dpi(mpp_y), "INCH")
+                mpp = (mpp_x, mpp_y)
+            return int(w), int(h), res_tuple, mpp, props
+        finally:
             try:
-                slide = openslide.OpenSlide(path)
-                w, h = slide.dimensions
-                props = dict(slide.properties or {})
-                mpp_x = _safe_float(props.get("openslide.mpp-x"))
-                mpp_y = _safe_float(props.get("openslide.mpp-y"))
-                res_tuple = None
-                mpp = None
-                if mpp_x and mpp_y:
-                    res_tuple = (_mpp_to_dpi(mpp_x), _mpp_to_dpi(mpp_y), "INCH")
-                    mpp = (mpp_x, mpp_y)
                 slide.close()
-                self.openslide_props = props
-                self.tiff_via_openslide = True
-                return int(w), int(h), res_tuple, mpp
             except Exception:
-                self.tiff_via_openslide = False
+                pass
 
+    def _probe_tifffile(self, path: str):
         with tifffile.TiffFile(path) as tif:
             if not tif.series:
                 raise ValueError("No image series found in TIFF/OME-TIFF.")
@@ -302,7 +661,6 @@ class ImageBackend:
                 h = int(shape0[axes.index("Y")])
             else:
                 h, w = int(shape0[0]), int(shape0[1])
-
             page0 = s0.pages[0] if getattr(s0, "pages", None) else tif.pages[0]
             tags = page0.tags
             xres_f = _tag_to_float(tags.get("XResolution"))
@@ -320,24 +678,7 @@ class ImageBackend:
                     unit_str = None
             res_tuple = (xres_f, yres_f, unit_str) if (xres_f and yres_f and unit_str) else None
             mpp = (_dpi_to_mpp(xres_f), _dpi_to_mpp(yres_f)) if res_tuple and unit_str == "INCH" else None
-            return w, h, res_tuple, mpp
-
-    def _probe_ndpi(self, path: str):
-        openslide = _try_import_openslide()
-        if openslide is None:
-            raise RuntimeError("OpenSlide is required for .ndpi. For dev: pip install openslide-python openslide-bin")
-        slide = openslide.OpenSlide(path)
-        w, h = slide.dimensions
-        props = dict(slide.properties or {})
-        mpp_x = _safe_float(props.get("openslide.mpp-x"))
-        mpp_y = _safe_float(props.get("openslide.mpp-y"))
-        res_tuple = None
-        mpp = None
-        if mpp_x and mpp_y:
-            res_tuple = (_mpp_to_dpi(mpp_x), _mpp_to_dpi(mpp_y), "INCH")
-            mpp = (mpp_x, mpp_y)
-        slide.close()
-        return int(w), int(h), res_tuple, mpp, props
+            return int(w), int(h), res_tuple, mpp
 
     @staticmethod
     def clip_roi(x, y, w, h, full_w, full_h):
@@ -348,18 +689,22 @@ class ImageBackend:
         return x, y, w, h
 
     def crop(self, x: int, y: int, w: int, h: int, fill: int = 255):
-        if not self.path or not self.file_kind or not self.slide_dims:
+        if not self.path or not self.reader or not self.slide_dims:
             raise RuntimeError("No image loaded.")
         full_w, full_h = self.slide_dims
         x, y, w, h = self.clip_roi(x, y, w, h, full_w, full_h)
-        if self.file_kind == "ndpi" or self.tiff_via_openslide:
+        if self.reader == "openslide":
             return self._crop_openslide_robust(self.path, x, y, w, h, fill=fill)
-        if self.file_kind == "raster":
+        if self.reader == "tifffile":
+            return self._crop_tifffile(self.path, x, y, w, h)
+        if self.reader == "pil":
             arr = self._read_with_pil(self.path)
             return _to_uint8_rgb(arr[y:y+h, x:x+w, :]), {"used": False}
-        return self._crop_tiff(self.path, x, y, w, h)
+        raise RuntimeError(f"Unknown reader: {self.reader}")
 
     def read_tile_with_padding(self, x: int, y: int, size: int, padding_color: str = "black") -> np.ndarray:
+        if not self.slide_dims:
+            raise RuntimeError("No image loaded.")
         full_w, full_h = self.slide_dims
         fill = 0 if padding_color.lower() == "black" else 255
         out = np.full((size, size, 3), fill, dtype=np.uint8)
@@ -372,15 +717,30 @@ class ImageBackend:
         return out
 
     def _crop_openslide_robust(self, path, x0, y0, w, h, block=1024, fill=255, prefer_levels=(2, 3)):
+        """
+        Robust OpenSlide crop.
+
+        Important behavior:
+        - Edge padding is handled outside this function by read_tile_with_padding().
+        - This function should NOT silently fill failed internal blocks with black/white.
+        - If OpenSlide cannot read a block at level 0 and also cannot recover it from a fallback level,
+          it raises an error instead of creating artificial padding in the middle of the tile.
+        """
         openslide = _try_import_openslide()
         if openslide is None:
             raise RuntimeError("OpenSlide not available.")
 
         s0 = openslide.OpenSlide(path)
-        level_count = s0.level_count
-        downsamples = list(s0.level_downsamples)
-        W0, H0 = s0.level_dimensions[0]
-        s0.close()
+        try:
+            level_count = s0.level_count
+            downsamples = list(s0.level_downsamples)
+            W0, H0 = s0.level_dimensions[0]
+        finally:
+            try:
+                s0.close()
+            except Exception:
+                pass
+
         if x0 < 0 or y0 < 0 or x0 + w > W0 or y0 + h > H0:
             raise ValueError(f"ROI out of bounds. Slide=({W0},{H0}), ROI=({x0},{y0},{w},{h})")
 
@@ -398,84 +758,155 @@ class ImageBackend:
         min_lvl_used = None
         s = openslide.OpenSlide(path)
 
-        for by in range(0, h, block):
-            bh = min(block, h - by)
-            for bx in range(0, w, block):
-                bw = min(block, w - bx)
-                sx, sy = x0 + bx, y0 + by
-                try:
-                    im0 = s.read_region((sx, sy), 0, (bw, bh)).convert("RGB")
-                    out[by:by+bh, bx:bx+bw, :] = np.asarray(im0, dtype=np.uint8)
-                    continue
-                except Exception:
-                    failed0 += 1
-                    try:
-                        s.close()
-                    except Exception:
-                        pass
-                    s = openslide.OpenSlide(path)
+        try:
+            for by in range(0, h, block):
+                bh = min(block, h - by)
+                for bx in range(0, w, block):
+                    bw = min(block, w - bx)
+                    sx, sy = x0 + bx, y0 + by
 
-                for lvl in fallback_levels:
-                    ds = float(downsamples[lvl])
-                    lw = max(1, int(math.ceil(bw / ds)))
-                    lh = max(1, int(math.ceil(bh / ds)))
                     try:
-                        iml = s.read_region((sx, sy), lvl, (lw, lh)).convert("RGB")
-                        if (lw, lh) != (bw, bh):
-                            from PIL import Image
-                            iml = iml.resize((bw, bh), resample=Image.BILINEAR)
-                        out[by:by+bh, bx:bx+bw, :] = np.asarray(iml, dtype=np.uint8)
-                        recovered += 1
-                        min_lvl_used = lvl if min_lvl_used is None else min(min_lvl_used, lvl)
-                        break
-                    except Exception:
+                        im0 = s.read_region((sx, sy), 0, (bw, bh)).convert("RGB")
+                        out[by:by+bh, bx:bx+bw, :] = np.asarray(im0, dtype=np.uint8)
+                        continue
+                    except Exception as level0_error:
+                        failed0 += 1
                         try:
                             s.close()
                         except Exception:
                             pass
                         s = openslide.OpenSlide(path)
-        try:
-            s.close()
-        except Exception:
-            pass
+
+                    block_recovered = False
+                    last_recovery_error = None
+
+                    for lvl in fallback_levels:
+                        ds = float(downsamples[lvl])
+                        lw = max(1, int(math.ceil(bw / ds)))
+                        lh = max(1, int(math.ceil(bh / ds)))
+                        try:
+                            iml = s.read_region((sx, sy), lvl, (lw, lh)).convert("RGB")
+                            if (lw, lh) != (bw, bh):
+                                from PIL import Image
+                                iml = iml.resize((bw, bh), resample=Image.BILINEAR)
+                            out[by:by+bh, bx:bx+bw, :] = np.asarray(iml, dtype=np.uint8)
+                            recovered += 1
+                            min_lvl_used = lvl if min_lvl_used is None else min(min_lvl_used, lvl)
+                            block_recovered = True
+                            break
+                        except Exception as recovery_error:
+                            last_recovery_error = recovery_error
+                            try:
+                                s.close()
+                            except Exception:
+                                pass
+                            s = openslide.OpenSlide(path)
+
+                    if not block_recovered:
+                        raise RuntimeError(
+                            "OpenSlide failed to read an internal block and fallback recovery also failed.\n"
+                            "To avoid artificial black/white padding inside the image, the tile was not saved.\n\n"
+                            f"Slide: {path}\n"
+                            f"Requested crop: X={x0}, Y={y0}, W={w}, H={h}\n"
+                            f"Failed block inside crop: local X={bx}, local Y={by}, W={bw}, H={bh}\n"
+                            f"Slide-level block origin: X={sx}, Y={sy}\n\n"
+                            f"Level 0 error: {level0_error}\n"
+                            f"Last fallback error: {last_recovery_error}"
+                        )
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
         return out, {"used": failed0 > 0, "failed0": failed0, "recovered": recovered, "fallback_level": min_lvl_used}
 
-    def _crop_tiff(self, path, x, y, w, h):
+    def _crop_tifffile(self, path, x, y, w, h):
         fallback_info = {"used": False}
         with tifffile.TiffFile(path) as tif:
             s0 = tif.series[0]
+            axes = getattr(s0, "axes", "")
             try:
                 z = s0.aszarr()
-                import zarr  # type: ignore
+                import zarr
                 za = zarr.open(z, mode="r")
-                arr = za[y:y+h, x:x+w, ...]
+                slicer = self._build_spatial_slicer(za.ndim, axes, x, y, w, h)
+                arr = za[tuple(slicer)]
                 return _to_uint8_rgb(np.asarray(arr)), fallback_info
-            except Exception:
-                full = tif.pages[0].asarray()
-                return _to_uint8_rgb(full[y:y+h, x:x+w, ...]), fallback_info
+            except Exception as zarr_error:
+                fallback_info = {"used": True, "reason": f"zarr crop failed, used full read fallback: {zarr_error}"}
+                arr = s0.asarray()
+                slicer = self._build_spatial_slicer(arr.ndim, axes, x, y, w, h)
+                arr = arr[tuple(slicer)]
+                return _to_uint8_rgb(np.asarray(arr)), fallback_info
+
+    def _build_spatial_slicer(self, ndim, axes, x, y, w, h):
+        slicer = []
+        if axes and len(axes) == ndim and "Y" in axes and "X" in axes:
+            for ax in axes:
+                if ax == "Y":
+                    slicer.append(slice(y, y + h))
+                elif ax == "X":
+                    slicer.append(slice(x, x + w))
+                elif ax == "C":
+                    slicer.append(slice(None))
+                else:
+                    slicer.append(0)
+        else:
+            for i in range(ndim):
+                if i == 0:
+                    slicer.append(slice(y, y + h))
+                elif i == 1:
+                    slicer.append(slice(x, x + w))
+                else:
+                    slicer.append(slice(None))
+        return slicer
 
     def input_thumbnail(self, max_side=512):
-        openslide = _try_import_openslide()
-        if openslide is not None:
-            try:
-                slide = openslide.OpenSlide(self.path)
-                lvl = slide.level_count - 1
-                w, h = slide.level_dimensions[lvl]
-                img = slide.read_region((0, 0), lvl, (int(w), int(h))).convert("RGB")
-                slide.close()
-                return _downsample_for_preview(_to_uint8_rgb(np.asarray(img)), max_side=max_side)
-            except Exception:
-                pass
-        if self.file_kind == "raster":
-            return _downsample_for_preview(_to_uint8_rgb(self._read_with_pil(self.path)), max_side=max_side)
-        with tifffile.TiffFile(self.path) as tif:
-            s0 = tif.series[0]
-            if hasattr(s0, "levels") and s0.levels:
-                arr = s0.levels[-1].asarray()
-            else:
-                arr = s0.asarray()
-        return _downsample_for_preview(_to_uint8_rgb(arr), max_side=max_side)
+        if not self.path or not self.reader:
+            raise RuntimeError("No image loaded.")
 
+        if self.reader == "openslide":
+            openslide = _try_import_openslide()
+            if openslide is None:
+                raise RuntimeError("OpenSlide not available.")
+            slide = openslide.OpenSlide(self.path)
+            try:
+                try:
+                    img = slide.get_thumbnail((max_side, max_side)).convert("RGB")
+                    return _to_uint8_rgb(np.asarray(img, dtype=np.uint8))
+                except Exception:
+                    lvl = slide.level_count - 1
+                    w, h = slide.level_dimensions[lvl]
+                    img = slide.read_region((0, 0), lvl, (int(w), int(h))).convert("RGB")
+                    return _downsample_for_preview(_to_uint8_rgb(np.asarray(img)), max_side=max_side)
+            finally:
+                try:
+                    slide.close()
+                except Exception:
+                    pass
+
+        if self.reader == "pil":
+            return _downsample_for_preview(_to_uint8_rgb(self._read_with_pil(self.path)), max_side=max_side)
+
+        if self.reader == "tifffile":
+            with tifffile.TiffFile(self.path) as tif:
+                s0 = tif.series[0]
+                try:
+                    if hasattr(s0, "levels") and s0.levels:
+                        arr = s0.levels[-1].asarray()
+                    else:
+                        arr = s0.asarray()
+                except Exception:
+                    arr = tif.pages[0].asarray()
+            return _downsample_for_preview(_to_uint8_rgb(arr), max_side=max_side)
+
+        raise RuntimeError(f"Unknown reader: {self.reader}")
+
+
+# ============================================================
+# Save helper
+# ============================================================
 
 def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, lossless=True,
                    source_resolution=None, source_mpp=None, image_name=None, annotation_kv=None):
@@ -496,11 +927,12 @@ def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, loss
             resolution = (float(xres), float(yres))
             resolutionunit = unit
 
-    mpp_x_um = mpp_y_um = None
+    mpp_x_um = None
+    mpp_y_um = None
     if source_mpp:
         mpp_x_um, mpp_y_um = source_mpp
 
-    compression_kwargs = {"compression": "deflate"} if lossless else {}
+    compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
 
     if write_ome:
         ome_xml = _build_ome_xml_rgb(
@@ -525,6 +957,10 @@ def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, loss
         )
 
 
+# ============================================================
+# Manual merge grid dialog
+# ============================================================
+
 class ManualGridDialog(QDialog):
     def __init__(self, tile_paths, read_tile_func, parent=None):
         super().__init__(parent)
@@ -535,14 +971,15 @@ class ManualGridDialog(QDialog):
         self.mapping = {}
 
         layout = QVBoxLayout(self)
-
         top = QHBoxLayout()
+
         self.rows_spin = QSpinBox()
         self.rows_spin.setRange(1, 200)
         self.rows_spin.setValue(2)
         self.cols_spin = QSpinBox()
         self.cols_spin.setRange(1, 200)
         self.cols_spin.setValue(2)
+
         top.addWidget(QLabel("Rows:"))
         top.addWidget(self.rows_spin)
         top.addWidget(QLabel("Columns:"))
@@ -653,19 +1090,20 @@ class ManualGridDialog(QDialog):
                 k += 1
 
     def get_layout(self):
-        return {
-            "rows": self.rows_spin.value(),
-            "cols": self.cols_spin.value(),
-            "mapping": dict(self.mapping),
-        }
+        return {"rows": self.rows_spin.value(), "cols": self.cols_spin.value(), "mapping": dict(self.mapping)}
 
+
+# ============================================================
+# Main GUI
+# ============================================================
 
 class WSICropTileMergeGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WSI Crop / Tile / Merge - TIFF / OME-TIFF / NDPI")
-        self.setGeometry(100, 80, 1120, 760)
+        self.setWindowTitle("WSI Crop / Tile / Merge - Multi-format WSI")
+        self.setGeometry(100, 80, 1180, 820)
         self.setStyleSheet("background-color: #f0f0f0;")
+
         self.backend = ImageBackend()
         self.tile_files = []
         self.bulk_paths = []
@@ -684,21 +1122,22 @@ class WSICropTileMergeGUI(QMainWindow):
         menu_row = QHBoxLayout()
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Crop", "Tiles", "Merge Tiles"])
-        self.mode_combo.currentIndexChanged.connect(lambda: self.stack.setCurrentIndex(self.mode_combo.currentIndex()))
         self.mode_combo.setMaximumWidth(180)
         menu_row.addWidget(QLabel("Mode:"))
         menu_row.addWidget(self.mode_combo)
         menu_row.addStretch()
         root.addLayout(menu_row)
 
+        self.info_label = QLabel("")
+        self.info_label.setStyleSheet("color: #27ae60; padding: 8px;")
+
         self.stack = QStackedWidget()
         root.addWidget(self.stack, 1)
         self.stack.addWidget(self._build_crop_page())
         self.stack.addWidget(self._build_tiles_page())
         self.stack.addWidget(self._build_merge_page())
+        self.mode_combo.currentIndexChanged.connect(lambda: self.stack.setCurrentIndex(self.mode_combo.currentIndex()))
 
-        self.info_label = QLabel("")
-        self.info_label.setStyleSheet("color: #27ae60; padding: 8px;")
         root.addWidget(self.info_label)
         self.progress = QProgressBar()
         self.progress.setVisible(False)
@@ -708,20 +1147,44 @@ class WSICropTileMergeGUI(QMainWindow):
         pm = _numpy_rgb_to_qpixmap(_to_uint8_rgb(rgb))
         label.setPixmap(pm.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
-    def _draw_grid_on_thumb(self, thumb_rgb, full_w, full_h, tile_size, overlap):
+    def _set_widgets_visible(self, widgets, visible: bool):
+        for w in widgets:
+            w.setVisible(visible)
+            w.setEnabled(visible)
+
+    def _draw_fixed_grid_on_thumb(self, thumb_rgb, full_w, full_h, tile_size, overlap):
         pm = _numpy_rgb_to_qpixmap(thumb_rgb)
         painter = QPainter(pm)
         pen_grid = QPen(QColor(220, 0, 0), 1)
         pen_pad = QPen(QColor(230, 190, 0), 2)
         sx = pm.width() / float(full_w)
         sy = pm.height() / float(full_h)
-        x_positions, y_positions, stride, _ = _compute_tile_grid(full_w, full_h, tile_size, overlap)
+        xs, ys, stride, _ = _compute_tile_grid(full_w, full_h, tile_size, overlap)
+
         painter.setPen(pen_grid)
-        for y in y_positions:
-            for x in x_positions:
+        for y in ys:
+            for x in xs:
                 painter.drawRect(int(x * sx), int(y * sy), int(tile_size * sx), int(tile_size * sy))
-        painter.setPen(pen_pad)
-        painter.drawRect(0, 0, int((x_positions[-1] + tile_size) * sx), int((y_positions[-1] + tile_size) * sy))
+
+        if xs and ys:
+            painter.setPen(pen_pad)
+            painter.drawRect(0, 0, int((xs[-1] + tile_size) * sx), int((ys[-1] + tile_size) * sy))
+
+        painter.end()
+        return pm
+
+    def _draw_division_grid_on_thumb(self, thumb_rgb, full_w, full_h, rows, cols):
+        pm = _numpy_rgb_to_qpixmap(thumb_rgb)
+        painter = QPainter(pm)
+        painter.setPen(QPen(QColor(220, 0, 0), 1))
+        sx = pm.width() / float(full_w)
+        sy = pm.height() / float(full_h)
+        for r in range(1, rows):
+            y = int(round((r * full_h / rows) * sy))
+            painter.drawLine(0, y, pm.width(), y)
+        for c in range(1, cols):
+            x = int(round((c * full_w / cols) * sx))
+            painter.drawLine(x, 0, x, pm.height())
         painter.end()
         return pm
 
@@ -735,9 +1198,14 @@ class WSICropTileMergeGUI(QMainWindow):
         parent_layout.addLayout(box)
         return sp
 
+    # ========================================================
+    # Crop page
+    # ========================================================
+
     def _build_crop_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+
         file_layout = QHBoxLayout()
         self.crop_file_label = QLabel("No file selected")
         self.crop_file_label.setStyleSheet("padding: 10px; border: 1px solid #bdc3c7; border-radius: 5px;")
@@ -747,15 +1215,19 @@ class WSICropTileMergeGUI(QMainWindow):
         file_layout.addWidget(self.crop_file_label, 1)
         layout.addLayout(file_layout)
 
-        coords_layout = QHBoxLayout()
+        coords_box = QGroupBox("Crop by exact pixels")
+        coords_layout = QHBoxLayout(coords_box)
         self.x_spin = self._mk_spin("X:", 0, 10_000_000, 0, coords_layout)
         self.y_spin = self._mk_spin("Y:", 0, 10_000_000, 0, coords_layout)
         self.w_spin = self._mk_spin("Width:", 1, 10_000_000, 1000, coords_layout)
         self.h_spin = self._mk_spin("Height:", 1, 10_000_000, 1000, coords_layout)
         self.full_area_btn = QPushButton("Select full area")
         self.full_area_btn.clicked.connect(self.select_full_crop_area)
+        update_rect_btn = QPushButton("Update rectangle from pixels")
+        update_rect_btn.clicked.connect(self.update_crop_rectangle_from_spinboxes)
         coords_layout.addWidget(self.full_area_btn)
-        layout.addLayout(coords_layout)
+        coords_layout.addWidget(update_rect_btn)
+        layout.addWidget(coords_box)
 
         out_layout = QHBoxLayout()
         out_layout.addWidget(QLabel("Output:"))
@@ -788,15 +1260,13 @@ class WSICropTileMergeGUI(QMainWindow):
         opt_layout.addStretch()
         layout.addWidget(opt)
 
-        prev = QGroupBox("Preview")
+        prev = QGroupBox("Preview - drag a rectangle on the input thumbnail")
         prev_layout = QHBoxLayout(prev)
-        self.crop_thumb_in = QLabel("Input thumbnail")
-        self.crop_thumb_in.setAlignment(Qt.AlignCenter)
-        self.crop_thumb_in.setFixedSize(520, 300)
-        self.crop_thumb_in.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
+        self.crop_thumb_in = CropSelectionLabel()
+        self.crop_thumb_in.setFixedSize(540, 330)
         self.crop_thumb_out = QLabel("Crop preview")
         self.crop_thumb_out.setAlignment(Qt.AlignCenter)
-        self.crop_thumb_out.setFixedSize(520, 300)
+        self.crop_thumb_out.setFixedSize(540, 330)
         self.crop_thumb_out.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
         prev_layout.addWidget(self.crop_thumb_in)
         prev_layout.addWidget(self.crop_thumb_out)
@@ -810,10 +1280,30 @@ class WSICropTileMergeGUI(QMainWindow):
         btn_row.addWidget(preview_btn)
         btn_row.addWidget(crop_btn)
         layout.addLayout(btn_row)
+
         return page
 
+    def _on_rectangle_selected(self, x, y, w, h):
+        self.x_spin.setValue(x)
+        self.y_spin.setValue(y)
+        self.w_spin.setValue(w)
+        self.h_spin.setValue(h)
+        self.info_label.setText(f"Rectangle selected: X={x}, Y={y}, W={w}, H={h}")
+
+    def update_crop_rectangle_from_spinboxes(self):
+        if not self.backend.path or not self.backend.slide_dims:
+            QMessageBox.warning(self, "Error", "Please select a file first.")
+            return
+        self.crop_thumb_in.set_selection_from_full_coords(
+            self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
+        )
+        self.info_label.setText(
+            f"Rectangle updated from pixels: X={self.x_spin.value()}, Y={self.y_spin.value()}, "
+            f"W={self.w_spin.value()}, H={self.h_spin.value()}"
+        )
+
     def browse_crop_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select WSI", "", "Image Files (*.tif *.tiff *.ome.tif *.ome.tiff *.ndpi *.jpg *.jpeg *.png);;All Files (*)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select WSI", "", _image_file_filter())
         if not file_path:
             return
         try:
@@ -824,9 +1314,11 @@ class WSICropTileMergeGUI(QMainWindow):
             self.y_spin.setMaximum(max(0, h - 1))
             self.w_spin.setMaximum(max(1, w))
             self.h_spin.setMaximum(max(1, h))
-            self.info_label.setText(f"Loaded: {Path(file_path).name} | Size: {w} x {h} px")
+            print("Loaded with:", self.backend.reader, self.backend.file_kind, self.backend.path_obj.suffix)
+            self.info_label.setText(f"Loaded: {Path(file_path).name} | Size: {w} x {h} px | Reader: {self.backend.reader}")
             if self.crop_preview_chk.isChecked():
-                self._set_label_pixmap(self.crop_thumb_in, self.backend.input_thumbnail())
+                thumb = self.backend.input_thumbnail(max_side=900)
+                self.crop_thumb_in.set_image(thumb, full_w=w, full_h=h, callback=self._on_rectangle_selected)
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
@@ -839,6 +1331,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.y_spin.setValue(0)
         self.w_spin.setValue(full_w)
         self.h_spin.setValue(full_h)
+        self.crop_thumb_in.set_selection_from_full_coords(0, 0, full_w, full_h)
         self.info_label.setText(f"Full area selected: 0, 0, {full_w}, {full_h}")
 
     def preview_crop(self):
@@ -854,45 +1347,63 @@ class WSICropTileMergeGUI(QMainWindow):
                 new_h = max(1, int(round(roi.shape[0] / downsample)))
                 roi = np.asarray(Image.fromarray(roi).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
             if self.crop_preview_chk.isChecked():
-                self._set_label_pixmap(self.crop_thumb_in, self.backend.input_thumbnail())
+                if self.backend.slide_dims:
+                    full_w, full_h = self.backend.slide_dims
+                    thumb = self.backend.input_thumbnail(max_side=900)
+                    self.crop_thumb_in.set_image(thumb, full_w=full_w, full_h=full_h, callback=self._on_rectangle_selected)
+                    self.crop_thumb_in.set_selection_from_full_coords(
+                        self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
+                    )
                 self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(roi, 512))
-            self.info_label.setText(f"Preview ready: {roi.shape[1]} x {roi.shape[0]} px")
+            self.info_label.setText(f"Preview ready: {roi.shape[1]} x {roi.shape[0]} px | Reader: {self.backend.reader}")
         except Exception as e:
             QMessageBox.critical(self, "Preview Error", str(e))
+
+    def _crop_output_settings(self):
+        suffix = self.crop_suffix_edit.text().strip() or "final"
+        downsample = float(self.crop_downsample_spin.value())
+        if downsample != 1.0:
+            ds_txt = f"DS{int(downsample)}" if downsample.is_integer() else f"DS{downsample:g}"
+            suffix = f"{suffix}{ds_txt}"
+        combo = self.crop_out_combo.currentText()
+        output_format = _write_format_from_combo(combo)
+        write_ome = combo.startswith("OME-TIFF")
+        ext = ".ome.tif" if write_ome else _extension_from_combo(combo)
+        return suffix, downsample, combo, output_format, write_ome, ext
 
     def crop_image(self):
         if not self.backend.path or not self.backend.path_obj:
             QMessageBox.warning(self, "Error", "Please select a file first.")
             return
         try:
-            suffix = self.crop_suffix_edit.text().strip() or "final"
-            downsample = float(self.crop_downsample_spin.value())
-            if downsample != 1.0:
-                ds_txt = f"DS{int(downsample)}" if downsample.is_integer() else f"DS{downsample:g}"
-                suffix = f"{suffix}{ds_txt}"
-            combo = self.crop_out_combo.currentText()
-            output_format = _write_format_from_combo(combo)
-            write_ome = combo.startswith("OME-TIFF")
-            ext = ".ome.tif" if write_ome else _extension_from_combo(combo)
+            suffix, raw_downsample, combo, output_format, write_ome, ext = self._crop_output_settings()
             out_path = self.backend.path_obj.parent / f"{self.backend.path_obj.stem}_crop_{suffix}{ext}"
-            roi, fallback_info = self.backend.crop(self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value(), fill=255)
-            raw_downsample = float(self.crop_downsample_spin.value())
+            roi, _ = self.backend.crop(self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value(), fill=255)
             if raw_downsample != 1.0:
                 from PIL import Image
                 new_w = max(1, int(round(roi.shape[1] / raw_downsample)))
                 new_h = max(1, int(round(roi.shape[0] / raw_downsample)))
                 roi = np.asarray(Image.fromarray(roi).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
-            save_rgb_image(out_path, roi, output_format, write_ome, self.crop_lossless_chk.isChecked(), self.backend.source_resolution, self.backend.source_mpp, out_path.stem, self.backend.openslide_props if write_ome else None)
+            save_rgb_image(
+                out_path, roi, output_format, write_ome, self.crop_lossless_chk.isChecked(),
+                self.backend.source_resolution, self.backend.source_mpp, out_path.stem,
+                self.backend.openslide_props if write_ome else None
+            )
             if self.crop_preview_chk.isChecked():
                 self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(roi, 512))
-            self.info_label.setText(f"Saved: {out_path}")
+            self.info_label.setText(f"Saved: {out_path} | Reader: {self.backend.reader}")
             QMessageBox.information(self, "Success", f"Saved:\n{out_path}")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
+    # ========================================================
+    # Tiles page
+    # ========================================================
+
     def _build_tiles_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+
         file_layout = QHBoxLayout()
         self.tiles_file_label = QLabel("No image selected")
         self.tiles_file_label.setStyleSheet("padding: 10px; border: 1px solid #bdc3c7; border-radius: 5px;")
@@ -907,36 +1418,102 @@ class WSICropTileMergeGUI(QMainWindow):
 
         params = QGroupBox("Tiling parameters")
         grid = QGridLayout(params)
+
+        self.tile_mode_label = QLabel("Tiling method:")
+        self.tile_mode_combo = QComboBox()
+        self.tile_mode_combo.addItems(["Fixed square tile size", "Divide image by rows/columns"])
+        self.tile_mode_combo.currentIndexChanged.connect(self.update_tile_mode_controls)
+
+        self.tile_fixed_info_label = QLabel(
+            "Fixed square tiles. True border tiles are padded to tile size. Middle tiles are direct crops."
+        )
+        self.tile_fixed_info_label.setStyleSheet("color: #555;")
+        self.tile_division_info_label = QLabel(
+            "Divide image into a fixed grid. Tiles may be rectangular; no artificial padding is added."
+        )
+        self.tile_division_info_label.setStyleSheet("color: #555;")
+
+        self.tile_size_label = QLabel("Tile size px:")
         self.tile_size_spin = QSpinBox()
         self.tile_size_spin.setRange(16, 100000)
         self.tile_size_spin.setValue(1024)
+
+        self.tile_overlap_label = QLabel("Overlap:")
         self.tile_overlap_spin = QDoubleSpinBox()
         self.tile_overlap_spin.setRange(0, 99.9)
         self.tile_overlap_spin.setDecimals(2)
         self.tile_overlap_spin.setValue(0.0)
         self.tile_overlap_spin.setSuffix(" %")
+
+
+        self.tile_padding_label = QLabel("Padding color:")
+        self.tile_padding_combo = QComboBox()
+        self.tile_padding_combo.addItems(["black", "white"])
+
+        self.tile_rows_label = QLabel("Rows:")
+        self.tile_rows_spin = QSpinBox()
+        self.tile_rows_spin.setRange(1, 10000)
+        self.tile_rows_spin.setValue(2)
+
+        self.tile_cols_label = QLabel("Columns:")
+        self.tile_cols_spin = QSpinBox()
+        self.tile_cols_spin.setRange(1, 10000)
+        self.tile_cols_spin.setValue(2)
+
+        self.tile_downsample_label = QLabel("Downsample:")
         self.tile_downsample_spin = QDoubleSpinBox()
         self.tile_downsample_spin.setRange(0.01, 1000.0)
         self.tile_downsample_spin.setDecimals(2)
         self.tile_downsample_spin.setValue(1.0)
-        self.tile_padding_combo = QComboBox()
-        self.tile_padding_combo.addItems(["black", "white"])
+
+        self.tile_format_label = QLabel("Format:")
         self.tile_out_combo = QComboBox()
         self.tile_out_combo.addItems(["TIFF (.tif)", "JPEG (.jpg)"])
+
         self.tile_lossless_chk = QCheckBox("Lossless TIFF compression")
         self.tile_lossless_chk.setChecked(True)
-        grid.addWidget(QLabel("Square tile size px:"), 0, 0)
-        grid.addWidget(self.tile_size_spin, 0, 1)
-        grid.addWidget(QLabel("Overlap:"), 0, 2)
-        grid.addWidget(self.tile_overlap_spin, 0, 3)
-        grid.addWidget(QLabel("Downsample:"), 1, 0)
-        grid.addWidget(self.tile_downsample_spin, 1, 1)
-        grid.addWidget(QLabel("Padding:"), 1, 2)
-        grid.addWidget(self.tile_padding_combo, 1, 3)
-        grid.addWidget(QLabel("Format:"), 2, 0)
-        grid.addWidget(self.tile_out_combo, 2, 1)
-        grid.addWidget(self.tile_lossless_chk, 2, 2, 1, 2)
+
+        grid.addWidget(self.tile_mode_label, 0, 0)
+        grid.addWidget(self.tile_mode_combo, 0, 1, 1, 2)
+        grid.addWidget(self.tile_fixed_info_label, 1, 0, 1, 4)
+        grid.addWidget(self.tile_division_info_label, 1, 0, 1, 4)
+
+        grid.addWidget(self.tile_size_label, 2, 0)
+        grid.addWidget(self.tile_size_spin, 2, 1)
+        grid.addWidget(self.tile_overlap_label, 2, 2)
+        grid.addWidget(self.tile_overlap_spin, 2, 3)
+        grid.addWidget(self.tile_padding_label, 3, 0)
+        grid.addWidget(self.tile_padding_combo, 3, 1)
+
+        grid.addWidget(self.tile_rows_label, 2, 0)
+        grid.addWidget(self.tile_rows_spin, 2, 1)
+        grid.addWidget(self.tile_cols_label, 2, 2)
+        grid.addWidget(self.tile_cols_spin, 2, 3)
+
+        grid.addWidget(self.tile_downsample_label, 4, 0)
+        grid.addWidget(self.tile_downsample_spin, 4, 1)
+        grid.addWidget(self.tile_format_label, 4, 2)
+        grid.addWidget(self.tile_out_combo, 4, 3)
+        grid.addWidget(self.tile_lossless_chk, 5, 0, 1, 4)
+
         layout.addWidget(params)
+
+        self.tile_fixed_widgets = [
+            self.tile_fixed_info_label,
+            self.tile_size_label,
+            self.tile_size_spin,
+            self.tile_overlap_label,
+            self.tile_overlap_spin,
+            self.tile_padding_label,
+            self.tile_padding_combo,
+        ]
+        self.tile_division_widgets = [
+            self.tile_division_info_label,
+            self.tile_rows_label,
+            self.tile_rows_spin,
+            self.tile_cols_label,
+            self.tile_cols_spin,
+        ]
 
         prev = QGroupBox("Thumbnail / Grid Preview")
         prev_layout = QHBoxLayout(prev)
@@ -955,16 +1532,34 @@ class WSICropTileMergeGUI(QMainWindow):
         btn_row.addWidget(preview_btn)
         btn_row.addWidget(save_btn)
         layout.addLayout(btn_row)
+
+        self.update_tile_mode_controls()
         return page
 
+    def update_tile_mode_controls(self):
+        if not hasattr(self, "tile_mode_combo"):
+            return
+        is_fixed = self.tile_mode_combo.currentText().startswith("Fixed")
+        self._set_widgets_visible(self.tile_fixed_widgets, is_fixed)
+        self._set_widgets_visible(self.tile_division_widgets, not is_fixed)
+
+
+        if hasattr(self, "info_label"):
+            if is_fixed:
+                self.info_label.setText(
+                    "Tiles mode: fixed square tiles. True border tiles are padded; middle tiles are direct crops."
+                )
+            else:
+                self.info_label.setText("Tiles mode: divide image by rows and columns. Tiles may be rectangular.")
+
     def load_one_tile_image(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select image", "", "Image Files (*.tif *.tiff *.ome.tif *.ome.tiff *.ndpi *.jpg *.jpeg *.png);;All Files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select image", "", _image_file_filter())
         if path:
             self.bulk_paths = [Path(path)]
             self._load_tiles_preview_image(self.bulk_paths[0])
 
     def load_bulk_tile_images(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select images for bulk tiling", "", "Image Files (*.tif *.tiff *.ome.tif *.ome.tiff *.ndpi *.jpg *.jpeg *.png);;All Files (*)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select images for bulk tiling", "", _image_file_filter())
         if paths:
             self.bulk_paths = [Path(p) for p in paths]
             self._load_tiles_preview_image(self.bulk_paths[0])
@@ -972,32 +1567,56 @@ class WSICropTileMergeGUI(QMainWindow):
     def _load_tiles_preview_image(self, path):
         self.backend = ImageBackend().load(str(path))
         w, h = self.backend.slide_dims
-        self.tiles_file_label.setText(f"Selected: {len(self.bulk_paths)} file(s) | Preview: {path.name} | {w} x {h} px")
+        print("Loaded for tiling with:", self.backend.reader, self.backend.file_kind, self.backend.path_obj.suffix)
+        self.tiles_file_label.setText(
+            f"Selected: {len(self.bulk_paths)} file(s) | Preview: {path.name} | {w} x {h} px | Reader: {self.backend.reader}"
+        )
         self._set_label_pixmap(self.tiles_thumb, self.backend.input_thumbnail(max_side=768))
-        self.info_label.setText(f"Loaded for tiling: {path.name}")
+        self.info_label.setText(f"Loaded for tiling: {path.name} | Reader: {self.backend.reader}")
 
     def _tile_params(self):
-        return (
-            int(self.tile_size_spin.value()),
-            float(self.tile_overlap_spin.value()),
-            float(self.tile_downsample_spin.value()),
-            self.tile_padding_combo.currentText(),
-            _write_format_from_combo(self.tile_out_combo.currentText()),
-            _extension_from_combo(self.tile_out_combo.currentText()),
-        )
+        return {
+            "mode": self.tile_mode_combo.currentText(),
+            "tile_size": int(self.tile_size_spin.value()),
+            "overlap": float(self.tile_overlap_spin.value()),
+            "rows": int(self.tile_rows_spin.value()),
+            "cols": int(self.tile_cols_spin.value()),
+            "downsample": float(self.tile_downsample_spin.value()),
+            "padding": self.tile_padding_combo.currentText(),
+            "output_format": _write_format_from_combo(self.tile_out_combo.currentText()),
+            "ext": _extension_from_combo(self.tile_out_combo.currentText()),
+        }
 
     def preview_tiles_grid(self):
         if not self.backend.path or not self.backend.slide_dims:
             QMessageBox.warning(self, "Error", "Load one or more images first.")
             return
         try:
-            tile_size, overlap, downsample, padding, output_format, ext = self._tile_params()
+            params = self._tile_params()
             full_w, full_h = self.backend.slide_dims
             thumb = self.backend.input_thumbnail(max_side=768)
-            pm = self._draw_grid_on_thumb(thumb, full_w, full_h, tile_size, overlap)
+
+            if params["mode"].startswith("Fixed"):
+                tile_size = params["tile_size"]
+                overlap = params["overlap"]
+                pm = self._draw_fixed_grid_on_thumb(thumb, full_w, full_h, tile_size, overlap)
+                xs, ys, stride, ovpx = _compute_tile_grid(full_w, full_h, tile_size, overlap)
+                self.info_label.setText(
+                    f"Fixed grid: {len(xs)} columns x {len(ys)} rows = {len(xs) * len(ys)} tiles | "
+                    f"Overlap {overlap:g}% ({ovpx}px) | Stride {stride}px | Reader: {self.backend.reader}"
+                )
+            else:
+                rows = params["rows"]
+                cols = params["cols"]
+                pm = self._draw_division_grid_on_thumb(thumb, full_w, full_h, rows, cols)
+                approx_w = int(math.ceil(full_w / cols))
+                approx_h = int(math.ceil(full_h / rows))
+                self.info_label.setText(
+                    f"Division grid: {rows} rows x {cols} columns = {rows * cols} tiles | "
+                    f"Approx tile size: {approx_w} x {approx_h} px | Reader: {self.backend.reader}"
+                )
+
             self.tiles_thumb.setPixmap(pm.scaled(self.tiles_thumb.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            xs, ys, stride, ovpx = _compute_tile_grid(full_w, full_h, tile_size, overlap)
-            self.info_label.setText(f"Grid: {len(xs)} columns x {len(ys)} rows = {len(xs)*len(ys)} tiles | Overlap {overlap:g}% ({ovpx}px) | Stride {stride}px")
         except Exception as e:
             QMessageBox.critical(self, "Preview Error", str(e))
 
@@ -1006,23 +1625,37 @@ class WSICropTileMergeGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Load one or more images first.")
             return
         try:
-            tile_size, overlap, downsample, padding, output_format, ext = self._tile_params()
-            suffix = _suffix_for_tile(overlap, downsample)
+            params = self._tile_params()
             jobs = []
             total_tiles = 0
             for p in self.bulk_paths:
                 b = ImageBackend().load(str(p))
                 w, h = b.slide_dims
-                xs, ys, _, _ = _compute_tile_grid(w, h, tile_size, overlap)
-                jobs.append((p, len(xs), len(ys)))
-                total_tiles += len(xs) * len(ys)
+                if params["mode"].startswith("Fixed"):
+                    xs, ys, _, _ = _compute_tile_grid(w, h, params["tile_size"], params["overlap"])
+                    n_tiles = len(xs) * len(ys)
+                else:
+                    n_tiles = params["rows"] * params["cols"]
+                jobs.append((p, b.reader, n_tiles))
+                total_tiles += n_tiles
+
+            if total_tiles == 0:
+                QMessageBox.warning(self, "No tiles", "No tiles would be generated with the current settings.")
+                return
+
             self.progress.setVisible(True)
             self.progress.setRange(0, total_tiles)
             self.progress.setValue(0)
             QApplication.processEvents()
+
             written = 0
             for p, _, _ in jobs:
-                written += self._save_tiles_one_image(p, tile_size, overlap, downsample, padding, output_format, ext, suffix, written)
+                if params["mode"].startswith("Fixed"):
+                    count = self._save_fixed_tiles_one_image(p, params, written)
+                else:
+                    count = self._save_division_tiles_one_image(p, params, written)
+                written += count
+
             self.progress.setVisible(False)
             self.info_label.setText(f"Done: saved {written} tiles from {len(self.bulk_paths)} image(s).")
             QMessageBox.information(self, "Done", f"Saved {written} tiles from {len(self.bulk_paths)} image(s).")
@@ -1030,30 +1663,112 @@ class WSICropTileMergeGUI(QMainWindow):
             self.progress.setVisible(False)
             QMessageBox.critical(self, "Tiling Error", str(e))
 
-    def _save_tiles_one_image(self, image_path, tile_size, overlap, downsample, padding, output_format, ext, suffix, start_progress):
+    def _save_fixed_tiles_one_image(self, image_path, params, start_progress):
         backend = ImageBackend().load(str(image_path))
         full_w, full_h = backend.slide_dims
+        tile_size = params["tile_size"]
+        overlap = params["overlap"]
+        downsample = params["downsample"]
+        padding = params["padding"]
+        output_format = params["output_format"]
+        ext = params["ext"]
+
+        suffix = _suffix_for_tile(overlap, downsample)
+
         xs, ys, _, _ = _compute_tile_grid(full_w, full_h, tile_size, overlap)
         out_dir = image_path.parent / image_path.stem
         out_dir.mkdir(parents=True, exist_ok=True)
         count = 0
+        total = len(xs) * len(ys)
+
         for row_idx, y in enumerate(ys):
             for col_idx, x in enumerate(xs):
-                tile = backend.read_tile_with_padding(x=x, y=y, size=tile_size, padding_color=padding)
+                crop_w = min(tile_size, full_w - x)
+                crop_h = min(tile_size, full_h - y)
+                if crop_w <= 0 or crop_h <= 0:
+                    continue
+
+                # Only use padding when the tile truly touches the image boundary.
+                # For internal/middle tiles, use a direct crop. This avoids accidental padding
+                # appearing in the middle of the image.
+                is_edge_tile = (x + tile_size > full_w) or (y + tile_size > full_h)
+
+                if is_edge_tile:
+                    tile = backend.read_tile_with_padding(x=x, y=y, size=tile_size, padding_color=padding)
+                    actual_w, actual_h = crop_w, crop_h
+                else:
+                    tile, _ = backend.crop(x, y, tile_size, tile_size, fill=255)
+                    actual_w, actual_h = tile_size, tile_size
+
                 if float(downsample) != 1.0:
                     from PIL import Image
-                    new_size = max(1, int(round(tile_size / downsample)))
-                    tile = np.asarray(Image.fromarray(tile).resize((new_size, new_size), Image.Resampling.LANCZOS), dtype=np.uint8)
-                out_name = f"{image_path.stem}_{_col_to_letters(col_idx)}{row_idx + 1}{suffix}{ext}"
+                    new_w = max(1, int(round(tile.shape[1] / downsample)))
+                    new_h = max(1, int(round(tile.shape[0] / downsample)))
+                    tile = np.asarray(Image.fromarray(tile).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
+
+                out_name = (
+                    f"{image_path.stem}_{_col_to_letters(col_idx)}{row_idx + 1}{suffix}"
+                    f"_X{x}_Y{y}_W{actual_w}_H{actual_h}{ext}"
+                )
                 out_path = out_dir / out_name
-                save_rgb_image(out_path, tile, output_format, False, self.tile_lossless_chk.isChecked(), backend.source_resolution, backend.source_mpp, out_path.stem)
+                save_rgb_image(
+                    out_path, tile, output_format, False, self.tile_lossless_chk.isChecked(),
+                    backend.source_resolution, backend.source_mpp, out_path.stem
+                )
                 count += 1
                 self.progress.setValue(start_progress + count)
                 if count % 10 == 0:
-                    self.info_label.setText(f"Saving tiles: {image_path.name} | {count}/{len(xs)*len(ys)}")
+                    self.info_label.setText(
+                        f"Saving fixed tiles: {image_path.name} | {count}/{total} | Reader: {backend.reader}"
+                    )
                     QApplication.processEvents()
+
         QApplication.processEvents()
         return count
+
+    def _save_division_tiles_one_image(self, image_path, params, start_progress):
+        backend = ImageBackend().load(str(image_path))
+        full_w, full_h = backend.slide_dims
+        rows = params["rows"]
+        cols = params["cols"]
+        downsample = params["downsample"]
+        output_format = params["output_format"]
+        ext = params["ext"]
+        suffix = _suffix_for_division_tile(rows, cols, downsample)
+        out_dir = image_path.parent / f"{image_path.stem}_{suffix}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        total = rows * cols
+        count = 0
+
+        for r in range(rows):
+            for c in range(cols):
+                x, y, w, h = _division_bounds(0, 0, full_w, full_h, rows, cols, r, c)
+                tile, _ = backend.crop(x, y, w, h, fill=255)
+
+                if float(downsample) != 1.0:
+                    from PIL import Image
+                    new_w = max(1, int(round(tile.shape[1] / downsample)))
+                    new_h = max(1, int(round(tile.shape[0] / downsample)))
+                    tile = np.asarray(Image.fromarray(tile).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
+
+                out_name = f"{image_path.stem}_R{r + 1:03d}_C{c + 1:03d}{suffix}_X{x}_Y{y}_W{w}_H{h}{ext}"
+                out_path = out_dir / out_name
+                save_rgb_image(
+                    out_path, tile, output_format, False, self.tile_lossless_chk.isChecked(),
+                    backend.source_resolution, backend.source_mpp, out_path.stem
+                )
+                count += 1
+                self.progress.setValue(start_progress + count)
+                if count % 5 == 0:
+                    self.info_label.setText(f"Saving division tiles: {image_path.name} | {count}/{total} | Reader: {backend.reader}")
+                    QApplication.processEvents()
+
+        QApplication.processEvents()
+        return count
+
+    # ========================================================
+    # Merge page
+    # ========================================================
 
     def _build_merge_page(self):
         page = QWidget()
@@ -1120,11 +1835,14 @@ class WSICropTileMergeGUI(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select folder containing tiles")
         if folder:
             folder = Path(folder)
-            self.tile_files = sorted([p for p in folder.iterdir() if p.is_file() and p.name.lower().endswith((".tif", ".tiff", ".jpg", ".jpeg", ".png"))])
+            self.tile_files = sorted([
+                p for p in folder.iterdir()
+                if p.is_file() and _has_ext(p.name, (".tif", ".tiff", ".ome.tif", ".ome.tiff", ".jpg", ".jpeg", ".png"))
+            ])
             self.merge_file_label.setText(f"Loaded {len(self.tile_files)} tile file(s) from {folder}")
 
     def select_tile_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select tile files", "", "Image Files (*.tif *.tiff *.jpg *.jpeg *.png);;All Files (*)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select tile files", "", _tile_file_filter())
         if paths:
             self.tile_files = sorted([Path(p) for p in paths])
             self.merge_file_label.setText(f"Loaded {len(self.tile_files)} selected tile file(s)")
@@ -1136,7 +1854,10 @@ class WSICropTileMergeGUI(QMainWindow):
             if meta is not None:
                 metas.append(meta)
         if not metas:
-            raise ValueError("No valid tiles found. Expected ImageName_A1.tif or ImageName_B2Ov10DS2.tif")
+            raise ValueError(
+                "No valid tiles found. Expected ImageName_A1.tif, ImageName_B2Ov10DS2.tif, "
+                "or ImageName_R001_C001Div2x2.tif"
+            )
         bases = sorted(set(m["base"] for m in metas))
         if len(bases) != 1:
             raise ValueError(f"Multiple image bases detected: {bases}. Select one tile set at a time.")
@@ -1152,7 +1873,7 @@ class WSICropTileMergeGUI(QMainWindow):
         return float(txt)
 
     def _read_tile_file(self, path):
-        if path.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+        if _has_ext(path.name, (".jpg", ".jpeg", ".png")):
             from PIL import Image
             return _to_uint8_rgb(np.asarray(Image.open(path).convert("RGB")))
         return _to_uint8_rgb(tifffile.imread(str(path)))
@@ -1186,6 +1907,31 @@ class WSICropTileMergeGUI(QMainWindow):
         self.manual_layout = dlg.get_layout()
         return True
 
+    def _tile_canvas_geometry(self, metas, overlap):
+        # More robust than assuming all tiles have the first tile size.
+        # This handles partial edge tiles correctly.
+        sizes = {}
+        max_right = 0
+        max_bottom = 0
+
+        first = self._read_tile_file(metas[0]["path"])
+        base_h, base_w = first.shape[:2]
+        stride_x = base_w - int(round(base_w * overlap / 100.0))
+        stride_y = base_h - int(round(base_h * overlap / 100.0))
+        if stride_x <= 0 or stride_y <= 0:
+            raise ValueError("Overlap must be lower than 100%.")
+
+        for m in metas:
+            tile = self._read_tile_file(m["path"])
+            th, tw = tile.shape[:2]
+            sizes[m["path"]] = (tw, th)
+            x = m["col"] * stride_x
+            y = m["row"] * stride_y
+            max_right = max(max_right, x + tw)
+            max_bottom = max(max_bottom, y + th)
+
+        return int(max_right), int(max_bottom), stride_x, stride_y, sizes
+
     def _reconstruct_tiles_manual(self, preview=False):
         if not self.manual_layout:
             if not self._open_manual_layout_dialog():
@@ -1200,18 +1946,22 @@ class WSICropTileMergeGUI(QMainWindow):
         first_path = next(iter(mapping.values()))
         first = self._read_tile_file(first_path)
         tile_h, tile_w = first.shape[:2]
-        if tile_w != tile_h:
-            raise ValueError(f"Tiles must be square. First tile is {tile_w} x {tile_h}.")
-
-        tile_size = tile_w
         overlap = self._manual_overlap_value()
-        overlap_px = int(round(tile_size * overlap / 100.0))
-        stride = tile_size - overlap_px
-        if stride <= 0:
+        stride_x = tile_w - int(round(tile_w * overlap / 100.0))
+        stride_y = tile_h - int(round(tile_h * overlap / 100.0))
+        if stride_x <= 0 or stride_y <= 0:
             raise ValueError("Overlap must be lower than 100%.")
 
-        out_w = (cols - 1) * stride + tile_size
-        out_h = (rows - 1) * stride + tile_size
+        out_w = 0
+        out_h = 0
+        tile_cache = {}
+        for (r, c), tile_path in mapping.items():
+            tile = self._read_tile_file(tile_path)
+            tile_cache[(r, c)] = tile
+            th, tw = tile.shape[:2]
+            out_w = max(out_w, c * stride_x + tw)
+            out_h = max(out_h, r * stride_y + th)
+
         base = Path(first_path).parent.name or "manual_layout"
 
         if preview:
@@ -1220,57 +1970,42 @@ class WSICropTileMergeGUI(QMainWindow):
             prev_h = max(1, int(round(out_h * scale)))
             canvas = np.zeros((prev_h, prev_w, 3), dtype=np.uint8)
             from PIL import Image
-            for (r, c), tile_path in mapping.items():
-                tile = self._read_tile_file(tile_path)
-                small_size = max(1, int(round(tile_size * scale)))
-                small = Image.fromarray(tile).resize((small_size, small_size), Image.Resampling.BILINEAR)
-                small = np.asarray(small, dtype=np.uint8)
-                x = int(round(c * stride * scale))
-                y = int(round(r * stride * scale))
+            for (r, c), tile in tile_cache.items():
+                small_w = max(1, int(round(tile.shape[1] * scale)))
+                small_h = max(1, int(round(tile.shape[0] * scale)))
+                small = np.asarray(Image.fromarray(tile).resize((small_w, small_h), Image.Resampling.BILINEAR), dtype=np.uint8)
+                x = int(round(c * stride_x * scale))
+                y = int(round(r * stride_y * scale))
                 hh, ww = small.shape[:2]
                 canvas[y:min(y+hh, prev_h), x:min(x+ww, prev_w), :] = small[:max(0, min(hh, prev_h-y)), :max(0, min(ww, prev_w-x)), :]
             if self.merge_crop_padding_chk.isChecked():
                 canvas = _crop_external_padding(canvas, self.merge_padding_combo.currentText())
-            return canvas, base, overlap, stride
+            return canvas, base, overlap, min(stride_x, stride_y)
 
         merged = np.zeros((out_h, out_w, 3), dtype=np.uint8)
-        total = len(mapping)
         self.progress.setVisible(True)
-        self.progress.setRange(0, total)
+        self.progress.setRange(0, len(tile_cache))
         self.progress.setValue(0)
-        for i, ((r, c), tile_path) in enumerate(mapping.items(), start=1):
-            tile = self._read_tile_file(tile_path)
-            if tile.shape[0] != tile_size or tile.shape[1] != tile_size:
-                raise ValueError(f"All tiles must have same square size. Problem: {tile_path.name}")
-            x = c * stride
-            y = r * stride
-            merged[y:y+tile_size, x:x+tile_size, :] = tile
+        for i, ((r, c), tile) in enumerate(tile_cache.items(), start=1):
+            x = c * stride_x
+            y = r * stride_y
+            th, tw = tile.shape[:2]
+            merged[y:y+th, x:x+tw, :] = tile
             self.progress.setValue(i)
             if i % 10 == 0:
                 QApplication.processEvents()
         self.progress.setVisible(False)
         if self.merge_crop_padding_chk.isChecked():
             merged = _crop_external_padding(merged, self.merge_padding_combo.currentText())
-        return merged, base, overlap, stride
+        return merged, base, overlap, min(stride_x, stride_y)
 
     def _reconstruct_tiles(self, preview=False):
         if self.merge_mode_combo.currentText().startswith("Manual"):
             return self._reconstruct_tiles_manual(preview=preview)
+
         metas, base = self._collect_tile_metadata()
         overlap = self._merge_overlap_value(metas)
-        first = self._read_tile_file(metas[0]["path"])
-        tile_h, tile_w = first.shape[:2]
-        if tile_w != tile_h:
-            raise ValueError(f"Tiles must be square. First tile is {tile_w} x {tile_h}.")
-        tile_size = tile_w
-        overlap_px = int(round(tile_size * overlap / 100.0))
-        stride = tile_size - overlap_px
-        if stride <= 0:
-            raise ValueError("Overlap must be lower than 100%.")
-        max_col = max(m["col"] for m in metas)
-        max_row = max(m["row"] for m in metas)
-        out_w = max_col * stride + tile_size
-        out_h = max_row * stride + tile_size
+        out_w, out_h, stride_x, stride_y, sizes = self._tile_canvas_geometry(metas, overlap)
 
         if preview:
             scale = min(820 / out_w, 430 / out_h, 1.0)
@@ -1280,31 +2015,33 @@ class WSICropTileMergeGUI(QMainWindow):
             from PIL import Image
             for m in metas:
                 tile = self._read_tile_file(m["path"])
-                small = Image.fromarray(tile).resize((max(1, int(round(tile_size * scale))), max(1, int(round(tile_size * scale)))), Image.Resampling.BILINEAR)
-                small = np.asarray(small, dtype=np.uint8)
-                x = int(round(m["col"] * stride * scale))
-                y = int(round(m["row"] * stride * scale))
+                small_w = max(1, int(round(tile.shape[1] * scale)))
+                small_h = max(1, int(round(tile.shape[0] * scale)))
+                small = np.asarray(Image.fromarray(tile).resize((small_w, small_h), Image.Resampling.BILINEAR), dtype=np.uint8)
+                x = int(round(m["col"] * stride_x * scale))
+                y = int(round(m["row"] * stride_y * scale))
                 hh, ww = small.shape[:2]
                 canvas[y:min(y+hh, prev_h), x:min(x+ww, prev_w), :] = small[:max(0, min(hh, prev_h-y)), :max(0, min(ww, prev_w-x)), :]
             if self.merge_crop_padding_chk.isChecked():
                 canvas = _crop_external_padding(canvas, self.merge_padding_combo.currentText())
-            return canvas, base, overlap, stride
+            return canvas, base, overlap, min(stride_x, stride_y)
 
         merged = np.zeros((out_h, out_w, 3), dtype=np.uint8)
         self.progress.setVisible(True)
         self.progress.setRange(0, len(metas))
         for i, m in enumerate(metas, start=1):
             tile = self._read_tile_file(m["path"])
-            x = m["col"] * stride
-            y = m["row"] * stride
-            merged[y:y+tile_size, x:x+tile_size, :] = tile
+            x = m["col"] * stride_x
+            y = m["row"] * stride_y
+            th, tw = tile.shape[:2]
+            merged[y:y+th, x:x+tw, :] = tile
             self.progress.setValue(i)
             if i % 10 == 0:
                 QApplication.processEvents()
         self.progress.setVisible(False)
         if self.merge_crop_padding_chk.isChecked():
             merged = _crop_external_padding(merged, self.merge_padding_combo.currentText())
-        return merged, base, overlap, stride
+        return merged, base, overlap, min(stride_x, stride_y)
 
     def preview_merge(self):
         if not self.tile_files:
@@ -1340,6 +2077,10 @@ class WSICropTileMergeGUI(QMainWindow):
             self.progress.setVisible(False)
             QMessageBox.critical(self, "Merge Error", str(e))
 
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
     app = QApplication(sys.argv)
