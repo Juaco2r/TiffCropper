@@ -20,8 +20,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QTextBrowser, QDialogButtonBox
 )
 from PyQt5.QtCore import Qt, QRect, QPoint
-from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor
-
+from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QIcon
 
 # ============================================================
 # App metadata
@@ -35,6 +34,21 @@ APP_GITHUB = "https://github.com/Juaco2r/TiffCropper"
 APP_AUTHOR = "José Rodriguez-Rojas"
 APP_YEAR = "2026"
 APP_LICENSE = "MIT License"
+APP_ICON_PATH = "assets/icon/cropper.ico"
+
+
+def resource_path(relative_path):
+    """
+    Get absolute path to a bundled resource.
+
+    Works both during normal Python execution and inside a PyInstaller executable.
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base_path = Path(sys._MEIPASS)
+    else:
+        base_path = Path(__file__).resolve().parents[2]
+
+    return str(base_path / relative_path)
 APP_CITATION = (
     f"Rodriguez-Rojas J. {APP_TITLE}. "
     f"Version {APP_VERSION}. Zenodo; {APP_YEAR}. "
@@ -155,6 +169,152 @@ def _tag_to_float(tag):
         return float(v)
     except Exception:
         return None
+
+
+def _resolution_to_mpp(xres: float, yres: float, unit: str):
+    """Convert TIFF resolution tags to micrometers per pixel.
+
+    TIFF stores resolution as pixels per unit. The physical pixel size is
+    therefore the size of that unit divided by the resolution value.
+    """
+    if not xres or not yres or not unit:
+        return None
+    unit = str(unit).upper()
+    try:
+        if unit == "INCH":
+            return 25400.0 / float(xres), 25400.0 / float(yres)
+        if unit == "CENTIMETER":
+            return 10000.0 / float(xres), 10000.0 / float(yres)
+    except Exception:
+        return None
+    return None
+
+
+def _mpp_to_resolution_tuple(mpp_x: float, mpp_y: float):
+    """Return a TIFF resolution tuple in pixels per inch from µm/px."""
+    if not mpp_x or not mpp_y:
+        return None
+    try:
+        return (_mpp_to_dpi(float(mpp_x)), _mpp_to_dpi(float(mpp_y)), "INCH")
+    except Exception:
+        return None
+
+
+def _convert_physical_size_to_um(value, unit):
+    """Convert OME physical size units to micrometers."""
+    try:
+        value = float(value)
+    except Exception:
+        return None
+
+    unit = str(unit or "um").strip().lower().replace("µ", "u")
+
+    if unit in ("um", "micrometer", "micrometre", "micrometers", "micrometres"):
+        return value
+    if unit in ("nm", "nanometer", "nanometre", "nanometers", "nanometres"):
+        return value / 1000.0
+    if unit in ("mm", "millimeter", "millimetre", "millimeters", "millimetres"):
+        return value * 1000.0
+    if unit in ("cm", "centimeter", "centimetre", "centimeters", "centimetres"):
+        return value * 10000.0
+    if unit in ("m", "meter", "metre", "meters", "metres"):
+        return value * 1000000.0
+
+    # If the unit is absent or unusual, assume the common OME default: micrometers.
+    return value
+
+
+def _extract_ome_physical_size_um(ome_xml):
+    """Extract PhysicalSizeX/Y from OME-XML, returned as (µm/px X, µm/px Y)."""
+    if not ome_xml:
+        return None
+
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(ome_xml)
+
+        # Namespace-aware search first, then a namespace-agnostic fallback.
+        pixels = None
+        for elem in root.iter():
+            if elem.tag.endswith("Pixels"):
+                pixels = elem
+                break
+
+        if pixels is None:
+            return None
+
+        psx = pixels.attrib.get("PhysicalSizeX")
+        psy = pixels.attrib.get("PhysicalSizeY")
+        if psx is None or psy is None:
+            return None
+
+        unit_x = pixels.attrib.get("PhysicalSizeXUnit", "um")
+        unit_y = pixels.attrib.get("PhysicalSizeYUnit", "um")
+
+        mpp_x = _convert_physical_size_to_um(psx, unit_x)
+        mpp_y = _convert_physical_size_to_um(psy, unit_y)
+
+        if mpp_x is None or mpp_y is None or mpp_x <= 0 or mpp_y <= 0:
+            return None
+        return float(mpp_x), float(mpp_y)
+    except Exception:
+        return None
+
+
+def _scale_resolution_and_mpp(source_resolution=None, source_mpp=None, pixel_scale=1.0):
+    """Adjust calibration metadata after image downsampling.
+
+    pixel_scale is the linear pixel-size scale factor. For example, downsample=2
+    means output pixels are physically twice as large, so µm/px doubles and
+    pixels-per-inch/centimeter resolution halves.
+    """
+    try:
+        pixel_scale = float(pixel_scale)
+    except Exception:
+        pixel_scale = 1.0
+    if pixel_scale <= 0:
+        pixel_scale = 1.0
+
+    scaled_resolution = None
+    if source_resolution is not None:
+        try:
+            xres, yres, unit = source_resolution
+            if xres and yres and unit:
+                scaled_resolution = (
+                    float(xres) / pixel_scale,
+                    float(yres) / pixel_scale,
+                    unit
+                )
+        except Exception:
+            scaled_resolution = None
+
+    scaled_mpp = None
+    if source_mpp is not None:
+        try:
+            mpp_x, mpp_y = source_mpp
+            if mpp_x and mpp_y:
+                scaled_mpp = (
+                    float(mpp_x) * pixel_scale,
+                    float(mpp_y) * pixel_scale
+                )
+        except Exception:
+            scaled_mpp = None
+
+    # If only one representation exists, derive the other so TIFF tags and OME XML agree.
+    if scaled_mpp is None and scaled_resolution is not None:
+        try:
+            xres, yres, unit = scaled_resolution
+            scaled_mpp = _resolution_to_mpp(xres, yres, unit)
+        except Exception:
+            scaled_mpp = None
+
+    if scaled_resolution is None and scaled_mpp is not None:
+        try:
+            scaled_resolution = _mpp_to_resolution_tuple(scaled_mpp[0], scaled_mpp[1])
+        except Exception:
+            scaled_resolution = None
+
+    return scaled_resolution, scaled_mpp
 
 
 def _ome_map_annotation_xml(kv: dict, ann_id: str = "Annotation:0") -> str:
@@ -283,6 +443,7 @@ def _numpy_rgb_to_qpixmap(rgb: np.ndarray) -> QPixmap:
 class CropSelectionLabel(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
+        
         self.setAlignment(Qt.AlignCenter)
         self.setMouseTracking(True)
         self._pixmap_original = None
@@ -774,6 +935,15 @@ class ImageBackend:
         with tifffile.TiffFile(path) as tif:
             if not tif.series:
                 raise ValueError("No image series found in TIFF/OME-TIFF.")
+
+            # Prefer OME-XML physical pixel size when present because many OME-TIFF
+            # files store calibration there rather than in classic TIFF resolution tags.
+            ome_mpp = None
+            try:
+                ome_mpp = _extract_ome_physical_size_um(tif.ome_metadata)
+            except Exception:
+                ome_mpp = None
+
             s0 = tif.series[0]
             shape0 = s0.shape
             axes = getattr(s0, "axes", "")
@@ -782,6 +952,7 @@ class ImageBackend:
                 h = int(shape0[axes.index("Y")])
             else:
                 h, w = int(shape0[0]), int(shape0[1])
+
             page0 = s0.pages[0] if getattr(s0, "pages", None) else tif.pages[0]
             tags = page0.tags
             xres_f = _tag_to_float(tags.get("XResolution"))
@@ -797,8 +968,19 @@ class ImageBackend:
                         unit_str = "CENTIMETER"
                 except Exception:
                     unit_str = None
+
             res_tuple = (xres_f, yres_f, unit_str) if (xres_f and yres_f and unit_str) else None
-            mpp = (_dpi_to_mpp(xres_f), _dpi_to_mpp(yres_f)) if res_tuple and unit_str == "INCH" else None
+
+            if ome_mpp is not None:
+                mpp = ome_mpp
+            else:
+                mpp = _resolution_to_mpp(xres_f, yres_f, unit_str) if res_tuple else None
+
+            # If OME metadata provided the pixel size but TIFF resolution tags were
+            # absent/unusable, create a matching pixels-per-inch resolution tuple.
+            if res_tuple is None and mpp is not None:
+                res_tuple = _mpp_to_resolution_tuple(mpp[0], mpp[1])
+
             return int(w), int(h), res_tuple, mpp
 
     @staticmethod
@@ -1011,15 +1193,19 @@ class ImageBackend:
 # ============================================================
 
 def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, lossless=True,
-                   source_resolution=None, source_mpp=None, image_name=None, annotation_kv=None):
+                   source_resolution=None, source_mpp=None, image_name=None, annotation_kv=None,
+                   pixel_scale=1.0):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     rgb = _to_uint8_rgb(rgb)
 
-    if output_format == "jpeg":
-        from PIL import Image
-        Image.fromarray(rgb).save(str(output_path), quality=95)
-        return
+    # Apply calibration scaling after downsampling.
+    # Example: original 0.25 µm/px, downsample=2 -> output 0.50 µm/px.
+    source_resolution, source_mpp = _scale_resolution_and_mpp(
+        source_resolution=source_resolution,
+        source_mpp=source_mpp,
+        pixel_scale=pixel_scale
+    )
 
     resolution = None
     resolutionunit = None
@@ -1032,7 +1218,21 @@ def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, loss
     mpp_x_um = None
     mpp_y_um = None
     if source_mpp:
-        mpp_x_um, mpp_y_um = source_mpp
+        try:
+            mpp_x_um, mpp_y_um = float(source_mpp[0]), float(source_mpp[1])
+        except Exception:
+            mpp_x_um = None
+            mpp_y_um = None
+
+    if output_format == "jpeg":
+        from PIL import Image
+        save_kwargs = {"quality": 95}
+        # JPEG can store DPI. It cannot store full OME physical-size metadata,
+        # but adding DPI is still better than dropping calibration completely.
+        if resolution is not None and resolutionunit == "INCH":
+            save_kwargs["dpi"] = (float(resolution[0]), float(resolution[1]))
+        Image.fromarray(rgb).save(str(output_path), **save_kwargs)
+        return
 
     compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
 
@@ -1057,7 +1257,6 @@ def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, loss
             software=f"{APP_NAME} v{APP_VERSION}", resolution=resolution,
             resolutionunit=resolutionunit, **compression_kwargs
         )
-
 
 # ============================================================
 # Manual merge grid dialog
@@ -1202,6 +1401,7 @@ class ManualGridDialog(QDialog):
 class WSICropTileMergeGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.setWindowIcon(QIcon(resource_path(APP_ICON_PATH)))
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Tile / Merge")
         self.setGeometry(100, 80, 1180, 820)
         self.setStyleSheet("background-color: #f0f0f0;")
@@ -1597,7 +1797,8 @@ class WSICropTileMergeGUI(QMainWindow):
             save_rgb_image(
                 out_path, roi, output_format, write_ome, self.crop_lossless_chk.isChecked(),
                 self.backend.source_resolution, self.backend.source_mpp, out_path.stem,
-                self.backend.openslide_props if write_ome else None
+                self.backend.openslide_props if write_ome else None,
+                pixel_scale=raw_downsample
             )
             if self.crop_preview_chk.isChecked():
                 self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(roi, 512))
@@ -1984,7 +2185,8 @@ class WSICropTileMergeGUI(QMainWindow):
                 out_path = out_dir / out_name
                 save_rgb_image(
                     out_path, tile, output_format, False, self.tile_lossless_chk.isChecked(),
-                    backend.source_resolution, backend.source_mpp, out_path.stem
+                    backend.source_resolution, backend.source_mpp, out_path.stem,
+                    pixel_scale=downsample
                 )
                 count += 1
                 self.progress.setValue(start_progress + count)
@@ -2027,7 +2229,8 @@ class WSICropTileMergeGUI(QMainWindow):
                 out_path = out_dir / out_name
                 save_rgb_image(
                     out_path, tile, output_format, False, self.tile_lossless_chk.isChecked(),
-                    backend.source_resolution, backend.source_mpp, out_path.stem
+                    backend.source_resolution, backend.source_mpp, out_path.stem,
+                    pixel_scale=downsample
                 )
                 count += 1
                 self.progress.setValue(start_progress + count)
@@ -2384,7 +2587,25 @@ class WSICropTileMergeGUI(QMainWindow):
             ext = _extension_from_combo(combo)
             suffix = _suffix_for_tile(overlap, 1)
             out_path = self.tile_files[0].parent / f"{base}_merged{suffix}{ext}"
-            save_rgb_image(out_path, rgb, output_format, False, self.merge_lossless_chk.isChecked(), image_name=out_path.stem)
+
+            # Reuse calibration from the first tile. The tiles already contain the
+            # final pixel size, so no additional scaling is applied during merge.
+            source_resolution = None
+            source_mpp = None
+            try:
+                metadata_backend = ImageBackend().load(str(self.tile_files[0]))
+                source_resolution = metadata_backend.source_resolution
+                source_mpp = metadata_backend.source_mpp
+                metadata_backend.close()
+            except Exception:
+                source_resolution = None
+                source_mpp = None
+
+            save_rgb_image(
+                out_path, rgb, output_format, False, self.merge_lossless_chk.isChecked(),
+                source_resolution=source_resolution, source_mpp=source_mpp,
+                image_name=out_path.stem, pixel_scale=1.0
+            )
             self._set_label_pixmap(self.merge_thumb, _downsample_for_preview(rgb, 900))
             self.info_label.setText(f"Saved merged image: {out_path}")
             QMessageBox.information(self, "Done", f"Saved merged image:\n{out_path}")
@@ -2406,4 +2627,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    app.setWindowIcon(QIcon(resource_path(APP_ICON_PATH)))
+
+    window = WSICropTileMergeGUI()
+    window.show()
+    sys.exit(app.exec_())
