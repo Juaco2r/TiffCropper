@@ -9,8 +9,10 @@ block_cipher = None
 # Paths
 # ============================================================
 
-openslide_path = os.path.abspath("openslide_bin")
-assets_path = os.path.abspath("assets")
+project_root = os.path.abspath(".")
+openslide_path = os.path.join(project_root, "openslide_bin")
+assets_path = os.path.join(project_root, "assets")
+icon_path = os.path.join(assets_path, "icon", "cropper.ico")
 
 # ============================================================
 # Collect compiled dependencies
@@ -20,7 +22,7 @@ imagecodecs_datas, imagecodecs_binaries, imagecodecs_hiddenimports = collect_all
 numcodecs_datas, numcodecs_binaries, numcodecs_hiddenimports = collect_all("numcodecs")
 zarr_datas, zarr_binaries, zarr_hiddenimports = collect_all("zarr")
 
-# OpenSlide DLLs, if available as a Python package
+# OpenSlide dynamic libraries if available as package binaries
 openslide_binaries = collect_dynamic_libs("openslide")
 
 # ============================================================
@@ -66,6 +68,22 @@ hiddenimports = [
     # Extra safety for imagecodecs compiled modules
     "imagecodecs._shared",
     "imagecodecs._imcd",
+    "imagecodecs._aec",
+    "imagecodecs._bitshuffle",
+    "imagecodecs._brotli",
+    "imagecodecs._deflate",
+    "imagecodecs._jpeg2k",
+    "imagecodecs._jpeg8",
+    "imagecodecs._jpegsof3",
+    "imagecodecs._lz4",
+    "imagecodecs._lzf",
+    "imagecodecs._lzma",
+    "imagecodecs._png",
+    "imagecodecs._tiff",
+    "imagecodecs._webp",
+    "imagecodecs._zlib",
+    "imagecodecs._zopfli",
+    "imagecodecs._zstd",
 ]
 
 hiddenimports += imagecodecs_hiddenimports
@@ -81,7 +99,7 @@ hiddenimports = list(dict.fromkeys(hiddenimports))
 
 a = Analysis(
     ["src/tiffcropper/app.py"],
-    pathex=[],
+    pathex=[project_root],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -113,5 +131,5 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
-    icon="assets/icon/cropper.ico",
+    icon=icon_path if os.path.exists(icon_path) else None,
 )

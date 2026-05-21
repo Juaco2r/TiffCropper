@@ -65,6 +65,18 @@ jobs:
           pip install -r requirements.txt
 
       # -----------------------------
+      # Diagnostic check
+      # -----------------------------
+      - name: Check imagecodecs installation
+        run: |
+          python - <<'PY'
+          import imagecodecs
+          print("imagecodecs version:", imagecodecs.version())
+          print("delta_encode available:", hasattr(imagecodecs, "delta_encode"))
+          print("delta_decode available:", hasattr(imagecodecs, "delta_decode"))
+          PY
+
+      # -----------------------------
       # Build
       # -----------------------------
       - name: Build Windows
@@ -81,6 +93,12 @@ jobs:
             --console \
             --noupx \
             --name TiffCropper \
+            --collect-all imagecodecs \
+            --collect-all numcodecs \
+            --collect-all zarr \
+            --hidden-import imagecodecs._shared \
+            --hidden-import imagecodecs._imcd \
+            --add-data "assets:assets" \
             src/tiffcropper/app.py
 
       - name: Build macOS
@@ -91,6 +109,12 @@ jobs:
             --windowed \
             --noupx \
             --name TiffCropper \
+            --collect-all imagecodecs \
+            --collect-all numcodecs \
+            --collect-all zarr \
+            --hidden-import imagecodecs._shared \
+            --hidden-import imagecodecs._imcd \
+            --add-data "assets:assets" \
             src/tiffcropper/app.py
 
       # -----------------------------
