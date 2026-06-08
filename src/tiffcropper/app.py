@@ -4,9 +4,11 @@ import sys
 import re
 import math
 import csv
+import json
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.sax.saxutils import escape as xml_escape
 
 import numpy as np
@@ -112,6 +114,24 @@ def _image_file_filter():
 
 def _tile_file_filter():
     return "Tile Files (*.tif *.tiff *.ome.tif *.ome.tiff *.jpg *.jpeg *.png);;All Files (*)"
+
+
+# ============================================================
+# LIF splitter filters
+# ============================================================
+
+LIF_EXTENSIONS = (".lif",)
+
+
+def _lif_file_filter():
+    return "Leica LIF Files (*.lif);;All Files (*)"
+
+
+def _lif_output_folder_for(lif_path: Path, output_base: Optional[str] = None) -> Path:
+    """Return the output folder for one .lif file."""
+    if output_base:
+        return Path(output_base).expanduser() / f"{lif_path.stem}_split_ome_tiff"
+    return lif_path.parent / f"{lif_path.stem}_split_ome_tiff"
 
 
 # ============================================================
@@ -419,6 +439,107 @@ def _to_uint8_rgb(arr: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(arr.astype(np.uint8, copy=False))
 
 
+def _array_to_rgb_preview(arr: np.ndarray, axes: str = None) -> np.ndarray:
+    """Return a display-only RGB preview from grayscale, RGB, or scientific multichannel data.
+
+    This function is intentionally only for visualization. It may normalize and
+    select a representative T/Z plane, but it never controls how scientific data
+    are saved. Saving raw multichannel crops is handled separately.
+    """
+    arr = np.asarray(arr)
+    axes = (axes or "").strip()
+
+    if axes and len(axes) == arr.ndim and "Y" in axes and "X" in axes:
+        slicer = []
+        kept_axes = []
+        for ax in axes:
+            if ax in ("Y", "X", "C", "S"):
+                slicer.append(slice(None))
+                kept_axes.append(ax)
+            else:
+                # For preview only, show the first timepoint/Z-plane/etc.
+                slicer.append(0)
+        arr = arr[tuple(slicer)]
+        axes = "".join(kept_axes)
+
+        if "Y" in axes and "X" in axes:
+            order = [axes.index("Y"), axes.index("X")]
+            if "C" in axes:
+                order.append(axes.index("C"))
+            elif "S" in axes:
+                order.append(axes.index("S"))
+            arr = np.transpose(arr, order)
+
+    return _to_uint8_rgb(arr)
+
+
+def _resize_spatial_array(arr: np.ndarray, axes: str = None, downsample: float = 1.0):
+    """Resize only Y/X dimensions while preserving channels, Z, T and dtype."""
+    arr = np.asarray(arr)
+    axes = (axes or "").strip()
+    try:
+        downsample = float(downsample)
+    except Exception:
+        downsample = 1.0
+    if downsample == 1.0:
+        return arr, axes
+    if downsample <= 0:
+        raise ValueError("Downsample must be > 0.")
+
+    if axes and len(axes) == arr.ndim and "Y" in axes and "X" in axes:
+        y_axis = axes.index("Y")
+        x_axis = axes.index("X")
+    else:
+        if arr.ndim < 2:
+            return arr, axes
+        y_axis = arr.ndim - 2
+        x_axis = arr.ndim - 1
+
+    y_size = int(arr.shape[y_axis])
+    x_size = int(arr.shape[x_axis])
+    new_y = max(1, int(round(y_size / downsample)))
+    new_x = max(1, int(round(x_size / downsample)))
+
+    arr_moved = np.moveaxis(arr, (y_axis, x_axis), (-2, -1))
+    prefix_shape = arr_moved.shape[:-2]
+    planes = arr_moved.reshape((-1, y_size, x_size))
+    resized = np.empty((planes.shape[0], new_y, new_x), dtype=arr.dtype)
+
+    from PIL import Image
+    resample = Image.Resampling.LANCZOS if downsample > 1 else Image.Resampling.BILINEAR
+    for i, plane in enumerate(planes):
+        im = Image.fromarray(np.asarray(plane))
+        resized_plane = np.asarray(im.resize((new_x, new_y), resample=resample))
+        if resized_plane.dtype != arr.dtype:
+            resized_plane = np.clip(resized_plane, np.iinfo(arr.dtype).min, np.iinfo(arr.dtype).max).astype(arr.dtype) if np.issubdtype(arr.dtype, np.integer) else resized_plane.astype(arr.dtype)
+        resized[i] = resized_plane
+
+    resized = resized.reshape(prefix_shape + (new_y, new_x))
+    resized = np.moveaxis(resized, (-2, -1), (y_axis, x_axis))
+    return np.ascontiguousarray(resized), axes
+
+
+def _guess_axes_for_array(arr: np.ndarray, axes: str = None) -> str:
+    """Return a reasonable axes string for tifffile OME writing."""
+    arr = np.asarray(arr)
+    axes = (axes or "").strip()
+    if axes and len(axes) == arr.ndim:
+        return axes
+    if arr.ndim == 2:
+        return "YX"
+    if arr.ndim == 3:
+        if arr.shape[0] <= 16 and arr.shape[-1] not in (3, 4):
+            return "CYX"
+        if arr.shape[-1] <= 16:
+            return "YXC"
+        return "ZYX"
+    if arr.ndim == 4:
+        return "CZYX"
+    if arr.ndim == 5:
+        return "TCZYX"
+    return ""
+
+
 def _downsample_for_preview(rgb: np.ndarray, max_side: int = 512) -> np.ndarray:
     rgb = _to_uint8_rgb(rgb)
     h, w = rgb.shape[:2]
@@ -434,6 +555,620 @@ def _numpy_rgb_to_qpixmap(rgb: np.ndarray) -> QPixmap:
     h, w = rgb.shape[:2]
     qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
     return QPixmap.fromImage(qimg.copy())
+
+
+# ============================================================
+# Leica LIF splitter helpers
+# ============================================================
+
+def _require_readlif():
+    """Import readlif only when the LIF splitter is used."""
+    try:
+        from readlif.reader import LifFile
+        return LifFile
+    except Exception as exc:
+        raise RuntimeError(
+            "The package 'readlif' is not installed in this Python environment.\n\n"
+            "Install it in the same environment used to run this app:\n\n"
+            "    pip install readlif --no-deps\n\n"
+            "If that still fails, run:\n\n"
+            "    pip install readlif pillow beautifulsoup4\n\n"
+            f"Original import error: {exc}"
+        ) from exc
+
+
+def _lif_safe_name(text: Any, max_len: int = 90) -> str:
+    s = str(text or "scene").strip()
+    s = re.sub(r"[\\/:*?\"<>|]+", "_", s)
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("._")
+    if not s:
+        s = "scene"
+    return s[:max_len]
+
+
+def _lif_human_bytes(n: Optional[float]) -> str:
+    if n is None:
+        return "unknown"
+    try:
+        n = float(n)
+    except Exception:
+        return "unknown"
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    i = 0
+    while n >= 1024 and i < len(units) - 1:
+        n /= 1024.0
+        i += 1
+    return f"{n:.2f} {units[i]}"
+
+
+def _lif_get_int(value: Any, default: int = 1) -> int:
+    try:
+        if value is None:
+            return default
+        value = int(value)
+        return value if value > 0 else default
+    except Exception:
+        return default
+
+
+def _lif_get_image_dims(img: Any) -> Tuple[int, int, int, int, int, int]:
+    """
+    Return size_x, size_y, size_z, size_t, size_m, size_c.
+
+    readlif commonly exposes dims as (x, y, z, t, m), while channels are
+    available through the image.channels attribute.
+    """
+    dims = getattr(img, "dims", None) or ()
+    size_x = _lif_get_int(dims[0] if len(dims) > 0 else None)
+    size_y = _lif_get_int(dims[1] if len(dims) > 1 else None)
+    size_z = _lif_get_int(dims[2] if len(dims) > 2 else getattr(img, "nz", 1))
+    size_t = _lif_get_int(dims[3] if len(dims) > 3 else getattr(img, "nt", 1))
+    size_m = _lif_get_int(dims[4] if len(dims) > 4 else 1)
+    size_c = _lif_get_int(getattr(img, "channels", 1))
+    size_z = _lif_get_int(getattr(img, "nz", size_z), size_z)
+    size_t = _lif_get_int(getattr(img, "nt", size_t), size_t)
+    return size_x, size_y, size_z, size_t, size_m, size_c
+
+
+def _lif_physical_sizes_um(img: Any) -> Dict[str, Optional[float]]:
+    """
+    Extract approximate physical pixel size from readlif scale metadata.
+
+    readlif scale is usually expressed as pixels per micrometer, so the physical
+    size in micrometers per pixel is 1 / scale.
+    """
+    out = {"PhysicalSizeX": None, "PhysicalSizeY": None, "PhysicalSizeZ": None}
+    scale = getattr(img, "scale", None)
+    if not scale:
+        return out
+    for i, key in enumerate(["PhysicalSizeX", "PhysicalSizeY", "PhysicalSizeZ"]):
+        try:
+            value = float(scale[i])
+            if value > 0:
+                out[key] = 1.0 / value
+        except Exception:
+            pass
+    return out
+
+
+def _lif_channel_names(img: Any, size_c: int) -> List[str]:
+    candidates = []
+    for attr_name in ["channel_names", "channels_names", "channel_name"]:
+        try:
+            value = getattr(img, attr_name)
+            if value:
+                candidates = list(value)
+                break
+        except Exception:
+            pass
+    names = []
+    for i in range(size_c):
+        if i < len(candidates) and candidates[i]:
+            names.append(str(candidates[i]))
+        else:
+            names.append(f"Channel_{i}")
+    return names
+
+
+def _lif_json_safe(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (list, tuple)):
+        return [_lif_json_safe(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): _lif_json_safe(v) for k, v in obj.items()}
+    return str(obj)
+
+
+def _lif_scene_metadata_dict(img: Any, scene_index: int) -> Dict[str, Any]:
+    size_x, size_y, size_z, size_t, size_m, size_c = _lif_get_image_dims(img)
+    metadata = {
+        "scene_index": scene_index,
+        "name": getattr(img, "name", ""),
+        "path": getattr(img, "path", ""),
+        "dims_readlif_xyztm": getattr(img, "dims", None),
+        "size_x": size_x,
+        "size_y": size_y,
+        "size_z": size_z,
+        "size_t": size_t,
+        "size_m": size_m,
+        "size_c": size_c,
+        "channels": getattr(img, "channels", None),
+        "nz": getattr(img, "nz", None),
+        "nt": getattr(img, "nt", None),
+        "scale_px_per_um": getattr(img, "scale", None),
+        "scale_n": getattr(img, "scale_n", None),
+        "bit_depth": getattr(img, "bit_depth", None),
+        "mosaic_position": getattr(img, "mosaic_position", None),
+        "settings": getattr(img, "settings", None),
+        "info": getattr(img, "info", None),
+    }
+    metadata.update(_lif_physical_sizes_um(img))
+    return _lif_json_safe(metadata)
+
+
+
+def _lif_first_frame_array(img: Any) -> np.ndarray:
+    frame = img.get_frame(z=0, t=0, c=0, m=0)
+    arr = np.asarray(frame)
+    if arr.ndim not in (2, 3):
+        raise ValueError(f"Unsupported first frame shape from readlif: {arr.shape}")
+    return arr
+
+
+def _lif_bit_depth_text(bit_depth: Any) -> str:
+    """Format readlif bit-depth metadata for display.
+
+    Some Leica files expose this as a tuple, for example (12, 12, 12, 12),
+    which means 12-bit acquisition for each channel. Showing the raw tuple in
+    the table is confusing, so this function makes it readable.
+    """
+    if bit_depth is None or bit_depth == "":
+        return "unknown"
+    try:
+        if isinstance(bit_depth, (list, tuple)):
+            values = [int(v) for v in bit_depth if v is not None]
+            if not values:
+                return "unknown"
+            unique = sorted(set(values))
+            if len(unique) == 1:
+                return f"{unique[0]}-bit × {len(values)} ch"
+            return ", ".join(f"C{i}:{v}-bit" for i, v in enumerate(values))
+        return f"{int(bit_depth)}-bit"
+    except Exception:
+        return str(bit_depth)
+
+
+def _lif_max_bit_depth(bit_depth: Any) -> Optional[int]:
+    try:
+        if isinstance(bit_depth, (list, tuple)):
+            vals = [int(v) for v in bit_depth if v is not None]
+            return max(vals) if vals else None
+        if bit_depth is not None and bit_depth != "":
+            return int(bit_depth)
+    except Exception:
+        return None
+    return None
+
+
+def _lif_infer_storage_dtype_text(img: Any, frame_mode: Optional[str] = None) -> str:
+    """Infer the likely stored dtype for the table without reading a full frame."""
+    max_bit = _lif_max_bit_depth(getattr(img, "bit_depth", None))
+    if max_bit is not None:
+        if max_bit <= 8:
+            return "uint8"
+        if max_bit <= 16:
+            return "uint16"
+        return f">16-bit"
+
+    mode = str(frame_mode or getattr(img, "mode", "") or "")
+    mode_lower = mode.lower()
+    if "16" in mode_lower:
+        return "uint16"
+    if mode in ("L", "P", "RGB", "RGBA"):
+        return "uint8"
+    if mode in ("I", "I;32"):
+        return "int32"
+    if mode == "F":
+        return "float32"
+    return "unknown"
+
+
+def _lif_preview_plane_from_frame(frame: Any, max_side: int) -> Tuple[np.ndarray, str]:
+    """Return a small 2D preview plane and source mode text.
+
+    The previous preview path used PIL.thumbnail with bilinear resampling. Some
+    Leica 12/16-bit frames are opened by Pillow in modes such as I;16, where
+    bilinear thumbnailing can raise "image has wrong mode". This function uses
+    a safer NEAREST resize first, then falls back to conservative conversions.
+    Export is unaffected because this is only for GUI thumbnails.
+    """
+    mode_text = str(getattr(frame, "mode", ""))
+
+    if hasattr(frame, "size") and hasattr(frame, "resize"):
+        try:
+            from PIL import Image
+            nearest = Image.Resampling.NEAREST
+            bilinear = Image.Resampling.BILINEAR
+        except Exception:
+            nearest = 0
+            bilinear = 2
+
+        try:
+            w, h = frame.size
+            scale = min(float(max_side) / max(float(w), float(h)), 1.0)
+            new_w = max(1, int(round(float(w) * scale)))
+            new_h = max(1, int(round(float(h) * scale)))
+        except Exception:
+            new_w = max_side
+            new_h = max_side
+
+        # Try direct NEAREST resize first. This usually works for 16-bit modes
+        # and avoids the "wrong mode" error caused by bilinear resampling.
+        for resample in (nearest, bilinear):
+            try:
+                small = frame.resize((new_w, new_h), resample=resample)
+                arr = np.asarray(small)
+                if arr.ndim == 3:
+                    arr = arr[:, :, 0]
+                return np.asarray(arr), mode_text
+            except Exception:
+                pass
+
+        # Last-resort preview fallback: convert only for display.
+        # This may reduce the visual bit depth, but does not affect export.
+        for convert_mode in ("I", "F", "L"):
+            try:
+                small = frame.convert(convert_mode).resize((new_w, new_h), resample=nearest)
+                arr = np.asarray(small)
+                if arr.ndim == 3:
+                    arr = arr[:, :, 0]
+                return np.asarray(arr), f"{mode_text}->{convert_mode}"
+            except Exception:
+                pass
+
+    arr = np.asarray(frame)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    arr = _downsample_for_preview(arr, max_side=max_side)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    return np.asarray(arr), mode_text
+
+
+def _lif_match_plane_shape(plane: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+    """Resize a small preview plane if channels produced slightly different sizes."""
+    plane = np.asarray(plane)
+    if plane.shape[:2] == target_shape:
+        return plane
+    try:
+        from PIL import Image
+        pil = Image.fromarray(_normalize_to_uint8(plane))
+        pil = pil.resize((int(target_shape[1]), int(target_shape[0])), resample=Image.Resampling.NEAREST)
+        return np.asarray(pil)
+    except Exception:
+        out = np.zeros(target_shape, dtype=plane.dtype if hasattr(plane, "dtype") else np.uint8)
+        h = min(out.shape[0], plane.shape[0])
+        w = min(out.shape[1], plane.shape[1])
+        out[:h, :w] = plane[:h, :w]
+        return out
+
+
+def _lif_false_color_preview(planes_u8: List[np.ndarray]) -> np.ndarray:
+    """Combine LIF channels into a simple IF-style false-color RGB preview."""
+    if not planes_u8:
+        raise ValueError("No planes available for preview.")
+    if len(planes_u8) == 1:
+        return np.stack([planes_u8[0], planes_u8[0], planes_u8[0]], axis=-1).astype(np.uint8)
+
+    h, w = planes_u8[0].shape[:2]
+    acc = np.zeros((h, w, 3), dtype=np.float32)
+
+    # Common IF visualization: C0 often DAPI -> blue, then green, red, magenta.
+    colors = [
+        (0.0, 0.0, 1.0),  # channel 0: blue
+        (0.0, 1.0, 0.0),  # channel 1: green
+        (1.0, 0.0, 0.0),  # channel 2: red
+        (1.0, 0.0, 1.0),  # channel 3: magenta
+        (0.0, 1.0, 1.0),
+        (1.0, 1.0, 0.0),
+    ]
+    for i, plane in enumerate(planes_u8):
+        color = colors[i % len(colors)]
+        p = plane.astype(np.float32) / 255.0
+        acc[:, :, 0] += p * color[0]
+        acc[:, :, 1] += p * color[1]
+        acc[:, :, 2] += p * color[2]
+
+    acc = np.clip(acc, 0.0, 1.0)
+    return np.ascontiguousarray((acc * 255.0).astype(np.uint8))
+
+
+def _lif_thumbnail_rgb(img: Any, max_side: int = 170, max_channels: int = 4) -> Tuple[np.ndarray, str]:
+    """
+    Create a lightweight visual preview for one LIF scene.
+
+    For IF, it combines the first Z/T/M plane of up to four channels using a
+    false-color display. This is only for display; export still writes the
+    original raw data without RGB conversion or intensity normalization.
+    """
+    size_x, size_y, size_z, size_t, size_m, size_c = _lif_get_image_dims(img)
+    n = max(1, min(size_c, max_channels))
+    planes = []
+    mode_texts = []
+    dtype_text = _lif_infer_storage_dtype_text(img)
+
+    target_shape = None
+    for c in range(n):
+        frame = img.get_frame(z=0, t=0, c=c, m=0)
+        try:
+            arr, mode_text = _lif_preview_plane_from_frame(frame, max_side=max_side)
+            mode_texts.append(mode_text)
+            if dtype_text == "unknown":
+                dtype_text = str(arr.dtype)
+            if target_shape is None:
+                target_shape = arr.shape[:2]
+            else:
+                arr = _lif_match_plane_shape(arr, target_shape)
+            planes.append(_normalize_to_uint8(arr))
+        finally:
+            try:
+                del frame
+            except Exception:
+                pass
+
+    if not planes:
+        raise ValueError("Could not create thumbnail.")
+
+    rgb = _lif_false_color_preview(planes)
+    mode_texts = [m for m in mode_texts if m]
+    if mode_texts:
+        unique_modes = []
+        for m in mode_texts:
+            if m not in unique_modes:
+                unique_modes.append(m)
+        dtype_text = f"{dtype_text}; mode {'/'.join(unique_modes)}"
+    return rgb, dtype_text
+
+
+def _lif_scene_geometry_from_first_frame(img: Any, first_arr: np.ndarray) -> Dict[str, Any]:
+    size_x, size_y, size_z, size_t, size_m, size_c = _lif_get_image_dims(img)
+
+    if first_arr.ndim == 2:
+        frame_y, frame_x = first_arr.shape
+        sample_count = 1
+    elif first_arr.ndim == 3:
+        frame_y, frame_x, sample_count = first_arr.shape
+    else:
+        raise ValueError(f"Unsupported first frame shape: {first_arr.shape}")
+
+    if frame_y != size_y or frame_x != size_x:
+        size_y, size_x = int(frame_y), int(frame_x)
+
+    out_t = int(size_t) * int(size_m)
+    out_c = int(size_c) * int(sample_count)
+    out_z = int(size_z)
+    shape_tczyx = (out_t, out_c, out_z, int(size_y), int(size_x))
+    total_planes = int(out_t * out_c * out_z)
+    estimated_bytes = int(np.prod(shape_tczyx, dtype=np.int64)) * int(first_arr.dtype.itemsize)
+    per_plane_bytes = int(size_y) * int(size_x) * int(first_arr.dtype.itemsize)
+
+    return {
+        "shape_tczyx": shape_tczyx,
+        "dtype": first_arr.dtype,
+        "sample_count_per_frame": int(sample_count),
+        "readlif_size_t": int(size_t),
+        "readlif_size_m": int(size_m),
+        "readlif_size_c": int(size_c),
+        "size_z": int(size_z),
+        "size_y": int(size_y),
+        "size_x": int(size_x),
+        "total_planes": total_planes,
+        "estimated_bytes": estimated_bytes,
+        "per_plane_bytes": per_plane_bytes,
+        "mosaic_flattened_into_t": bool(size_m > 1),
+        "rgb_samples_folded_into_c": bool(sample_count > 1),
+    }
+
+
+def _lif_plane_iterator(
+    img: Any,
+    first_arr: np.ndarray,
+    geom: Dict[str, Any],
+    progress_callback=None,
+) -> Iterable[np.ndarray]:
+    """Yield 2D planes in TCZYX order without building the full stack in RAM."""
+    size_t = geom["readlif_size_t"]
+    size_m = geom["readlif_size_m"]
+    size_c = geom["readlif_size_c"]
+    size_z = geom["size_z"]
+    sample_count = geom["sample_count_per_frame"]
+    total_planes = geom["total_planes"]
+
+    done = 0
+    first_used = False
+
+    for t in range(size_t):
+        for m in range(size_m):
+            for c in range(size_c):
+                for z in range(size_z):
+                    if not first_used and t == 0 and m == 0 and c == 0 and z == 0:
+                        frame_arr = first_arr
+                        first_used = True
+                    else:
+                        frame = img.get_frame(z=z, t=t, c=c, m=m)
+                        frame_arr = np.asarray(frame)
+
+                    if frame_arr.ndim == 2:
+                        done += 1
+                        if progress_callback is not None:
+                            progress_callback(done, total_planes)
+                        yield np.ascontiguousarray(frame_arr)
+                    elif frame_arr.ndim == 3:
+                        for s in range(sample_count):
+                            done += 1
+                            if progress_callback is not None:
+                                progress_callback(done, total_planes)
+                            yield np.ascontiguousarray(frame_arr[:, :, s])
+                    else:
+                        raise ValueError(f"Unsupported frame shape while reading: {frame_arr.shape}")
+
+                    if first_used and frame_arr is not first_arr:
+                        try:
+                            del frame_arr
+                        except Exception:
+                            pass
+
+
+def _lif_save_scene_ome_tiff_lowmem(
+    img: Any,
+    scene_index: int,
+    out_path: Path,
+    overwrite: bool = False,
+    skip_existing: bool = True,
+    compression: Optional[str] = None,
+    progress_callback=None,
+) -> Dict[str, Any]:
+    """Export one readlif scene/page as one OME-TIFF using low-memory streaming."""
+    out_path = Path(out_path)
+    if out_path.exists():
+        if skip_existing and not overwrite:
+            return {
+                "output_path": str(out_path),
+                "output_size_bytes": out_path.stat().st_size,
+                "skipped_existing": True,
+            }
+        if not overwrite:
+            raise FileExistsError(f"Output exists and overwrite is disabled: {out_path}")
+
+    size_x, size_y, size_z, size_t, size_m, size_c = _lif_get_image_dims(img)
+    channel_names = _lif_channel_names(img, size_c)
+    physical = _lif_physical_sizes_um(img)
+
+    first_arr = _lif_first_frame_array(img)
+    geom = _lif_scene_geometry_from_first_frame(img, first_arr)
+
+    if geom["sample_count_per_frame"] > 1:
+        expanded = []
+        sample_labels = ["R", "G", "B", "A"]
+        for base in channel_names:
+            for s in range(geom["sample_count_per_frame"]):
+                label = sample_labels[s] if s < len(sample_labels) else f"S{s}"
+                expanded.append(f"{base}_{label}")
+        channel_names = expanded
+
+    metadata = {
+        "axes": "TCZYX",
+        "Channel": {"Name": channel_names},
+    }
+    for key, value in physical.items():
+        if value is not None:
+            metadata[key] = float(value)
+            metadata[f"{key}Unit"] = "µm"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_name(out_path.name + ".part")
+    if tmp_path.exists():
+        if overwrite:
+            tmp_path.unlink()
+        else:
+            raise FileExistsError(f"Temporary output exists. Delete it or enable overwrite: {tmp_path}")
+
+    imwrite_kwargs = {
+        "bigtiff": True,
+        "ome": True,
+        "metadata": metadata,
+        "software": f"{APP_NAME} v{APP_VERSION} LIF splitter",
+        "shape": geom["shape_tczyx"],
+        "dtype": geom["dtype"],
+    }
+    if compression and str(compression).lower() not in ("none", ""):
+        imwrite_kwargs["compression"] = compression
+
+    try:
+        plane_iter = _lif_plane_iterator(img, first_arr, geom, progress_callback=progress_callback)
+        tifffile.imwrite(str(tmp_path), plane_iter, **imwrite_kwargs)
+        if out_path.exists() and overwrite:
+            out_path.unlink()
+        os.replace(str(tmp_path), str(out_path))
+    except Exception:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            del first_arr
+        except Exception:
+            pass
+
+    result = {
+        "output_path": str(out_path),
+        "output_shape_tczyx": "x".join(str(x) for x in geom["shape_tczyx"]),
+        "output_dtype": str(geom["dtype"]),
+        "output_size_bytes": out_path.stat().st_size if out_path.exists() else None,
+        "estimated_raw_bytes": geom["estimated_bytes"],
+        "per_plane_bytes": geom["per_plane_bytes"],
+        "channel_names": ";".join(channel_names),
+        "skipped_existing": False,
+        "readlif_size_t": geom["readlif_size_t"],
+        "readlif_size_m": geom["readlif_size_m"],
+        "readlif_size_c": geom["readlif_size_c"],
+        "sample_count_per_frame": geom["sample_count_per_frame"],
+        "mosaic_flattened_into_t": geom["mosaic_flattened_into_t"],
+        "rgb_samples_folded_into_c": geom["rgb_samples_folded_into_c"],
+    }
+    result.update(physical)
+    return result
+
+
+def _lif_write_xml_header(lif_obj: Any, lif_path: Path, out_dir: Path) -> Optional[Path]:
+    try:
+        xml_text = getattr(lif_obj, "xml_header", None)
+        if callable(xml_text):
+            xml_text = xml_text()
+        if not xml_text:
+            return None
+        xml_path = out_dir / f"{_lif_safe_name(lif_path.stem)}_Leica_XML_header.xml"
+        xml_path.write_text(str(xml_text), encoding="utf-8", errors="replace")
+        return xml_path
+    except Exception:
+        return None
+
+
+def _lif_write_scene_json(metadata: Dict[str, Any], out_dir: Path, scene_index: int, scene_name: str) -> Optional[Path]:
+    try:
+        json_dir = out_dir / "metadata_json"
+        json_dir.mkdir(parents=True, exist_ok=True)
+        json_path = json_dir / f"scene_{scene_index:03d}_{_lif_safe_name(scene_name)}_metadata.json"
+        json_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+        return json_path
+    except Exception:
+        return None
+
+
+def _lif_write_manifest(manifest_path: Path, rows: List[Dict[str, Any]]) -> Path:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    keys = []
+    for row in rows:
+        for key in row.keys():
+            if key not in keys:
+                keys.append(key)
+    with open(manifest_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in keys})
+    return manifest_path
 
 
 # ============================================================
@@ -1005,6 +1740,22 @@ class ImageBackend:
             return _to_uint8_rgb(arr[y:y+h, x:x+w, :]), {"used": False}
         raise RuntimeError(f"Unknown reader: {self.reader}")
 
+    def crop_raw(self, x: int, y: int, w: int, h: int):
+        """Crop without forcing RGB/uint8 conversion.
+
+        This is mainly for IF / OME-TIFF data where channels and original
+        intensities must be preserved. Returns (array, axes, info).
+        """
+        if not self.path or not self.reader or not self.slide_dims:
+            raise RuntimeError("No image loaded.")
+        full_w, full_h = self.slide_dims
+        x, y, w, h = self.clip_roi(x, y, w, h, full_w, full_h)
+        if self.reader == "tifffile":
+            return self._crop_tifffile_raw(self.path, x, y, w, h)
+        # OpenSlide and PIL are visual/RGB readers in this application.
+        rgb, info = self.crop(x, y, w, h, fill=255)
+        return rgb, "YXS", info
+
     def read_tile_with_padding(self, x: int, y: int, size: int, padding_color: str = "black") -> np.ndarray:
         if not self.slide_dims:
             raise RuntimeError("No image loaded.")
@@ -1106,12 +1857,17 @@ class ImageBackend:
         return out, {"used": failed0 > 0, "failed0": failed0, "recovered": recovered, "fallback_level": min_lvl_used}
 
     def _crop_tifffile(self, path, x, y, w, h):
+        arr, axes, fallback_info = self._crop_tifffile_raw(path, x, y, w, h)
+        return _array_to_rgb_preview(arr, axes), fallback_info
+
+    def _crop_tifffile_raw(self, path, x, y, w, h):
         fallback_info = {"used": False}
         za, series, axes, zarr_error = self._get_tiff_zarr()
+        axes = axes or getattr(series, "axes", "") or ""
         if za is not None:
-            slicer = self._build_spatial_slicer(za.ndim, axes, x, y, w, h)
-            arr = za[tuple(slicer)]
-            return _to_uint8_rgb(np.asarray(arr)), fallback_info
+            slicer = self._build_spatial_slicer_raw(za.ndim, axes, x, y, w, h)
+            arr = np.asarray(za[tuple(slicer)])
+            return arr, axes if len(axes) == arr.ndim else _guess_axes_for_array(arr, axes), fallback_info
 
         # Fallback: read the full series only when tiled/zarr access is unavailable.
         # This is less efficient for very large files, so the reason is returned.
@@ -1120,11 +1876,11 @@ class ImageBackend:
             "reason": f"zarr crop failed, used full read fallback: {zarr_error}"
         }
         arr = series.asarray()
-        slicer = self._build_spatial_slicer(arr.ndim, axes, x, y, w, h)
-        arr = arr[tuple(slicer)]
-        return _to_uint8_rgb(np.asarray(arr)), fallback_info
+        slicer = self._build_spatial_slicer_raw(arr.ndim, axes, x, y, w, h)
+        arr = np.asarray(arr[tuple(slicer)])
+        return arr, axes if len(axes) == arr.ndim else _guess_axes_for_array(arr, axes), fallback_info
 
-    def _build_spatial_slicer(self, ndim, axes, x, y, w, h):
+    def _build_spatial_slicer_raw(self, ndim, axes, x, y, w, h):
         slicer = []
         if axes and len(axes) == ndim and "Y" in axes and "X" in axes:
             for ax in axes:
@@ -1132,19 +1888,23 @@ class ImageBackend:
                     slicer.append(slice(y, y + h))
                 elif ax == "X":
                     slicer.append(slice(x, x + w))
-                elif ax == "C":
-                    slicer.append(slice(None))
                 else:
-                    slicer.append(0)
+                    # Preserve C, Z, T and any other non-spatial dimensions.
+                    slicer.append(slice(None))
         else:
+            # Conservative fallback: assume the last two axes are Y/X.
             for i in range(ndim):
-                if i == 0:
+                if i == ndim - 2:
                     slicer.append(slice(y, y + h))
-                elif i == 1:
+                elif i == ndim - 1:
                     slicer.append(slice(x, x + w))
                 else:
                     slicer.append(slice(None))
         return slicer
+
+    def _build_spatial_slicer(self, ndim, axes, x, y, w, h):
+        # Kept for backwards compatibility with older code paths.
+        return self._build_spatial_slicer_raw(ndim, axes, x, y, w, h)
 
     def input_thumbnail(self, max_side=512):
         if not self.path or not self.reader:
@@ -1257,6 +2017,63 @@ def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, loss
             software=f"{APP_NAME} v{APP_VERSION}", resolution=resolution,
             resolutionunit=resolutionunit, **compression_kwargs
         )
+
+
+def save_multichannel_image(output_path, arr, axes=None, write_ome=True, lossless=True,
+                            source_resolution=None, source_mpp=None, image_name=None,
+                            pixel_scale=1.0):
+    """Save scientific crop data without RGB conversion or intensity normalization."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.ascontiguousarray(np.asarray(arr))
+    axes = _guess_axes_for_array(arr, axes)
+
+    source_resolution, source_mpp = _scale_resolution_and_mpp(
+        source_resolution=source_resolution,
+        source_mpp=source_mpp,
+        pixel_scale=pixel_scale
+    )
+
+    resolution = None
+    resolutionunit = None
+    if source_resolution is not None:
+        try:
+            xres, yres, unit = source_resolution
+            if xres and yres and unit:
+                resolution = (float(xres), float(yres))
+                resolutionunit = unit
+        except Exception:
+            resolution = None
+            resolutionunit = None
+
+    metadata = {}
+    if axes:
+        metadata["axes"] = axes
+    if image_name:
+        metadata["Name"] = str(image_name)
+    if source_mpp:
+        try:
+            metadata["PhysicalSizeX"] = float(source_mpp[0])
+            metadata["PhysicalSizeY"] = float(source_mpp[1])
+            metadata["PhysicalSizeXUnit"] = "µm"
+            metadata["PhysicalSizeYUnit"] = "µm"
+        except Exception:
+            pass
+
+    compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
+
+    tifffile.imwrite(
+        str(output_path),
+        arr,
+        bigtiff=True,
+        ome=bool(write_ome),
+        metadata=metadata if metadata else None,
+        photometric="minisblack",
+        software=f"{APP_NAME} v{APP_VERSION}",
+        resolution=resolution,
+        resolutionunit=resolutionunit,
+        **compression_kwargs
+    )
 
 # ============================================================
 # Manual merge grid dialog
@@ -1410,6 +2227,10 @@ class WSICropTileMergeGUI(QMainWindow):
         self.tile_files = []
         self.bulk_paths = []
         self.manual_layout = None
+        self.lif_single_path = None
+        self.lif_single_obj = None
+        self.lif_single_images = []
+        self.lif_bulk_paths = []
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1423,7 +2244,7 @@ class WSICropTileMergeGUI(QMainWindow):
 
         menu_row = QHBoxLayout()
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Crop", "Tiles", "Merge Tiles"])
+        self.mode_combo.addItems(["Crop", "Tiles", "Merge Tiles", "Split LIF"])
         self.mode_combo.setMaximumWidth(180)
 
         menu_row.addWidget(QLabel("Mode:"))
@@ -1445,6 +2266,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.stack.addWidget(self._build_crop_page())
         self.stack.addWidget(self._build_tiles_page())
         self.stack.addWidget(self._build_merge_page())
+        self.stack.addWidget(self._build_lif_page())
         self.mode_combo.currentIndexChanged.connect(lambda: self.stack.setCurrentIndex(self.mode_combo.currentIndex()))
 
         root.addWidget(self.info_label)
@@ -1549,6 +2371,7 @@ class WSICropTileMergeGUI(QMainWindow):
             <li>Automatic tile merging from encoded tile names.</li>
             <li>Manual grid-based tile merging when filenames do not encode position.</li>
             <li>OME-TIFF export with physical pixel size preservation when available.</li>
+            <li>Leica LIF splitting into one OME-TIFF per internal scene/page, preserving IF channels.</li>
             <li>BigTIFF output and optional lossless DEFLATE compression.</li>
           </ul>
 
@@ -1609,6 +2432,408 @@ class WSICropTileMergeGUI(QMainWindow):
         dlg.exec_()
 
     # ========================================================
+    # LIF splitter page
+    # ========================================================
+
+    def _build_lif_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        file_box = QGroupBox("Leica LIF input")
+        file_layout = QVBoxLayout(file_box)
+
+        row1 = QHBoxLayout()
+        one_btn = QPushButton("Load one LIF + previews")
+        one_btn.clicked.connect(self.load_lif_single_file)
+        bulk_btn = QPushButton("Bulk select LIF files")
+        bulk_btn.clicked.connect(self.load_lif_bulk_files)
+        folder_btn = QPushButton("Bulk folder")
+        folder_btn.clicked.connect(self.load_lif_bulk_folder)
+        self.lif_file_label = QLabel("No LIF file selected")
+        self.lif_file_label.setStyleSheet("padding: 10px; border: 1px solid #bdc3c7; border-radius: 5px;")
+        row1.addWidget(one_btn)
+        row1.addWidget(bulk_btn)
+        row1.addWidget(folder_btn)
+        row1.addWidget(self.lif_file_label, 1)
+        file_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        out_btn = QPushButton("Output folder optional")
+        out_btn.clicked.connect(self.browse_lif_output_folder)
+        clear_out_btn = QPushButton("Clear")
+        clear_out_btn.clicked.connect(lambda: self.lif_output_edit.setText(""))
+        self.lif_output_edit = QLineEdit("")
+        self.lif_output_edit.setPlaceholderText("Leave empty to save beside each .lif file")
+        row2.addWidget(out_btn)
+        row2.addWidget(self.lif_output_edit, 1)
+        row2.addWidget(clear_out_btn)
+        file_layout.addLayout(row2)
+
+        layout.addWidget(file_box)
+
+        opt = QGroupBox("Export options")
+        opt_layout = QHBoxLayout(opt)
+        self.lif_skip_existing_chk = QCheckBox("Skip existing")
+        self.lif_skip_existing_chk.setChecked(True)
+        self.lif_overwrite_chk = QCheckBox("Overwrite")
+        self.lif_xml_chk = QCheckBox("Save Leica XML header")
+        self.lif_xml_chk.setChecked(True)
+        self.lif_json_chk = QCheckBox("Save scene metadata JSON")
+        self.lif_json_chk.setChecked(True)
+        self.lif_recursive_chk = QCheckBox("Recursive folder search")
+        self.lif_stop_on_error_chk = QCheckBox("Stop on error")
+        self.lif_compression_combo = QComboBox()
+        self.lif_compression_combo.addItems(["None", "deflate"])
+        opt_layout.addWidget(self.lif_skip_existing_chk)
+        opt_layout.addWidget(self.lif_overwrite_chk)
+        opt_layout.addWidget(self.lif_xml_chk)
+        opt_layout.addWidget(self.lif_json_chk)
+        opt_layout.addWidget(self.lif_recursive_chk)
+        opt_layout.addWidget(self.lif_stop_on_error_chk)
+        opt_layout.addWidget(QLabel("Compression:"))
+        opt_layout.addWidget(self.lif_compression_combo)
+        opt_layout.addStretch()
+        layout.addWidget(opt)
+
+        note = QLabel(
+            "Single-file mode loads false-color scene thumbnails so you can select which pages to save. "
+            "Bulk mode exports all scenes from each selected .lif file without preview. "
+            "Export is one OME-TIFF per LIF scene/page, preserving channels as raw IF data."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555; padding: 4px;")
+        layout.addWidget(note)
+
+        self.lif_scene_table = QTableWidget()
+        self.lif_scene_table.setColumnCount(7)
+        self.lif_scene_table.setHorizontalHeaderLabels([
+            "Save", "Scene", "Name", "Size X×Y", "C/Z/T/M", "Dtype / mode / bit depth", "Thumbnail"
+        ])
+        self.lif_scene_table.setColumnWidth(0, 60)
+        self.lif_scene_table.setColumnWidth(1, 70)
+        self.lif_scene_table.setColumnWidth(2, 230)
+        self.lif_scene_table.setColumnWidth(3, 130)
+        self.lif_scene_table.setColumnWidth(4, 130)
+        self.lif_scene_table.setColumnWidth(5, 210)
+        self.lif_scene_table.setColumnWidth(6, 190)
+        layout.addWidget(self.lif_scene_table, 1)
+
+        btn_row = QHBoxLayout()
+        select_all_btn = QPushButton("Select all")
+        select_all_btn.clicked.connect(lambda: self.set_lif_scene_checks(True))
+        clear_btn = QPushButton("Clear selection")
+        clear_btn.clicked.connect(lambda: self.set_lif_scene_checks(False))
+        save_selected_btn = QPushButton("SAVE SELECTED SCENES")
+        save_selected_btn.clicked.connect(self.save_lif_selected_scenes)
+        save_all_single_btn = QPushButton("Save all scenes from loaded LIF")
+        save_all_single_btn.clicked.connect(self.save_lif_all_single_scenes)
+        bulk_save_btn = QPushButton("RUN BULK EXPORT")
+        bulk_save_btn.clicked.connect(self.run_lif_bulk_export)
+        btn_row.addWidget(select_all_btn)
+        btn_row.addWidget(clear_btn)
+        btn_row.addWidget(save_selected_btn)
+        btn_row.addWidget(save_all_single_btn)
+        btn_row.addWidget(bulk_save_btn)
+        layout.addLayout(btn_row)
+
+        return page
+
+    def _close_lif_single(self):
+        try:
+            if self.lif_single_obj is not None:
+                self.lif_single_obj.close()
+        except Exception:
+            pass
+        self.lif_single_obj = None
+        self.lif_single_images = []
+        self.lif_single_path = None
+
+    def browse_lif_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select output folder")
+        if folder:
+            self.lif_output_edit.setText(folder)
+
+    def set_lif_scene_checks(self, checked: bool):
+        for r in range(self.lif_scene_table.rowCount()):
+            widget = self.lif_scene_table.cellWidget(r, 0)
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(checked)
+
+    def selected_lif_scene_indices(self):
+        indices = []
+        for r in range(self.lif_scene_table.rowCount()):
+            widget = self.lif_scene_table.cellWidget(r, 0)
+            if isinstance(widget, QCheckBox) and widget.isChecked():
+                item = self.lif_scene_table.item(r, 1)
+                if item is not None:
+                    try:
+                        indices.append(int(item.text()))
+                    except Exception:
+                        pass
+        return indices
+
+    def load_lif_single_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Leica LIF file", "", _lif_file_filter())
+        if not path:
+            return
+        self._load_lif_single_path(Path(path))
+
+    def _load_lif_single_path(self, lif_path: Path):
+        try:
+            LifFile = _require_readlif()
+            self._close_lif_single()
+            self.lif_scene_table.setRowCount(0)
+            self.progress.setVisible(True)
+            self.progress.setRange(0, 0)
+            QApplication.processEvents()
+
+            lif = LifFile(str(lif_path))
+            images = list(lif.get_iter_image())
+            self.lif_single_obj = lif
+            self.lif_single_path = lif_path
+            self.lif_single_images = images
+            self.lif_file_label.setText(f"Single LIF loaded: {lif_path.name} | {len(images)} scene(s)")
+
+            self.progress.setRange(0, max(1, len(images)))
+            self.progress.setValue(0)
+            self.lif_scene_table.setRowCount(len(images))
+
+            for row, img in enumerate(images):
+                scene_name = str(getattr(img, "name", f"scene_{row}"))
+                size_x, size_y, size_z, size_t, size_m, size_c = _lif_get_image_dims(img)
+                bit_depth = getattr(img, "bit_depth", "")
+                bit_depth_text = _lif_bit_depth_text(bit_depth)
+                dtype_text = _lif_infer_storage_dtype_text(img)
+
+                chk = QCheckBox()
+                chk.setChecked(True)
+                chk.setStyleSheet("margin-left: 16px;")
+                self.lif_scene_table.setCellWidget(row, 0, chk)
+                self.lif_scene_table.setItem(row, 1, QTableWidgetItem(str(row)))
+                self.lif_scene_table.setItem(row, 2, QTableWidgetItem(scene_name))
+                self.lif_scene_table.setItem(row, 3, QTableWidgetItem(f"{size_x} × {size_y}"))
+                self.lif_scene_table.setItem(row, 4, QTableWidgetItem(f"C={size_c}, Z={size_z}, T={size_t}, M={size_m}"))
+
+                thumb_label = QLabel("preview failed")
+                thumb_label.setAlignment(Qt.AlignCenter)
+                thumb_label.setFixedSize(180, 120)
+                thumb_label.setStyleSheet("background: white; border: 1px solid #bdc3c7;")
+                try:
+                    thumb_rgb, dtype_text = _lif_thumbnail_rgb(img, max_side=170, max_channels=4)
+                    pm = _numpy_rgb_to_qpixmap(thumb_rgb)
+                    thumb_label.setPixmap(pm.scaled(thumb_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                except Exception as thumb_error:
+                    thumb_label.setText(f"No preview\n{thumb_error}")
+
+                self.lif_scene_table.setItem(row, 5, QTableWidgetItem(f"{dtype_text} / {bit_depth_text}"))
+                self.lif_scene_table.setCellWidget(row, 6, thumb_label)
+                self.lif_scene_table.setRowHeight(row, 128)
+
+                self.progress.setValue(row + 1)
+                self.info_label.setText(f"Loaded LIF preview: {lif_path.name} | scene {row + 1}/{len(images)}")
+                QApplication.processEvents()
+
+            self.progress.setVisible(False)
+            self.info_label.setText(f"Ready: select scenes to export from {lif_path.name}")
+        except Exception as e:
+            self.progress.setVisible(False)
+            QMessageBox.critical(self, "LIF Load Error", str(e))
+
+    def load_lif_bulk_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select Leica LIF files", "", _lif_file_filter())
+        if not paths:
+            return
+        self.lif_bulk_paths = [Path(p) for p in paths]
+        self.lif_file_label.setText(f"Bulk LIF selection: {len(self.lif_bulk_paths)} file(s). Preview not loaded.")
+        self.info_label.setText("Bulk LIF mode ready. Click RUN BULK EXPORT to save all scenes from each file.")
+
+    def load_lif_bulk_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select folder containing LIF files")
+        if not folder:
+            return
+        folder = Path(folder)
+        pattern = "**/*.lif" if self.lif_recursive_chk.isChecked() else "*.lif"
+        self.lif_bulk_paths = sorted(folder.glob(pattern))
+        self.lif_file_label.setText(f"Bulk folder: {folder} | {len(self.lif_bulk_paths)} .lif file(s)")
+        self.info_label.setText("Bulk LIF folder loaded. Preview not loaded for bulk mode.")
+
+    def _lif_output_base(self):
+        text = self.lif_output_edit.text().strip()
+        return text if text else None
+
+    def _lif_compression(self):
+        text = self.lif_compression_combo.currentText().strip()
+        return None if text.lower() == "none" else text
+
+    def save_lif_selected_scenes(self):
+        if self.lif_single_path is None or self.lif_single_obj is None:
+            QMessageBox.warning(self, "No LIF loaded", "Load one LIF file first.")
+            return
+        selected = self.selected_lif_scene_indices()
+        if not selected:
+            QMessageBox.warning(self, "No scenes selected", "Select at least one scene/page to save.")
+            return
+        try:
+            manifest = self._export_lif_file(
+                lif_path=self.lif_single_path,
+                scene_indices=selected,
+                lif_obj=self.lif_single_obj,
+                images=self.lif_single_images,
+            )
+            QMessageBox.information(self, "LIF export complete", f"Export finished.\n\nManifest:\n{manifest}")
+        except Exception as e:
+            self.progress.setVisible(False)
+            QMessageBox.critical(self, "LIF Export Error", str(e))
+
+    def save_lif_all_single_scenes(self):
+        if self.lif_single_path is None or self.lif_single_obj is None:
+            QMessageBox.warning(self, "No LIF loaded", "Load one LIF file first.")
+            return
+        try:
+            manifest = self._export_lif_file(
+                lif_path=self.lif_single_path,
+                scene_indices=None,
+                lif_obj=self.lif_single_obj,
+                images=self.lif_single_images,
+            )
+            QMessageBox.information(self, "LIF export complete", f"Export finished.\n\nManifest:\n{manifest}")
+        except Exception as e:
+            self.progress.setVisible(False)
+            QMessageBox.critical(self, "LIF Export Error", str(e))
+
+    def run_lif_bulk_export(self):
+        if not self.lif_bulk_paths:
+            QMessageBox.warning(self, "No bulk LIF files", "Select LIF files or a folder first.")
+            return
+        manifests = []
+        failures = []
+        self.progress.setVisible(True)
+        self.progress.setRange(0, len(self.lif_bulk_paths))
+        self.progress.setValue(0)
+        QApplication.processEvents()
+
+        for i, lif_path in enumerate(self.lif_bulk_paths, start=1):
+            try:
+                self.info_label.setText(f"Bulk LIF export: {lif_path.name} ({i}/{len(self.lif_bulk_paths)})")
+                QApplication.processEvents()
+                manifests.append(self._export_lif_file(lif_path=lif_path, scene_indices=None))
+            except Exception as e:
+                failures.append((lif_path, e))
+                if self.lif_stop_on_error_chk.isChecked():
+                    break
+            self.progress.setRange(0, len(self.lif_bulk_paths))
+            self.progress.setValue(i)
+            QApplication.processEvents()
+
+        self.progress.setVisible(False)
+        msg = f"Bulk export finished.\n\nManifest files: {len(manifests)}"
+        if manifests:
+            msg += "\n" + "\n".join(str(p) for p in manifests[:10])
+            if len(manifests) > 10:
+                msg += f"\n... and {len(manifests) - 10} more"
+        if failures:
+            msg += f"\n\nFailures: {len(failures)}"
+            for p, e in failures[:5]:
+                msg += f"\n{p.name}: {e}"
+        QMessageBox.information(self, "Bulk LIF export", msg)
+        self.info_label.setText(msg.replace("\n", " | "))
+
+    def _export_lif_file(self, lif_path: Path, scene_indices=None, lif_obj=None, images=None):
+        LifFile = _require_readlif()
+        own_lif = False
+        if lif_obj is None or images is None:
+            lif_obj = LifFile(str(lif_path))
+            images = list(lif_obj.get_iter_image())
+            own_lif = True
+
+        out_dir = _lif_output_folder_for(lif_path, self._lif_output_base())
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = out_dir / f"{_lif_safe_name(lif_path.stem)}_manifest.csv"
+        rows = []
+
+        try:
+            xml_path = _lif_write_xml_header(lif_obj, lif_path, out_dir) if self.lif_xml_chk.isChecked() else None
+            selected = set(scene_indices) if scene_indices is not None else set(range(len(images)))
+
+            for scene_index, img in enumerate(images):
+                if scene_index not in selected:
+                    continue
+
+                scene_name = str(getattr(img, "name", f"scene_{scene_index}"))
+                safe_scene = _lif_safe_name(scene_name)
+                out_path = out_dir / f"scene_{scene_index:03d}_{safe_scene}.ome.tif"
+                base_meta = _lif_scene_metadata_dict(img, scene_index)
+                json_path = _lif_write_scene_json(base_meta, out_dir, scene_index, scene_name) if self.lif_json_chk.isChecked() else None
+
+                row = {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "lif_file": str(lif_path),
+                    "scene_index": scene_index,
+                    "scene_name": scene_name,
+                    "readlif_path": getattr(img, "path", ""),
+                    "size_x": base_meta.get("size_x"),
+                    "size_y": base_meta.get("size_y"),
+                    "size_z": base_meta.get("size_z"),
+                    "size_t": base_meta.get("size_t"),
+                    "size_m": base_meta.get("size_m"),
+                    "size_c": base_meta.get("size_c"),
+                    "bit_depth": base_meta.get("bit_depth"),
+                    "scale_px_per_um": base_meta.get("scale_px_per_um"),
+                    "PhysicalSizeX_um_per_px": base_meta.get("PhysicalSizeX"),
+                    "PhysicalSizeY_um_per_px": base_meta.get("PhysicalSizeY"),
+                    "PhysicalSizeZ_um_per_px": base_meta.get("PhysicalSizeZ"),
+                    "xml_header_path": str(xml_path) if xml_path else "",
+                    "scene_metadata_json": str(json_path) if json_path else "",
+                    "output_path": str(out_path),
+                    "status": "pending",
+                    "error": "",
+                }
+
+                def progress_cb(done, total, scene_index=scene_index, scene_name=scene_name):
+                    self.progress.setVisible(True)
+                    self.progress.setRange(0, max(1, total))
+                    self.progress.setValue(done)
+                    self.info_label.setText(
+                        f"Writing LIF scene {scene_index}: {scene_name} | plane {done}/{total}"
+                    )
+                    QApplication.processEvents()
+
+                try:
+                    result = _lif_save_scene_ome_tiff_lowmem(
+                        img=img,
+                        scene_index=scene_index,
+                        out_path=out_path,
+                        overwrite=self.lif_overwrite_chk.isChecked(),
+                        skip_existing=self.lif_skip_existing_chk.isChecked(),
+                        compression=self._lif_compression(),
+                        progress_callback=progress_cb,
+                    )
+                    row.update(result)
+                    row["status"] = "skipped_existing" if result.get("skipped_existing") else "success"
+                except Exception as exc:
+                    row["status"] = "failed"
+                    row["error"] = f"{exc}\n{traceback.format_exc()}"
+                    if self.lif_stop_on_error_chk.isChecked():
+                        rows.append(row)
+                        raise
+
+                rows.append(row)
+                _lif_write_manifest(manifest_path, rows)
+                QApplication.processEvents()
+
+        finally:
+            if own_lif:
+                try:
+                    lif_obj.close()
+                except Exception:
+                    pass
+
+        _lif_write_manifest(manifest_path, rows)
+        self.progress.setVisible(False)
+        self.info_label.setText(f"LIF export manifest saved: {manifest_path}")
+        return manifest_path
+
+    # ========================================================
     # Crop page
     # ========================================================
 
@@ -1643,6 +2868,8 @@ class WSICropTileMergeGUI(QMainWindow):
         out_layout.addWidget(QLabel("Output:"))
         self.crop_out_combo = QComboBox()
         self.crop_out_combo.addItems(["TIFF (.tif)", "OME-TIFF (.ome.tif)", "JPEG (.jpg)"])
+        # OME-TIFF is the safest default for microscopy/IF multichannel crops.
+        self.crop_out_combo.setCurrentIndex(1)
         self.crop_out_combo.setMaximumWidth(220)
         out_layout.addWidget(self.crop_out_combo)
         out_layout.addWidget(QLabel("Suffix after _crop_:"))
@@ -1663,9 +2890,12 @@ class WSICropTileMergeGUI(QMainWindow):
         opt_layout = QHBoxLayout(opt)
         self.crop_lossless_chk = QCheckBox("Lossless compression DEFLATE")
         self.crop_lossless_chk.setChecked(True)
+        self.crop_preserve_channels_chk = QCheckBox("Preserve raw multichannel data for TIFF/OME-TIFF")
+        self.crop_preserve_channels_chk.setChecked(True)
         self.crop_preview_chk = QCheckBox("Preview panel")
         self.crop_preview_chk.setChecked(True)
         opt_layout.addWidget(self.crop_lossless_chk)
+        opt_layout.addWidget(self.crop_preserve_channels_chk)
         opt_layout.addWidget(self.crop_preview_chk)
         opt_layout.addStretch()
         layout.addWidget(opt)
@@ -1749,13 +2979,31 @@ class WSICropTileMergeGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Please select a file first.")
             return
         try:
-            roi, _ = self.backend.crop(self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value(), fill=255)
-            downsample = float(self.crop_downsample_spin.value())
-            if downsample != 1.0:
-                from PIL import Image
-                new_w = max(1, int(round(roi.shape[1] / downsample)))
-                new_h = max(1, int(round(roi.shape[0] / downsample)))
-                roi = np.asarray(Image.fromarray(roi).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
+            preserve_raw = (
+                hasattr(self, "crop_preserve_channels_chk")
+                and self.crop_preserve_channels_chk.isChecked()
+                and self.backend.reader == "tifffile"
+            )
+            if preserve_raw:
+                raw, axes, _ = self.backend.crop_raw(
+                    self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
+                )
+                downsample = float(self.crop_downsample_spin.value())
+                raw_preview, axes_preview = _resize_spatial_array(raw, axes, downsample) if downsample != 1.0 else (raw, axes)
+                roi_preview = _array_to_rgb_preview(raw_preview, axes_preview)
+                shape_text = f"raw shape={tuple(raw.shape)} | axes={axes or 'unknown'} | dtype={raw.dtype}"
+            else:
+                roi_preview, _ = self.backend.crop(
+                    self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value(), fill=255
+                )
+                downsample = float(self.crop_downsample_spin.value())
+                if downsample != 1.0:
+                    from PIL import Image
+                    new_w = max(1, int(round(roi_preview.shape[1] / downsample)))
+                    new_h = max(1, int(round(roi_preview.shape[0] / downsample)))
+                    roi_preview = np.asarray(Image.fromarray(roi_preview).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
+                shape_text = f"preview={roi_preview.shape[1]} x {roi_preview.shape[0]} px"
+
             if self.crop_preview_chk.isChecked():
                 if self.backend.slide_dims:
                     full_w, full_h = self.backend.slide_dims
@@ -1764,8 +3012,8 @@ class WSICropTileMergeGUI(QMainWindow):
                     self.crop_thumb_in.set_selection_from_full_coords(
                         self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
                     )
-                self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(roi, 512))
-            self.info_label.setText(f"Preview ready: {roi.shape[1]} x {roi.shape[0]} px | Reader: {self.backend.reader}")
+                self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(roi_preview, 512))
+            self.info_label.setText(f"Preview ready: {shape_text} | Reader: {self.backend.reader}")
         except Exception as e:
             QMessageBox.critical(self, "Preview Error", str(e))
 
@@ -1788,22 +3036,52 @@ class WSICropTileMergeGUI(QMainWindow):
         try:
             suffix, raw_downsample, combo, output_format, write_ome, ext = self._crop_output_settings()
             out_path = self.backend.path_obj.parent / f"{self.backend.path_obj.stem}_crop_{suffix}{ext}"
-            roi, _ = self.backend.crop(self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value(), fill=255)
-            if raw_downsample != 1.0:
-                from PIL import Image
-                new_w = max(1, int(round(roi.shape[1] / raw_downsample)))
-                new_h = max(1, int(round(roi.shape[0] / raw_downsample)))
-                roi = np.asarray(Image.fromarray(roi).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
-            save_rgb_image(
-                out_path, roi, output_format, write_ome, self.crop_lossless_chk.isChecked(),
-                self.backend.source_resolution, self.backend.source_mpp, out_path.stem,
-                self.backend.openslide_props if write_ome else None,
-                pixel_scale=raw_downsample
+
+            preserve_raw = (
+                hasattr(self, "crop_preserve_channels_chk")
+                and self.crop_preserve_channels_chk.isChecked()
+                and self.backend.reader == "tifffile"
+                and output_format != "jpeg"
             )
+
+            if preserve_raw:
+                roi, axes, _ = self.backend.crop_raw(
+                    self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
+                )
+                if raw_downsample != 1.0:
+                    roi, axes = _resize_spatial_array(roi, axes, raw_downsample)
+                save_multichannel_image(
+                    out_path, roi, axes=axes, write_ome=write_ome,
+                    lossless=self.crop_lossless_chk.isChecked(),
+                    source_resolution=self.backend.source_resolution,
+                    source_mpp=self.backend.source_mpp,
+                    image_name=out_path.stem,
+                    pixel_scale=raw_downsample
+                )
+                preview_rgb = _array_to_rgb_preview(roi, axes)
+                saved_text = f"Saved raw multichannel crop: {out_path} | shape={tuple(roi.shape)} | axes={axes or 'unknown'} | dtype={roi.dtype}"
+            else:
+                roi, _ = self.backend.crop(
+                    self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value(), fill=255
+                )
+                if raw_downsample != 1.0:
+                    from PIL import Image
+                    new_w = max(1, int(round(roi.shape[1] / raw_downsample)))
+                    new_h = max(1, int(round(roi.shape[0] / raw_downsample)))
+                    roi = np.asarray(Image.fromarray(roi).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
+                save_rgb_image(
+                    out_path, roi, output_format, write_ome, self.crop_lossless_chk.isChecked(),
+                    self.backend.source_resolution, self.backend.source_mpp, out_path.stem,
+                    self.backend.openslide_props if write_ome else None,
+                    pixel_scale=raw_downsample
+                )
+                preview_rgb = roi
+                saved_text = f"Saved RGB crop: {out_path} | Reader: {self.backend.reader}"
+
             if self.crop_preview_chk.isChecked():
-                self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(roi, 512))
-            self.info_label.setText(f"Saved: {out_path} | Reader: {self.backend.reader}")
-            QMessageBox.information(self, "Success", f"Saved:\n{out_path}")
+                self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(preview_rgb, 512))
+            self.info_label.setText(saved_text)
+            QMessageBox.information(self, "Success", saved_text)
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
@@ -2635,3 +3913,4 @@ if __name__ == "__main__":
     window = WSICropTileMergeGUI()
     window.show()
     sys.exit(app.exec_())
+
