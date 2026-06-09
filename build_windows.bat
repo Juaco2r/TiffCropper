@@ -16,6 +16,13 @@ if exist dist rmdir /s /q dist
 
 REM Build using spec file
 pyinstaller --clean --noconfirm TiffCropper.spec
+if errorlevel 1 (
+    echo ===============================
+    echo BUILD FAILED
+    echo ===============================
+    pause
+    exit /b 1
+)
 
 echo ===============================
 echo BUILD COMPLETE
