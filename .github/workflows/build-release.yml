@@ -28,6 +28,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      # -----------------------------
+      # System dependencies
+      # -----------------------------
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -53,15 +56,25 @@ jobs:
         run: |
           brew install openslide
 
+      # -----------------------------
+      # Python dependencies
+      # -----------------------------
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          pip install -r requirements.txt
 
+      # -----------------------------
+      # Diagnostic check
+      # IMPORTANT: use python -c instead of bash heredoc because Windows uses PowerShell by default.
+      # -----------------------------
       - name: Check imagecodecs installation
         run: |
           python -c "import imagecodecs; print('imagecodecs version:', imagecodecs.version()); print('delta_encode available:', hasattr(imagecodecs, 'delta_encode')); print('delta_decode available:', hasattr(imagecodecs, 'delta_decode'))"
 
+      # -----------------------------
+      # Build
+      # -----------------------------
       - name: Build Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -100,6 +113,9 @@ jobs:
             --add-data "assets:assets" \
             src/tiffcropper/app.py
 
+      # -----------------------------
+      # Packaging
+      # -----------------------------
       - name: Package Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -107,21 +123,19 @@ jobs:
           Write-Host "Listing dist contents:"
           Get-ChildItem -Recurse dist
 
-          New-Item -ItemType Directory -Path "TiffCropper-Windows" -Force | Out-Null
-
           if (Test-Path "dist\TiffCropper.exe") {
-            Copy-Item "dist\TiffCropper.exe" "TiffCropper-Windows\TiffCropper.exe" -Force
+            New-Item -ItemType Directory -Path "TiffCropper-Windows" -Force
+            Copy-Item "dist\TiffCropper.exe" "TiffCropper-Windows\TiffCropper.exe"
+            Compress-Archive -Path "TiffCropper-Windows\*" -DestinationPath "TiffCropper-Windows.zip" -Force
           }
           elseif (Test-Path "dist\TiffCropper\TiffCropper.exe") {
-            Copy-Item "dist\TiffCropper\*" "TiffCropper-Windows\" -Recurse -Force
+            Compress-Archive -Path "dist\TiffCropper\*" -DestinationPath "TiffCropper-Windows.zip" -Force
           }
           else {
-            Write-Host "Could not find Windows executable."
+            Write-Host "Could not find Windows PyInstaller output."
             Get-ChildItem -Recurse dist
             exit 1
           }
-
-          Compress-Archive -Path "TiffCropper-Windows\*" -DestinationPath "TiffCropper-Windows.zip" -Force
 
       - name: Package Linux
         if: runner.os == 'Linux'
@@ -156,6 +170,9 @@ jobs:
             exit 1
           fi
 
+      # -----------------------------
+      # Upload Actions artifacts
+      # -----------------------------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
