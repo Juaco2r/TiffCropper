@@ -6,6 +6,8 @@ import math
 import csv
 import json
 import traceback
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -19,18 +21,19 @@ from PyQt5.QtWidgets import (
     QWidget, QPushButton, QLineEdit, QLabel, QFileDialog,
     QSpinBox, QMessageBox, QComboBox, QCheckBox, QGroupBox,
     QStackedWidget, QDoubleSpinBox, QProgressBar, QDialog,
-    QTableWidget, QTableWidgetItem, QTextBrowser, QDialogButtonBox
+    QTableWidget, QTableWidgetItem, QTextBrowser, QDialogButtonBox,
+    QScrollArea, QShortcut
 )
-from PyQt5.QtCore import Qt, QRect, QPoint
-from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QIcon
+from PyQt5.QtCore import Qt, QRect, QPoint, QThread, pyqtSignal
+from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QIcon, QKeySequence
 
 # ============================================================
 # App metadata
 # ============================================================
 
 APP_NAME = "TiffCropper"
-APP_VERSION = "1.2"
-APP_TITLE = "TiffCropper: WSI Crop, Tile and Merge Tool for Digital Pathology Images"
+APP_VERSION = "1.4"
+APP_TITLE = "PathoImage Toolkit: WSI, IF, OME-TIFF and LIF Image Utility"
 APP_DOI = "10.5281/zenodo.20316535"
 APP_GITHUB = "https://github.com/Juaco2r/TiffCropper"
 APP_AUTHOR = "José Rodriguez-Rojas"
@@ -555,6 +558,441 @@ def _numpy_rgb_to_qpixmap(rgb: np.ndarray) -> QPixmap:
     h, w = rgb.shape[:2]
     qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
     return QPixmap.fromImage(qimg.copy())
+
+
+# ============================================================
+# Channel preview / downsample helpers
+# ============================================================
+
+def _safe_imresize_2d(arr: np.ndarray, new_w: int, new_h: int, resample=None) -> np.ndarray:
+    """Resize one 2D plane preserving dtype as much as possible."""
+    from PIL import Image
+    arr = np.asarray(arr)
+    if resample is None:
+        resample = Image.Resampling.LANCZOS
+    im = Image.fromarray(arr)
+    out = np.asarray(im.resize((int(new_w), int(new_h)), resample=resample))
+    if out.dtype != arr.dtype:
+        if np.issubdtype(arr.dtype, np.integer):
+            info = np.iinfo(arr.dtype)
+            out = np.clip(out, info.min, info.max).astype(arr.dtype)
+        else:
+            out = out.astype(arr.dtype)
+    return out
+
+
+COLOR_MAPS = {
+    "gray": (1.0, 1.0, 1.0),
+    "white": (1.0, 1.0, 1.0),
+    "red": (1.0, 0.0, 0.0),
+    "green": (0.0, 1.0, 0.0),
+    "blue": (0.0, 0.0, 1.0),
+    "cyan": (0.0, 1.0, 1.0),
+    "magenta": (1.0, 0.0, 1.0),
+    "yellow": (1.0, 1.0, 0.0),
+    "orange": (1.0, 0.45, 0.0),
+}
+DEFAULT_CHANNEL_COLORS = ["blue", "green", "red", "magenta", "cyan", "yellow", "orange", "white"]
+
+
+def _normalize_channel_float(arr: np.ndarray, p_low: float = 1.0, p_high: float = 99.8) -> np.ndarray:
+    """Normalize one channel to float 0..1 for display/exported previews only."""
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.size == 0:
+        return np.zeros(arr.shape, dtype=np.float32)
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        return np.zeros(arr.shape, dtype=np.float32)
+    vals = arr[finite]
+    lo = float(np.percentile(vals, p_low))
+    hi = float(np.percentile(vals, p_high))
+    if hi <= lo:
+        lo = float(vals.min())
+        hi = float(vals.max())
+    if hi <= lo:
+        return np.zeros(arr.shape, dtype=np.float32)
+    return np.clip((arr - lo) / (hi - lo), 0, 1).astype(np.float32)
+
+
+def _representative_yx_or_yxc(arr: np.ndarray, axes: str = None) -> Tuple[np.ndarray, str]:
+    """Keep Y/X and channel/sample axes, taking first Z/T/M/etc. for display."""
+    arr = np.asarray(arr)
+    axes = (axes or "").strip()
+    if axes and len(axes) == arr.ndim and "Y" in axes and "X" in axes:
+        slicer = []
+        kept = []
+        for ax in axes:
+            if ax in ("Y", "X", "C", "S"):
+                slicer.append(slice(None))
+                kept.append(ax)
+            else:
+                slicer.append(0)
+        arr = arr[tuple(slicer)]
+        axes = "".join(kept)
+        order = [axes.index("Y"), axes.index("X")]
+        out_axes = "YX"
+        if "C" in axes:
+            order.append(axes.index("C"))
+            out_axes += "C"
+        elif "S" in axes:
+            order.append(axes.index("S"))
+            out_axes += "S"
+        arr = np.transpose(arr, order)
+        return np.asarray(arr), out_axes
+    arr = np.squeeze(arr)
+    if arr.ndim == 2:
+        return arr, "YX"
+    if arr.ndim == 3:
+        if arr.shape[-1] in (3, 4):
+            return arr, "YXS"
+        if arr.shape[0] <= 16:
+            return np.moveaxis(arr, 0, -1), "YXC"
+    return _to_uint8_rgb(arr), "YXS"
+
+
+def _count_display_channels(arr: np.ndarray, axes: str = None) -> int:
+    arr2, ax2 = _representative_yx_or_yxc(arr, axes)
+    if arr2.ndim == 2:
+        return 1
+    if arr2.ndim == 3 and ax2.endswith(("C", "S")):
+        return int(arr2.shape[-1])
+    return 1
+
+
+def render_channel_composite(arr: np.ndarray, axes: str, channel_settings: List[Dict[str, Any]],
+                             p_low: float = 1.0, p_high: float = 99.8) -> np.ndarray:
+    """Render multichannel scientific data into a display RGB image."""
+    arr2, ax2 = _representative_yx_or_yxc(arr, axes)
+    if arr2.ndim == 3 and ax2 == "YXS" and arr2.shape[-1] in (3, 4):
+        if not channel_settings:
+            return _to_uint8_rgb(arr2)
+    if arr2.ndim == 2:
+        ch = _normalize_channel_float(arr2, p_low, p_high)
+        return np.clip(np.stack([ch, ch, ch], axis=-1) * 255, 0, 255).astype(np.uint8)
+
+    h, w = arr2.shape[:2]
+    rgb = np.zeros((h, w, 3), dtype=np.float32)
+    if not channel_settings:
+        n = arr2.shape[-1]
+        channel_settings = [
+            {"channel": i, "visible": True, "color": DEFAULT_CHANNEL_COLORS[i % len(DEFAULT_CHANNEL_COLORS)]}
+            for i in range(n)
+        ]
+    # Draw in the natural channel order. Colors and visibility are user-controlled;
+    # order was intentionally removed from the GUI because it did not add much value
+    # for additive IF overlays.
+    for st in channel_settings:
+        if not st.get("visible", True):
+            continue
+        c = int(st.get("channel", 0))
+        if c < 0 or c >= arr2.shape[-1]:
+            continue
+        color_name = str(st.get("color", "gray")).lower()
+        color_vec = np.asarray(COLOR_MAPS.get(color_name, COLOR_MAPS["gray"]), dtype=np.float32)
+        ch = _normalize_channel_float(arr2[:, :, c], p_low, p_high)
+        rgb += ch[:, :, None] * color_vec[None, None, :]
+    return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+
+
+
+def _placeholder_rgb(message: str, width: int = 900, height: int = 600) -> np.ndarray:
+    """Small display-only placeholder used when a full-resolution preview would be unsafe."""
+    arr = np.full((int(height), int(width), 3), 238, dtype=np.uint8)
+    try:
+        from PIL import Image, ImageDraw
+        im = Image.fromarray(arr)
+        draw = ImageDraw.Draw(im)
+        lines = []
+        for line in str(message).split("\n"):
+            while len(line) > 70:
+                lines.append(line[:70])
+                line = line[70:]
+            lines.append(line)
+        y = 25
+        for line in lines[:12]:
+            draw.text((25, y), line, fill=(40, 40, 40))
+            y += 24
+        return np.asarray(im, dtype=np.uint8)
+    except Exception:
+        return arr
+
+
+def read_preview_array_from_file(path: str, max_side: int = 1200, allow_full_fallback: bool = False) -> Tuple[np.ndarray, str, Dict[str, Any]]:
+    """Read a memory-light representative preview array from RGB, TIFF, or OME-TIFF.
+
+    This function deliberately avoids full reads of very large TIFF/OME-TIFF files.
+    If zarr/levels/memmap access is unavailable and the image is large, it returns a
+    placeholder instead of freezing the GUI.
+    """
+    path = str(path)
+    p = Path(path)
+    meta = {"path": path, "reader": "unknown"}
+    if _has_ext(p.name, RASTER_EXTENSIONS):
+        from PIL import Image
+        im = Image.open(path)
+        im.thumbnail((max_side, max_side))
+        arr = np.asarray(im.convert("RGB"))
+        return arr, "YXS", {**meta, "reader": "PIL", "shape": tuple(arr.shape), "axes": "YXS"}
+
+    if _has_ext(p.name, TIFF_EXTENSIONS):
+        with tifffile.TiffFile(path) as tif:
+            s = tif.series[0]
+            axes = getattr(s, "axes", "") or ""
+            shape = tuple(s.shape)
+            try:
+                if hasattr(s, "levels") and len(s.levels) > 1:
+                    best = s.levels[-1]
+                    arr = best.asarray()
+                    axes2 = getattr(best, "axes", axes) or axes
+                    return arr, axes2, {**meta, "reader": "tifffile-level", "shape": shape, "axes": axes}
+            except Exception:
+                pass
+
+            # Preferred path for tiled/compressed OME-TIFF: zarr region stepping.
+            try:
+                z = s.aszarr()
+                import zarr
+                za = zarr.open(z, mode="r")
+                if axes and len(axes) == za.ndim and "Y" in axes and "X" in axes:
+                    y_axis = axes.index("Y")
+                    x_axis = axes.index("X")
+                    y = int(za.shape[y_axis])
+                    x = int(za.shape[x_axis])
+                    step = max(1, int(math.ceil(max(y, x) / float(max_side))))
+                    slicer = []
+                    kept = []
+                    for ax in axes:
+                        if ax == "Y":
+                            slicer.append(slice(0, y, step)); kept.append("Y")
+                        elif ax == "X":
+                            slicer.append(slice(0, x, step)); kept.append("X")
+                        elif ax in ("C", "S"):
+                            slicer.append(slice(None)); kept.append(ax)
+                        else:
+                            slicer.append(0)
+                    arr = np.asarray(za[tuple(slicer)])
+                    return arr, "".join(kept), {**meta, "reader": "tifffile-zarr", "shape": shape, "axes": axes, "step": step}
+            except Exception as zarr_error:
+                last_error = zarr_error
+
+            # Try memory mapping for uncompressed/non-tiled TIFFs.
+            try:
+                mm = tifffile.memmap(path, series=0)
+                mm_axes = axes if axes and len(axes) == mm.ndim else _guess_axes_for_array(mm, axes)
+                if mm_axes and len(mm_axes) == mm.ndim and "Y" in mm_axes and "X" in mm_axes:
+                    y_axis = mm_axes.index("Y")
+                    x_axis = mm_axes.index("X")
+                    y = int(mm.shape[y_axis])
+                    x = int(mm.shape[x_axis])
+                    step = max(1, int(math.ceil(max(y, x) / float(max_side))))
+                    slicer = []
+                    kept = []
+                    for ax in mm_axes:
+                        if ax == "Y":
+                            slicer.append(slice(0, y, step)); kept.append("Y")
+                        elif ax == "X":
+                            slicer.append(slice(0, x, step)); kept.append("X")
+                        elif ax in ("C", "S"):
+                            slicer.append(slice(None)); kept.append(ax)
+                        else:
+                            slicer.append(0)
+                    arr = np.asarray(mm[tuple(slicer)])
+                    return arr, "".join(kept), {**meta, "reader": "tifffile-memmap", "shape": shape, "axes": mm_axes, "step": step}
+            except Exception as mmap_error:
+                last_error = mmap_error
+
+            # Only small files are allowed to fall back to full read.
+            spatial_pixels = 0
+            try:
+                if axes and len(axes) == len(shape) and "Y" in axes and "X" in axes:
+                    spatial_pixels = int(shape[axes.index("Y")]) * int(shape[axes.index("X")])
+                elif len(shape) >= 2:
+                    spatial_pixels = int(shape[-2]) * int(shape[-1])
+            except Exception:
+                spatial_pixels = 0
+            if allow_full_fallback or spatial_pixels <= 25_000_000:
+                arr = s.asarray()
+                arr2, axes2 = _representative_yx_or_yxc(arr, axes)
+                rgb = _downsample_for_preview(_array_to_rgb_preview(arr2, axes2), max_side=max_side)
+                return rgb, "YXS", {**meta, "reader": "tifffile-full-fallback", "shape": shape, "axes": axes}
+
+            msg = (
+                "Preview skipped to keep GUI responsive.\n"
+                f"File: {p.name}\nShape: {shape} axes={axes}\n"
+                "This TIFF could not expose a tiled/zarr or memmap preview.\n"
+                "Saving/cropping may still work; preview would require a full read."
+            )
+            return _placeholder_rgb(msg), "YXS", {**meta, "reader": "safe-placeholder", "shape": shape, "axes": axes, "error": str(last_error)}
+
+    b = ImageBackend().load(path)
+    try:
+        arr = b.input_thumbnail(max_side=max_side)
+        return arr, "YXS", {**meta, "reader": b.reader, "shape": tuple(arr.shape), "axes": "YXS"}
+    finally:
+        b.close()
+
+def save_preview_jpg(path: Path, rgb: np.ndarray, quality: int = 95):
+    from PIL import Image
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(_to_uint8_rgb(rgb)).save(str(path), quality=int(quality))
+
+
+def _downsample_tiff_raw_lowmem(input_path: Path, output_path: Path, downsample: float,
+                                write_ome: bool = True, lossless: bool = True,
+                                source_resolution=None, source_mpp=None):
+    """Downsample a TIFF/OME-TIFF plane-by-plane to reduce RAM usage."""
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tifffile.TiffFile(str(input_path)) as tif:
+        s = tif.series[0]
+        axes = getattr(s, "axes", "") or ""
+        if not axes or len(axes) != len(s.shape) or "Y" not in axes or "X" not in axes:
+            arr = s.asarray()
+            arr, axes = _resize_spatial_array(arr, axes, downsample)
+            save_multichannel_image(output_path, arr, axes=axes, write_ome=write_ome, lossless=lossless,
+                                    source_resolution=source_resolution, source_mpp=source_mpp,
+                                    image_name=output_path.stem, pixel_scale=downsample)
+            return
+        try:
+            z = s.aszarr()
+            import zarr
+            za = zarr.open(z, mode="r")
+        except Exception:
+            arr = s.asarray()
+            arr, axes = _resize_spatial_array(arr, axes, downsample)
+            save_multichannel_image(output_path, arr, axes=axes, write_ome=write_ome, lossless=lossless,
+                                    source_resolution=source_resolution, source_mpp=source_mpp,
+                                    image_name=output_path.stem, pixel_scale=downsample)
+            return
+
+        y_axis = axes.index("Y")
+        x_axis = axes.index("X")
+        y_size = int(za.shape[y_axis])
+        x_size = int(za.shape[x_axis])
+        new_y = max(1, int(round(y_size / float(downsample))))
+        new_x = max(1, int(round(x_size / float(downsample))))
+        out_shape = list(za.shape)
+        out_shape[y_axis] = new_y
+        out_shape[x_axis] = new_x
+        out_shape = tuple(out_shape)
+        prefix_axes = [i for i, ax in enumerate(axes) if ax not in ("Y", "X")]
+        prefix_shape = tuple(za.shape[i] for i in prefix_axes)
+        inv = {axis: k for k, axis in enumerate(prefix_axes)}
+
+        def gen_planes():
+            iterator_shape = prefix_shape if prefix_shape else (1,)
+            for idx in np.ndindex(iterator_shape):
+                slicer = []
+                for dim_i, ax in enumerate(axes):
+                    if ax == "Y":
+                        slicer.append(slice(None))
+                    elif ax == "X":
+                        slicer.append(slice(None))
+                    else:
+                        slicer.append(idx[inv[dim_i]] if prefix_shape else 0)
+                plane = np.asarray(za[tuple(slicer)])
+                yield _safe_imresize_2d(plane, new_x, new_y)
+
+        source_resolution, source_mpp = _scale_resolution_and_mpp(
+            source_resolution=source_resolution, source_mpp=source_mpp, pixel_scale=downsample
+        )
+        metadata = {"axes": axes, "Name": output_path.stem}
+        if source_mpp:
+            metadata.update({
+                "PhysicalSizeX": float(source_mpp[0]), "PhysicalSizeY": float(source_mpp[1]),
+                "PhysicalSizeXUnit": "µm", "PhysicalSizeYUnit": "µm",
+            })
+        resolution = None
+        resolutionunit = None
+        if source_resolution:
+            try:
+                xres, yres, unit = source_resolution
+                resolution = (float(xres), float(yres))
+                resolutionunit = unit
+            except Exception:
+                pass
+        compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
+        tifffile.imwrite(str(output_path), gen_planes(), shape=out_shape, dtype=za.dtype,
+                         bigtiff=True, ome=bool(write_ome), metadata=metadata,
+                         photometric="minisblack", software=f"{APP_NAME} v{APP_VERSION}",
+                         resolution=resolution, resolutionunit=resolutionunit, **compression_kwargs)
+
+
+def downsample_image_file(input_path: Path, output_dir: Optional[Path], downsample: float,
+                          output_kind: str = "OME-TIFF (.ome.tif)", preserve_raw: bool = True,
+                          lossless: bool = True, overwrite: bool = False) -> Path:
+    """Downsample one supported image file."""
+    input_path = Path(input_path)
+    output_dir = input_path.parent if output_dir is None else Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ds_txt = f"DS{int(downsample)}" if float(downsample).is_integer() else f"DS{downsample:g}"
+    if "OME" in output_kind.upper():
+        ext, output_format, write_ome = ".ome.tif", "tiff", True
+    elif "JPEG" in output_kind.upper() or "JPG" in output_kind.upper():
+        ext, output_format, write_ome = ".jpg", "jpeg", False
+    else:
+        ext, output_format, write_ome = ".tif", "tiff", False
+    out_path = output_dir / f"{input_path.stem}_downsample_{ds_txt}{ext}"
+    if out_path.exists() and not overwrite:
+        return out_path
+    if preserve_raw and output_format == "tiff" and _has_ext(input_path.name, TIFF_EXTENSIONS):
+        # Preserve raw data for scientific multichannel TIFF/OME-TIFF.
+        # If the file is a true RGB image stored with a Samples axis, use the visual RGB path instead.
+        try:
+            with tifffile.TiffFile(str(input_path)) as _tf_check:
+                _axes_check = getattr(_tf_check.series[0], "axes", "") or ""
+            _is_rgb_samples = "S" in _axes_check
+        except Exception:
+            _is_rgb_samples = False
+        if not _is_rgb_samples:
+            b = ImageBackend().load(str(input_path))
+            try:
+                _downsample_tiff_raw_lowmem(input_path, out_path, downsample, write_ome=write_ome,
+                                            lossless=lossless, source_resolution=b.source_resolution,
+                                            source_mpp=b.source_mpp)
+            finally:
+                b.close()
+            return out_path
+
+    b = ImageBackend().load(str(input_path))
+    try:
+        if b.reader == "openslide":
+            slide = b._get_openslide()
+            best_level = slide.get_best_level_for_downsample(float(downsample))
+            level_w, level_h = slide.level_dimensions[best_level]
+            img = slide.read_region((0, 0), best_level, (int(level_w), int(level_h))).convert("RGB")
+            arr = np.asarray(img, dtype=np.uint8)
+            actual_ds = float(slide.level_downsamples[best_level])
+            if abs(actual_ds - float(downsample)) / max(float(downsample), 1.0) > 0.05:
+                from PIL import Image
+                full_w, full_h = b.slide_dims
+                new_w = max(1, int(round(full_w / float(downsample))))
+                new_h = max(1, int(round(full_h / float(downsample))))
+                arr = np.asarray(Image.fromarray(arr).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
+            save_rgb_image(out_path, arr, output_format=output_format, write_ome=write_ome, lossless=lossless,
+                           source_resolution=b.source_resolution, source_mpp=b.source_mpp,
+                           image_name=out_path.stem, pixel_scale=downsample)
+            return out_path
+        if b.reader == "pil":
+            from PIL import Image
+            im = Image.open(str(input_path)).convert("RGB")
+            new_w = max(1, int(round(im.width / float(downsample))))
+            new_h = max(1, int(round(im.height / float(downsample))))
+            arr = np.asarray(im.resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
+            save_rgb_image(out_path, arr, output_format=output_format, write_ome=False, lossless=lossless,
+                           image_name=out_path.stem)
+            return out_path
+        raw, axes, _ = b.crop_raw(0, 0, b.slide_dims[0], b.slide_dims[1])
+        raw, axes = _resize_spatial_array(raw, axes, downsample)
+        rgb = _array_to_rgb_preview(raw, axes)
+        save_rgb_image(out_path, rgb, output_format=output_format, write_ome=False, lossless=lossless,
+                       source_resolution=b.source_resolution, source_mpp=b.source_mpp,
+                       image_name=out_path.stem, pixel_scale=downsample)
+        return out_path
+    finally:
+        b.close()
 
 
 # ============================================================
@@ -1323,6 +1761,430 @@ class CropSelectionLabel(QLabel):
         painter.end()
 
 
+
+class FixedSquarePreviewLabel(QLabel):
+    """Thumbnail label with a fixed-size draggable square ROI."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMouseTracking(True)
+        self._pixmap_original = None
+        self._thumb_w = None
+        self._thumb_h = None
+        self._full_w = None
+        self._full_h = None
+        self.square_size_full = 1024
+        self._center_full = None
+        self._dragging = False
+        self.selection_callback = None
+        self.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
+
+    def set_image(self, rgb, full_w, full_h, square_size_full=1024, callback=None):
+        rgb = _to_uint8_rgb(rgb)
+        self._thumb_h, self._thumb_w = rgb.shape[:2]
+        self._full_w = int(full_w)
+        self._full_h = int(full_h)
+        self.square_size_full = int(square_size_full)
+        self.selection_callback = callback
+        self._pixmap_original = _numpy_rgb_to_qpixmap(rgb)
+        if self._center_full is None:
+            self._center_full = (self._full_w // 2, self._full_h // 2)
+        self._emit_selection()
+        self.update()
+
+    def has_image(self):
+        return self._pixmap_original is not None and self._full_w and self._full_h
+
+    def _display_rect(self):
+        if self._pixmap_original is None:
+            return QRect(0, 0, 0, 0)
+        label_w = self.width()
+        label_h = self.height()
+        img_w = self._pixmap_original.width()
+        img_h = self._pixmap_original.height()
+        if img_w <= 0 or img_h <= 0 or label_w <= 0 or label_h <= 0:
+            return QRect(0, 0, 0, 0)
+        scale = min(label_w / img_w, label_h / img_h)
+        disp_w = int(round(img_w * scale))
+        disp_h = int(round(img_h * scale))
+        x0 = int(round((label_w - disp_w) / 2))
+        y0 = int(round((label_h - disp_h) / 2))
+        return QRect(x0, y0, disp_w, disp_h)
+
+    def _widget_to_full(self, p: QPoint):
+        disp = self._display_rect()
+        x = max(disp.left(), min(p.x(), disp.right()))
+        y = max(disp.top(), min(p.y(), disp.bottom()))
+        fx = int(round((x - disp.left()) / max(1, disp.width()) * self._full_w))
+        fy = int(round((y - disp.top()) / max(1, disp.height()) * self._full_h))
+        return max(0, min(fx, self._full_w - 1)), max(0, min(fy, self._full_h - 1))
+
+    def _selection_full(self):
+        if not self.has_image():
+            return None
+        cx, cy = self._center_full or (self._full_w // 2, self._full_h // 2)
+        s = max(1, min(int(self.square_size_full), self._full_w, self._full_h))
+        x = max(0, min(int(cx - s // 2), self._full_w - s))
+        y = max(0, min(int(cy - s // 2), self._full_h - s))
+        return x, y, s, s
+
+    def _selection_widget_rect(self):
+        sel = self._selection_full()
+        if sel is None:
+            return QRect(0, 0, 0, 0)
+        x, y, w, h = sel
+        disp = self._display_rect()
+        px = disp.left() + x / self._full_w * disp.width()
+        py = disp.top() + y / self._full_h * disp.height()
+        pw = w / self._full_w * disp.width()
+        ph = h / self._full_h * disp.height()
+        return QRect(int(round(px)), int(round(py)), int(round(pw)), int(round(ph)))
+
+    def _emit_selection(self):
+        sel = self._selection_full()
+        if sel and self.selection_callback:
+            self.selection_callback(*sel)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.has_image() and self._display_rect().contains(event.pos()):
+            self._dragging = True
+            self._center_full = self._widget_to_full(event.pos())
+            self._emit_selection()
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and self.has_image():
+            self._center_full = self._widget_to_full(event.pos())
+            self._emit_selection()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            self._center_full = self._widget_to_full(event.pos())
+            self._emit_selection()
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("white"))
+        if self._pixmap_original is not None:
+            disp = self._display_rect()
+            scaled = self._pixmap_original.scaled(disp.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            painter.drawPixmap(disp.topLeft(), scaled)
+            rect = self._selection_widget_rect()
+            painter.setPen(QPen(QColor(255, 0, 0), 2))
+            painter.drawRect(rect)
+            painter.fillRect(rect, QColor(255, 0, 0, 35))
+        painter.end()
+
+
+class ZoomRegionPreviewLabel(QLabel):
+    """Fixed preview label that pans by click/drag and supports rectangle zoom.
+
+    Normal mode:
+        click/drag recenters the preview on the clicked point.
+    Rectangle-zoom mode:
+        click-drag a rectangle; on release, the app zooms to that full-resolution ROI.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMouseTracking(True)
+        self.setMinimumSize(720, 560)
+        self.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
+        self._pixmap_original = None
+        self._roi_full = None
+        self._full_dims = None
+        self._dragging = False
+        self._selecting = False
+        self._rect_zoom_enabled = False
+        self._sel_start = QPoint()
+        self._sel_end = QPoint()
+        self.center_callback = None
+        self.rectangle_callback = None
+
+    def set_preview(self, rgb, roi_full=None, full_dims=None, center_callback=None, rectangle_callback=None):
+        self._pixmap_original = _numpy_rgb_to_qpixmap(_to_uint8_rgb(rgb))
+        self._roi_full = roi_full
+        self._full_dims = full_dims
+        self.center_callback = center_callback
+        if rectangle_callback is not None:
+            self.rectangle_callback = rectangle_callback
+        self.update()
+
+    def enable_rectangle_zoom(self, enabled: bool = True):
+        self._rect_zoom_enabled = bool(enabled)
+        self._selecting = False
+        self._dragging = False
+        self._sel_start = QPoint()
+        self._sel_end = QPoint()
+        self.setCursor(Qt.CrossCursor if self._rect_zoom_enabled else Qt.ArrowCursor)
+        self.update()
+
+    def _display_rect(self):
+        if self._pixmap_original is None:
+            return QRect(0, 0, 0, 0)
+        label_w = self.width()
+        label_h = self.height()
+        img_w = self._pixmap_original.width()
+        img_h = self._pixmap_original.height()
+        if img_w <= 0 or img_h <= 0 or label_w <= 0 or label_h <= 0:
+            return QRect(0, 0, 0, 0)
+        scale = min(label_w / img_w, label_h / img_h)
+        disp_w = int(round(img_w * scale))
+        disp_h = int(round(img_h * scale))
+        x0 = int(round((label_w - disp_w) / 2))
+        y0 = int(round((label_h - disp_h) / 2))
+        return QRect(x0, y0, disp_w, disp_h)
+
+    def _clamp_to_display(self, pos):
+        disp = self._display_rect()
+        x = max(disp.left(), min(pos.x(), disp.right()))
+        y = max(disp.top(), min(pos.y(), disp.bottom()))
+        return QPoint(x, y)
+
+    def _pos_to_full_xy(self, pos):
+        if not self._roi_full:
+            return None
+        disp = self._display_rect()
+        if disp.width() <= 0 or disp.height() <= 0:
+            return None
+        p = self._clamp_to_display(pos)
+        rx, ry, rw, rh = self._roi_full
+        fx = (p.x() - disp.left()) / max(1, disp.width())
+        fy = (p.y() - disp.top()) / max(1, disp.height())
+        return rx + fx * rw, ry + fy * rh
+
+    def _emit_center_from_pos(self, pos):
+        if not self.center_callback:
+            return
+        xy = self._pos_to_full_xy(pos)
+        if xy is None:
+            return
+        self.center_callback(float(xy[0]), float(xy[1]))
+
+    def _emit_rectangle_from_widget_rect(self, rect):
+        if not self.rectangle_callback or not self._roi_full:
+            return
+        disp = self._display_rect()
+        rect = rect.normalized().intersected(disp)
+        if rect.width() < 8 or rect.height() < 8:
+            return
+        p0 = self._pos_to_full_xy(rect.topLeft())
+        p1 = self._pos_to_full_xy(rect.bottomRight())
+        if p0 is None or p1 is None:
+            return
+        x0, y0 = p0
+        x1, y1 = p1
+        x = max(0.0, min(x0, x1))
+        y = max(0.0, min(y0, y1))
+        w = abs(x1 - x0)
+        h = abs(y1 - y0)
+        if w >= 2 and h >= 2:
+            self.rectangle_callback(float(x), float(y), float(w), float(h))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._pixmap_original is not None and self._display_rect().contains(event.pos()):
+            if self._rect_zoom_enabled:
+                self._selecting = True
+                self._sel_start = self._clamp_to_display(event.pos())
+                self._sel_end = self._sel_start
+                self.update()
+            else:
+                self._dragging = True
+                self._emit_center_from_pos(event.pos())
+
+    def mouseMoveEvent(self, event):
+        if self._rect_zoom_enabled and self._selecting:
+            self._sel_end = self._clamp_to_display(event.pos())
+            self.update()
+        elif self._dragging:
+            self._emit_center_from_pos(event.pos())
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._rect_zoom_enabled and self._selecting:
+            self._selecting = False
+            self._sel_end = self._clamp_to_display(event.pos())
+            rect = QRect(self._sel_start, self._sel_end).normalized()
+            self.enable_rectangle_zoom(False)
+            self._emit_rectangle_from_widget_rect(rect)
+            self.update()
+        elif event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            self._emit_center_from_pos(event.pos())
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("white"))
+        if self._pixmap_original is not None:
+            disp = self._display_rect()
+            scaled = self._pixmap_original.scaled(disp.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            painter.drawPixmap(disp.topLeft(), scaled)
+        if self._rect_zoom_enabled and (self._selecting or not self._sel_start.isNull()):
+            rect = QRect(self._sel_start, self._sel_end).normalized().intersected(self._display_rect())
+            if rect.width() > 0 and rect.height() > 0:
+                painter.setPen(QPen(QColor(255, 80, 0), 2))
+                painter.fillRect(rect, QColor(255, 120, 0, 35))
+                painter.drawRect(rect)
+        painter.end()
+
+
+def _compute_zoom_roi(full_w: int, full_h: int, center_xy, zoom: float, viewport_w: int, viewport_h: int):
+    """Compute an original-resolution ROI for a fixed zoom and preview aspect ratio."""
+    full_w = int(full_w)
+    full_h = int(full_h)
+    zoom = max(1.0, float(zoom))
+    viewport_w = max(1, int(viewport_w))
+    viewport_h = max(1, int(viewport_h))
+    aspect = viewport_w / float(viewport_h)
+
+    roi_w = full_w / zoom
+    roi_h = roi_w / aspect
+    max_h_by_zoom = full_h / zoom
+    if roi_h > max_h_by_zoom:
+        roi_h = max_h_by_zoom
+        roi_w = roi_h * aspect
+    roi_w = max(1, min(int(round(roi_w)), full_w))
+    roi_h = max(1, min(int(round(roi_h)), full_h))
+
+    if center_xy is None:
+        cx, cy = full_w / 2.0, full_h / 2.0
+    else:
+        cx, cy = float(center_xy[0]), float(center_xy[1])
+    x = int(round(cx - roi_w / 2.0))
+    y = int(round(cy - roi_h / 2.0))
+    x = max(0, min(x, full_w - roi_w))
+    y = max(0, min(y, full_h - roi_h))
+    return int(x), int(y), int(roi_w), int(roi_h)
+
+
+def read_zoom_region_from_file(path: str, center_xy=None, zoom: float = 1.0,
+                               viewport_size=(900, 600), max_side: int = 1800):
+    """Read only the visible preview region, with stride/downsample to keep RAM stable."""
+    path = str(path)
+    p = Path(path)
+    vw, vh = viewport_size
+    meta = {"path": path, "reader": "unknown", "roi": None}
+
+    # Raster images are safe to crop with PIL.
+    if _has_ext(p.name, RASTER_EXTENSIONS):
+        from PIL import Image
+        im = Image.open(path).convert("RGB")
+        full_w, full_h = im.size
+        roi = _compute_zoom_roi(full_w, full_h, center_xy, zoom, vw, vh)
+        x, y, w, h = roi
+        crop = im.crop((x, y, x + w, y + h))
+        crop.thumbnail((max_side, max_side))
+        arr = np.asarray(crop, dtype=np.uint8)
+        return arr, "YXS", {**meta, "reader": "PIL-region", "shape": (full_h, full_w), "axes": "YXS", "roi": roi, "full_dims": (full_w, full_h)}
+
+    if _has_ext(p.name, TIFF_EXTENSIONS):
+        with tifffile.TiffFile(path) as tif:
+            s0 = tif.series[0]
+            axes = getattr(s0, "axes", "") or ""
+            shape = tuple(s0.shape)
+            if axes and len(axes) == len(shape) and "Y" in axes and "X" in axes:
+                full_h = int(shape[axes.index("Y")])
+                full_w = int(shape[axes.index("X")])
+            else:
+                # Fallback assumes first two dimensions are Y/X.
+                full_h, full_w = int(shape[0]), int(shape[1])
+            roi = _compute_zoom_roi(full_w, full_h, center_xy, zoom, vw, vh)
+            x, y, w, h = roi
+            step = max(1, int(math.ceil(max(w, h) / float(max_side))))
+            try:
+                z = s0.aszarr()
+                import zarr
+                za = zarr.open(z, mode="r")
+                if axes and len(axes) == za.ndim and "Y" in axes and "X" in axes:
+                    slicer = []
+                    kept = []
+                    for ax in axes:
+                        if ax == "Y":
+                            slicer.append(slice(y, y + h, step)); kept.append("Y")
+                        elif ax == "X":
+                            slicer.append(slice(x, x + w, step)); kept.append("X")
+                        elif ax in ("C", "S"):
+                            slicer.append(slice(None)); kept.append(ax)
+                        else:
+                            slicer.append(0)
+                    arr = np.asarray(za[tuple(slicer)])
+                    return arr, "".join(kept), {**meta, "reader": "tifffile-zarr-region", "shape": shape, "axes": axes, "roi": roi, "step": step, "full_dims": (full_w, full_h)}
+            except Exception as zarr_error:
+                last_error = zarr_error
+
+            # Try memory mapping for uncompressed/non-tiled TIFFs.
+            try:
+                mm = tifffile.memmap(path, series=0)
+                mm_axes = axes if axes and len(axes) == mm.ndim else _guess_axes_for_array(mm, axes)
+                if mm_axes and len(mm_axes) == mm.ndim and "Y" in mm_axes and "X" in mm_axes:
+                    slicer = []
+                    kept = []
+                    for ax in mm_axes:
+                        if ax == "Y":
+                            slicer.append(slice(y, y + h, step)); kept.append("Y")
+                        elif ax == "X":
+                            slicer.append(slice(x, x + w, step)); kept.append("X")
+                        elif ax in ("C", "S"):
+                            slicer.append(slice(None)); kept.append(ax)
+                        else:
+                            slicer.append(0)
+                    arr = np.asarray(mm[tuple(slicer)])
+                    return arr, "".join(kept), {**meta, "reader": "tifffile-memmap-region", "shape": shape, "axes": mm_axes, "roi": roi, "step": step, "full_dims": (full_w, full_h)}
+            except Exception as mmap_error:
+                last_error = mmap_error
+
+            # Avoid full reading huge files in the GUI thread.
+            spatial_pixels = int(full_w) * int(full_h)
+            if spatial_pixels <= 25_000_000:
+                arr = s0.asarray()
+                if axes and len(axes) == arr.ndim and "Y" in axes and "X" in axes:
+                    slicer = []
+                    kept = []
+                    for ax in axes:
+                        if ax == "Y":
+                            slicer.append(slice(y, y + h, step)); kept.append("Y")
+                        elif ax == "X":
+                            slicer.append(slice(x, x + w, step)); kept.append("X")
+                        elif ax in ("C", "S"):
+                            slicer.append(slice(None)); kept.append(ax)
+                        else:
+                            slicer.append(0)
+                    arr = np.asarray(arr[tuple(slicer)])
+                    return arr, "".join(kept), {**meta, "reader": "tifffile-full-region", "shape": shape, "axes": axes, "roi": roi, "step": step, "full_dims": (full_w, full_h)}
+                arr = np.asarray(arr[y:y+h:step, x:x+w:step])
+                return arr, _guess_axes_for_array(arr, axes), {**meta, "reader": "tifffile-simple-region", "shape": shape, "axes": axes, "roi": roi, "step": step, "full_dims": (full_w, full_h)}
+
+            msg = (
+                "Zoom preview skipped to keep GUI responsive.\n"
+                f"File: {p.name}\nShape: {shape} axes={axes}\n"
+                "This TIFF could not expose zarr or memmap region access.\n"
+                "Use saved previews or convert to tiled OME-TIFF for fast interactive viewing."
+            )
+            return _placeholder_rgb(msg, width=max(600, vw), height=max(400, vh)), "YXS", {**meta, "reader": "safe-placeholder-region", "shape": shape, "axes": axes, "roi": roi, "full_dims": (full_w, full_h), "error": str(last_error)}
+
+    # WSI path through OpenSlide/PIL backend.
+    b = ImageBackend().load(path)
+    try:
+        full_w, full_h = b.slide_dims
+        roi = _compute_zoom_roi(full_w, full_h, center_xy, zoom, vw, vh)
+        x, y, w, h = roi
+        if b.reader == "openslide":
+            slide = b._get_openslide()
+            target_ds = max(1.0, max(w, h) / float(max_side))
+            level = slide.get_best_level_for_downsample(target_ds)
+            ds = float(slide.level_downsamples[level])
+            lw = max(1, int(round(w / ds)))
+            lh = max(1, int(round(h / ds)))
+            arr = np.asarray(slide.read_region((x, y), level, (lw, lh)).convert("RGB"), dtype=np.uint8)
+            return arr, "YXS", {**meta, "reader": "openslide-region", "roi": roi, "step": ds, "full_dims": (full_w, full_h)}
+        arr, _ = b.crop(x, y, w, h)
+        arr = _downsample_for_preview(arr, max_side=max_side)
+        return arr, "YXS", {**meta, "reader": f"{b.reader}-region", "roi": roi, "full_dims": (full_w, full_h)}
+    finally:
+        b.close()
+
 # ============================================================
 # Tile helpers
 # ============================================================
@@ -1360,7 +2222,12 @@ def _suffix_for_division_tile(rows: int, cols: int, downsample: float) -> str:
 
 
 def _extension_from_combo(text: str) -> str:
-    return ".jpg" if "JPEG" in text.upper() or "JPG" in text.upper() else ".tif"
+    text_u = str(text).upper()
+    if "JPEG" in text_u or "JPG" in text_u:
+        return ".jpg"
+    if "OME-TIFF" in text_u or "OME.TIF" in text_u:
+        return ".ome.tif"
+    return ".tif"
 
 
 def _write_format_from_combo(text: str) -> str:
@@ -1417,14 +2284,46 @@ def _parse_tile_name(path: Path):
     return None
 
 
-def _compute_tile_grid(width: int, height: int, tile_size: int, overlap_percent: float):
+def _compute_tile_positions(length: int, tile_size: int, stride: int, edge_mode: str = "edge_aligned"):
+    """Compute tile start positions along one dimension.
+
+    edge_mode="edge_aligned" avoids tiny last sliver tiles by adding a final
+    tile whose right/bottom edge coincides with the image boundary. This can
+    create extra overlap at the border, but it keeps the last tiles comparable
+    in size to the other tiles and avoids artificial padding for raw IF data.
+
+    edge_mode="partial" preserves the older behavior: positions are generated
+    by regular stride until the image end, so the last tile may be very small.
+    """
+    length = int(length)
+    tile_size = int(tile_size)
+    stride = int(stride)
+    if length <= 0:
+        return []
+    if tile_size <= 0 or stride <= 0:
+        raise ValueError("Tile size and stride must be positive.")
+    if length <= tile_size:
+        return [0]
+
+    edge_mode = str(edge_mode or "edge_aligned").lower().replace("-", "_")
+    if edge_mode in ("partial", "partial_edges", "allow_partial"):
+        return list(range(0, length, stride))
+
+    max_start = max(0, length - tile_size)
+    positions = list(range(0, max_start + 1, stride))
+    if not positions or positions[-1] != max_start:
+        positions.append(max_start)
+    return sorted(set(int(v) for v in positions))
+
+
+def _compute_tile_grid(width: int, height: int, tile_size: int, overlap_percent: float, edge_mode: str = "edge_aligned"):
     overlap_px = int(round(tile_size * overlap_percent / 100.0))
     stride = tile_size - overlap_px
     if stride <= 0:
         raise ValueError("Overlap must be lower than 100%.")
 
-    x_positions = list(range(0, width, stride))
-    y_positions = list(range(0, height, stride))
+    x_positions = _compute_tile_positions(width, tile_size, stride, edge_mode=edge_mode)
+    y_positions = _compute_tile_positions(height, tile_size, stride, edge_mode=edge_mode)
 
     return x_positions, y_positions, stride, overlap_px
 
@@ -1934,16 +2833,11 @@ class ImageBackend:
             return _downsample_for_preview(_to_uint8_rgb(self._read_with_pil(self.path)), max_side=max_side)
 
         if self.reader == "tifffile":
-            with tifffile.TiffFile(self.path) as tif:
-                s0 = tif.series[0]
-                try:
-                    if hasattr(s0, "levels") and s0.levels:
-                        arr = s0.levels[-1].asarray()
-                    else:
-                        arr = s0.asarray()
-                except Exception:
-                    arr = tif.pages[0].asarray()
-            return _downsample_for_preview(_to_uint8_rgb(arr), max_side=max_side)
+            # Memory-light thumbnail: use TIFF/zarr region stepping instead of
+            # reading the full 20k x 20k x C image into RAM. This prevents the
+            # GUI from becoming unresponsive while loading IF/OME-TIFF files.
+            arr, axes, _meta = read_preview_array_from_file(self.path, max_side=max_side)
+            return _array_to_rgb_preview(arr, axes)
 
         raise RuntimeError(f"Unknown reader: {self.reader}")
 
@@ -2025,7 +2919,11 @@ def save_multichannel_image(output_path, arr, axes=None, write_ome=True, lossles
     """Save scientific crop data without RGB conversion or intensity normalization."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    arr = np.ascontiguousarray(np.asarray(arr))
+    arr = np.asarray(arr)
+    # Avoid unnecessary copies. This matters for disk-backed memmap arrays used
+    # by exact raw merge of large multichannel tiles.
+    if not arr.flags.c_contiguous:
+        arr = np.ascontiguousarray(arr)
     axes = _guess_axes_for_array(arr, axes)
 
     source_resolution, source_mpp = _scale_resolution_and_mpp(
@@ -2211,6 +3109,456 @@ class ManualGridDialog(QDialog):
         return {"rows": self.rows_spin.value(), "cols": self.cols_spin.value(), "mapping": dict(self.mapping)}
 
 
+
+
+# ============================================================
+# Background workers and batch job helpers
+# ============================================================
+
+class AppWorker(QThread):
+    """Run long jobs outside the Qt GUI thread.
+
+    This keeps Windows from showing "Not Responding" while tiles, downsampled
+    files, or LIF scenes are being written. Progress is reported through Qt
+    signals, so all GUI changes still happen safely in the main thread.
+    """
+    message = pyqtSignal(str)
+    progress = pyqtSignal(int, int)
+    finished_ok = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, job_func, *args, **kwargs):
+        super().__init__()
+        self.job_func = job_func
+        self.args = args
+        self.kwargs = kwargs
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
+        self.message.emit("Cancellation requested. Waiting for current file/plane to finish safely...")
+
+    def run(self):
+        try:
+            result = self.job_func(
+                self.cancel_event,
+                self.progress.emit,
+                self.message.emit,
+                *self.args,
+                **self.kwargs,
+            )
+            self.finished_ok.emit(result)
+        except Exception as exc:
+            self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
+
+
+def _check_cancel(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("Cancelled by user.")
+
+
+def _save_fixed_tiles_one_image_worker(image_path, params, lossless=True, cancel_event=None, tile_progress_cb=None):
+    image_path = Path(image_path)
+    backend = ImageBackend().load(str(image_path))
+    try:
+        full_w, full_h = backend.slide_dims
+        tile_size = int(params["tile_size"])
+        overlap = float(params["overlap"])
+        downsample = float(params["downsample"])
+        padding = params["padding"]
+        output_format = params["output_format"]
+        write_ome = bool(params.get("write_ome", False))
+        preserve_raw = bool(params.get("preserve_raw", False)) and backend.reader == "tifffile" and output_format != "jpeg"
+        ext = params["ext"]
+        suffix = _suffix_for_tile(overlap, downsample)
+        edge_mode = params.get("edge_mode", "edge_aligned")
+        xs, ys, _, _ = _compute_tile_grid(full_w, full_h, tile_size, overlap, edge_mode=edge_mode)
+        out_dir = image_path.parent / image_path.stem
+        out_dir.mkdir(parents=True, exist_ok=True)
+        total = len(xs) * len(ys)
+        count = 0
+        for row_idx, y in enumerate(ys):
+            for col_idx, x in enumerate(xs):
+                _check_cancel(cancel_event)
+                crop_w = min(tile_size, full_w - x)
+                crop_h = min(tile_size, full_h - y)
+                if crop_w <= 0 or crop_h <= 0:
+                    continue
+                if preserve_raw:
+                    # Exact scientific tile: no RGB conversion, no per-tile intensity normalization.
+                    # Border tiles are saved as their true smaller size rather than padded,
+                    # because padding would create artificial pixels in multichannel data.
+                    actual_w, actual_h = crop_w, crop_h
+                    tile, axes, _ = backend.crop_raw(x, y, actual_w, actual_h)
+                    if downsample != 1.0:
+                        tile, axes = _resize_spatial_array(tile, axes, downsample)
+                    out_name = (
+                        f"{image_path.stem}_{_col_to_letters(col_idx)}{row_idx + 1}{suffix}"
+                        f"_X{x}_Y{y}_W{actual_w}_H{actual_h}{ext}"
+                    )
+                    out_path = out_dir / out_name
+                    save_multichannel_image(
+                        out_path, tile, axes=axes, write_ome=write_ome, lossless=lossless,
+                        source_resolution=backend.source_resolution, source_mpp=backend.source_mpp,
+                        image_name=out_path.stem, pixel_scale=downsample,
+                    )
+                else:
+                    # Visual tile path: converts to RGB uint8 for normal image/JPG workflows.
+                    # This is not intensity-preserving for IF data. Use preserve_raw for IF.
+                    is_edge_tile = (x + tile_size > full_w) or (y + tile_size > full_h)
+                    if is_edge_tile:
+                        tile = backend.read_tile_with_padding(x=x, y=y, size=tile_size, padding_color=padding)
+                        actual_w, actual_h = crop_w, crop_h
+                    else:
+                        tile, _ = backend.crop(x, y, tile_size, tile_size, fill=255)
+                        actual_w, actual_h = tile_size, tile_size
+                    if downsample != 1.0:
+                        from PIL import Image
+                        new_w = max(1, int(round(tile.shape[1] / downsample)))
+                        new_h = max(1, int(round(tile.shape[0] / downsample)))
+                        tile = np.asarray(Image.fromarray(tile).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
+                    out_name = (
+                        f"{image_path.stem}_{_col_to_letters(col_idx)}{row_idx + 1}{suffix}"
+                        f"_X{x}_Y{y}_W{actual_w}_H{actual_h}{ext}"
+                    )
+                    out_path = out_dir / out_name
+                    save_rgb_image(
+                        out_path, tile, output_format, write_ome, lossless,
+                        backend.source_resolution, backend.source_mpp, out_path.stem,
+                        pixel_scale=downsample,
+                    )
+                count += 1
+                if tile_progress_cb is not None:
+                    tile_progress_cb(count, total)
+        return {"image": str(image_path), "output_folder": str(out_dir), "tiles_written": count, "reader": backend.reader}
+    finally:
+        backend.close()
+
+
+def _save_division_tiles_one_image_worker(image_path, params, lossless=True, cancel_event=None, tile_progress_cb=None):
+    image_path = Path(image_path)
+    backend = ImageBackend().load(str(image_path))
+    try:
+        full_w, full_h = backend.slide_dims
+        rows = int(params["rows"])
+        cols = int(params["cols"])
+        downsample = float(params["downsample"])
+        output_format = params["output_format"]
+        write_ome = bool(params.get("write_ome", False))
+        preserve_raw = bool(params.get("preserve_raw", False)) and backend.reader == "tifffile" and output_format != "jpeg"
+        ext = params["ext"]
+        suffix = _suffix_for_division_tile(rows, cols, downsample)
+        out_dir = image_path.parent / f"{image_path.stem}_{suffix}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        total = rows * cols
+        count = 0
+        for r in range(rows):
+            for c in range(cols):
+                _check_cancel(cancel_event)
+                x, y, w, h = _division_bounds(0, 0, full_w, full_h, rows, cols, r, c)
+                out_name = f"{image_path.stem}_R{r + 1:03d}_C{c + 1:03d}{suffix}_X{x}_Y{y}_W{w}_H{h}{ext}"
+                out_path = out_dir / out_name
+                if preserve_raw:
+                    tile, axes, _ = backend.crop_raw(x, y, w, h)
+                    if downsample != 1.0:
+                        tile, axes = _resize_spatial_array(tile, axes, downsample)
+                    save_multichannel_image(
+                        out_path, tile, axes=axes, write_ome=write_ome, lossless=lossless,
+                        source_resolution=backend.source_resolution, source_mpp=backend.source_mpp,
+                        image_name=out_path.stem, pixel_scale=downsample,
+                    )
+                else:
+                    tile, _ = backend.crop(x, y, w, h, fill=255)
+                    if downsample != 1.0:
+                        from PIL import Image
+                        new_w = max(1, int(round(tile.shape[1] / downsample)))
+                        new_h = max(1, int(round(tile.shape[0] / downsample)))
+                        tile = np.asarray(Image.fromarray(tile).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
+                    save_rgb_image(
+                        out_path, tile, output_format, write_ome, lossless,
+                        backend.source_resolution, backend.source_mpp, out_path.stem,
+                        pixel_scale=downsample,
+                    )
+                count += 1
+                if tile_progress_cb is not None:
+                    tile_progress_cb(count, total)
+        return {"image": str(image_path), "output_folder": str(out_dir), "tiles_written": count, "reader": backend.reader}
+    finally:
+        backend.close()
+
+
+def _tile_bulk_job(cancel_event, progress_cb, message_cb, image_paths, params, lossless=True, max_workers=1):
+    image_paths = [Path(p) for p in image_paths]
+    max_workers = max(1, int(max_workers or 1))
+    rows_log = []
+    ok = failed = 0
+    progress_cb(0, len(image_paths))
+
+    def run_one(p):
+        if str(params["mode"]).startswith("Fixed"):
+            return _save_fixed_tiles_one_image_worker(p, params, lossless=lossless, cancel_event=cancel_event)
+        return _save_division_tiles_one_image_worker(p, params, lossless=lossless, cancel_event=cancel_event)
+
+    if max_workers <= 1 or len(image_paths) <= 1:
+        for i, p in enumerate(image_paths, start=1):
+            _check_cancel(cancel_event)
+            try:
+                message_cb(f"Saving tiles: {p.name} ({i}/{len(image_paths)})")
+                result = run_one(p)
+                rows_log.append({
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "operation": "fixed_tiles" if str(params["mode"]).startswith("Fixed") else "division_tiles",
+                    "status": "success",
+                    "image": str(p),
+                    "reader": result.get("reader", ""),
+                    "output_folder": result.get("output_folder", ""),
+                    "tiles_expected": "",
+                    "tiles_written": result.get("tiles_written", ""),
+                    "message": "",
+                })
+                ok += 1
+            except Exception as exc:
+                failed += 1
+                rows_log.append({
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "operation": "fixed_tiles" if str(params["mode"]).startswith("Fixed") else "division_tiles",
+                    "status": "failed",
+                    "image": str(p),
+                    "reader": "",
+                    "output_folder": "",
+                    "tiles_expected": "",
+                    "tiles_written": 0,
+                    "message": f"{exc}\n{traceback.format_exc()}",
+                })
+            progress_cb(i, len(image_paths))
+    else:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(image_paths))) as ex:
+            future_to_path = {ex.submit(run_one, p): p for p in image_paths}
+            done = 0
+            for fut in as_completed(future_to_path):
+                _check_cancel(cancel_event)
+                p = future_to_path[fut]
+                done += 1
+                try:
+                    result = fut.result()
+                    ok += 1
+                    rows_log.append({
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "operation": "fixed_tiles" if str(params["mode"]).startswith("Fixed") else "division_tiles",
+                        "status": "success",
+                        "image": str(p),
+                        "reader": result.get("reader", ""),
+                        "output_folder": result.get("output_folder", ""),
+                        "tiles_expected": "",
+                        "tiles_written": result.get("tiles_written", ""),
+                        "message": "",
+                    })
+                    message_cb(f"Finished tiles: {p.name} ({done}/{len(image_paths)})")
+                except Exception as exc:
+                    failed += 1
+                    rows_log.append({
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "operation": "fixed_tiles" if str(params["mode"]).startswith("Fixed") else "division_tiles",
+                        "status": "failed",
+                        "image": str(p),
+                        "reader": "",
+                        "output_folder": "",
+                        "tiles_expected": "",
+                        "tiles_written": 0,
+                        "message": f"{exc}\n{traceback.format_exc()}",
+                    })
+                progress_cb(done, len(image_paths))
+    log_base = image_paths[0].parent if image_paths else Path.cwd()
+    log_path = log_base / f"TiffCropper_batch_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    fieldnames = ["timestamp", "operation", "status", "image", "reader", "output_folder", "tiles_expected", "tiles_written", "message"]
+    with open(log_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows_log:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+    return {"ok": ok, "failed": failed, "log_path": str(log_path), "task": "tiles"}
+
+
+def _downsample_bulk_job(cancel_event, progress_cb, message_cb, image_paths, output_dir, factor, output_kind, preserve_raw, lossless, overwrite, max_workers=1):
+    paths = [Path(p) for p in image_paths]
+    out_dir = Path(output_dir) if output_dir else None
+    max_workers = max(1, int(max_workers or 1))
+    rows, ok, failed = [], 0, 0
+    progress_cb(0, len(paths))
+
+    def run_one(p):
+        _check_cancel(cancel_event)
+        return downsample_image_file(p, out_dir, factor, output_kind, preserve_raw, lossless, overwrite)
+
+    if max_workers <= 1 or len(paths) <= 1:
+        for i, p in enumerate(paths, start=1):
+            _check_cancel(cancel_event)
+            try:
+                message_cb(f"Downsampling {p.name} ({i}/{len(paths)})")
+                out = run_one(p)
+                rows.append({"input": str(p), "output": str(out), "status": "success", "message": ""})
+                ok += 1
+            except Exception as exc:
+                rows.append({"input": str(p), "output": "", "status": "failed", "message": f"{exc}\n{traceback.format_exc()}"})
+                failed += 1
+            progress_cb(i, len(paths))
+    else:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(paths))) as ex:
+            future_to_path = {ex.submit(run_one, p): p for p in paths}
+            done = 0
+            for fut in as_completed(future_to_path):
+                _check_cancel(cancel_event)
+                p = future_to_path[fut]
+                done += 1
+                try:
+                    out = fut.result()
+                    rows.append({"input": str(p), "output": str(out), "status": "success", "message": ""})
+                    ok += 1
+                    message_cb(f"Finished downsample: {p.name} ({done}/{len(paths)})")
+                except Exception as exc:
+                    rows.append({"input": str(p), "output": "", "status": "failed", "message": f"{exc}\n{traceback.format_exc()}"})
+                    failed += 1
+                progress_cb(done, len(paths))
+
+    log_dir = out_dir or (paths[0].parent if paths else Path.cwd())
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"TiffCropper_downsample_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    with open(log_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["input", "output", "status", "message"])
+        writer.writeheader()
+        writer.writerows(rows)
+    return {"ok": ok, "failed": failed, "log_path": str(log_path), "task": "downsample"}
+
+
+def _export_lif_file_headless(lif_path, scene_indices, options, cancel_event=None, progress_cb=None, message_cb=None):
+    LifFile = _require_readlif()
+    lif_path = Path(lif_path)
+    lif_obj = LifFile(str(lif_path))
+    images = list(lif_obj.get_iter_image())
+    out_dir = _lif_output_folder_for(lif_path, options.get("output_base"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = out_dir / f"{_lif_safe_name(lif_path.stem)}_manifest.csv"
+    rows = []
+    xml_path = _lif_write_xml_header(lif_obj, lif_path, out_dir) if options.get("save_xml", True) else None
+    selected = set(scene_indices) if scene_indices is not None else set(range(len(images)))
+    total_scenes = len(selected)
+    done_scenes = 0
+
+    for scene_index, img in enumerate(images):
+        if scene_index not in selected:
+            continue
+        _check_cancel(cancel_event)
+        scene_name = str(getattr(img, "name", f"scene_{scene_index}"))
+        safe_scene = _lif_safe_name(scene_name)
+        out_path = out_dir / f"scene_{scene_index:03d}_{safe_scene}.ome.tif"
+        base_meta = _lif_scene_metadata_dict(img, scene_index)
+        json_path = _lif_write_scene_json(base_meta, out_dir, scene_index, scene_name) if options.get("save_json", True) else None
+        row = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "lif_file": str(lif_path),
+            "scene_index": scene_index,
+            "scene_name": scene_name,
+            "readlif_path": getattr(img, "path", ""),
+            "size_x": base_meta.get("size_x"),
+            "size_y": base_meta.get("size_y"),
+            "size_z": base_meta.get("size_z"),
+            "size_t": base_meta.get("size_t"),
+            "size_m": base_meta.get("size_m"),
+            "size_c": base_meta.get("size_c"),
+            "bit_depth": base_meta.get("bit_depth"),
+            "scale_px_per_um": base_meta.get("scale_px_per_um"),
+            "PhysicalSizeX_um_per_px": base_meta.get("PhysicalSizeX"),
+            "PhysicalSizeY_um_per_px": base_meta.get("PhysicalSizeY"),
+            "PhysicalSizeZ_um_per_px": base_meta.get("PhysicalSizeZ"),
+            "xml_header_path": str(xml_path) if xml_path else "",
+            "scene_metadata_json": str(json_path) if json_path else "",
+            "output_path": str(out_path),
+            "status": "pending",
+            "error": "",
+        }
+
+        def plane_progress(done, total, scene_index=scene_index, scene_name=scene_name):
+            _check_cancel(cancel_event)
+            if progress_cb is not None:
+                progress_cb(done, max(1, total))
+            if message_cb is not None:
+                message_cb(f"Writing LIF {lif_path.name} | scene {scene_index}: {scene_name} | plane {done}/{total}")
+
+        try:
+            result = _lif_save_scene_ome_tiff_lowmem(
+                img=img,
+                scene_index=scene_index,
+                out_path=out_path,
+                overwrite=options.get("overwrite", False),
+                skip_existing=options.get("skip_existing", True),
+                compression=options.get("compression"),
+                progress_callback=plane_progress,
+            )
+            row.update(result)
+            row["status"] = "skipped_existing" if result.get("skipped_existing") else "success"
+        except Exception as exc:
+            row["status"] = "failed"
+            row["error"] = f"{exc}\n{traceback.format_exc()}"
+            rows.append(row)
+            _lif_write_manifest(manifest_path, rows)
+            if options.get("stop_on_error", False):
+                raise
+        else:
+            rows.append(row)
+            _lif_write_manifest(manifest_path, rows)
+        done_scenes += 1
+        if progress_cb is not None:
+            progress_cb(done_scenes, max(1, total_scenes))
+        if message_cb is not None:
+            message_cb(f"Finished LIF scene {scene_index}: {scene_name} ({done_scenes}/{total_scenes})")
+    return manifest_path
+
+
+def _lif_export_job(cancel_event, progress_cb, message_cb, lif_paths, scene_indices_by_file, options, max_workers=1):
+    paths = [Path(p) for p in lif_paths]
+    max_workers = max(1, int(max_workers or 1))
+    manifests, failures = [], []
+    progress_cb(0, len(paths))
+
+    def run_one(p):
+        indices = None
+        if scene_indices_by_file:
+            indices = scene_indices_by_file.get(str(p), None)
+        return _export_lif_file_headless(p, indices, options, cancel_event=cancel_event, progress_cb=None, message_cb=None)
+
+    # LIF export is memory- and disk-heavy. Parallelism is kept per file, not per scene.
+    if max_workers <= 1 or len(paths) <= 1:
+        for i, p in enumerate(paths, start=1):
+            _check_cancel(cancel_event)
+            try:
+                message_cb(f"Exporting LIF: {p.name} ({i}/{len(paths)})")
+                indices = scene_indices_by_file.get(str(p), None) if scene_indices_by_file else None
+                manifest = _export_lif_file_headless(p, indices, options, cancel_event=cancel_event, progress_cb=progress_cb, message_cb=message_cb)
+                manifests.append(str(manifest))
+            except Exception as exc:
+                failures.append({"file": str(p), "error": f"{exc}\n{traceback.format_exc()}"})
+                if options.get("stop_on_error", False):
+                    raise
+            progress_cb(i, len(paths))
+    else:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(paths))) as ex:
+            future_to_path = {ex.submit(run_one, p): p for p in paths}
+            done = 0
+            for fut in as_completed(future_to_path):
+                _check_cancel(cancel_event)
+                p = future_to_path[fut]
+                done += 1
+                try:
+                    manifests.append(str(fut.result()))
+                    message_cb(f"Finished LIF: {p.name} ({done}/{len(paths)})")
+                except Exception as exc:
+                    failures.append({"file": str(p), "error": f"{exc}\n{traceback.format_exc()}"})
+                    if options.get("stop_on_error", False):
+                        raise
+                progress_cb(done, len(paths))
+    return {"task": "lif", "manifests": manifests, "failures": failures}
+
+
 # ============================================================
 # Main GUI
 # ============================================================
@@ -2231,6 +3579,21 @@ class WSICropTileMergeGUI(QMainWindow):
         self.lif_single_obj = None
         self.lif_single_images = []
         self.lif_bulk_paths = []
+        self.downsample_paths = []
+        self.downsample_preview_path = None
+        self.downsample_roi = None
+        self.preview_path = None
+        self.preview_arr = None
+        self.preview_axes = None
+        self.preview_meta = {}
+        self.preview_full_dims = None
+        self.preview_center = None
+        self.preview_zoom = 1.0
+        self.preview_last_rgb = None
+        self.batch_channel_paths = []
+        self.active_worker = None
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._preview_channel_shortcuts = []
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -2244,12 +3607,26 @@ class WSICropTileMergeGUI(QMainWindow):
 
         menu_row = QHBoxLayout()
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Crop", "Tiles", "Merge Tiles", "Split LIF"])
+        self.mode_combo.addItems([
+            "Crop", "Tiles", "Merge Tiles", "Split LIF",
+            "Downsample", "Image Preview"
+        ])
         self.mode_combo.setMaximumWidth(180)
 
         menu_row.addWidget(QLabel("Mode:"))
         menu_row.addWidget(self.mode_combo)
         menu_row.addStretch()
+
+        self.worker_spin = QSpinBox()
+        self.worker_spin.setRange(1, max(1, min(8, (os.cpu_count() or 2))))
+        self.worker_spin.setValue(1)
+        self.worker_spin.setToolTip("Number of parallel files to process in bulk jobs. Use 1–2 for very large IF/LIF files.")
+        self.cancel_job_btn = QPushButton("Cancel job")
+        self.cancel_job_btn.setEnabled(False)
+        self.cancel_job_btn.clicked.connect(self.cancel_background_job)
+        menu_row.addWidget(QLabel("Workers:"))
+        menu_row.addWidget(self.worker_spin)
+        menu_row.addWidget(self.cancel_job_btn)
 
         help_btn = QPushButton("Help / About")
         help_btn.setToolTip("Show app information, citation, DOI, and usage notes.")
@@ -2267,6 +3644,8 @@ class WSICropTileMergeGUI(QMainWindow):
         self.stack.addWidget(self._build_tiles_page())
         self.stack.addWidget(self._build_merge_page())
         self.stack.addWidget(self._build_lif_page())
+        self.stack.addWidget(self._build_downsample_page())
+        self.stack.addWidget(self._build_preview_page())
         self.mode_combo.currentIndexChanged.connect(lambda: self.stack.setCurrentIndex(self.mode_combo.currentIndex()))
 
         root.addWidget(self.info_label)
@@ -2274,14 +3653,108 @@ class WSICropTileMergeGUI(QMainWindow):
         self.progress.setVisible(False)
         root.addWidget(self.progress)
 
+        self._install_preview_channel_shortcuts()
+
     def _set_label_pixmap(self, label, rgb):
         pm = _numpy_rgb_to_qpixmap(_to_uint8_rgb(rgb))
         label.setPixmap(pm.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def _install_preview_channel_shortcuts(self):
+        """Number keys 1..9 toggle channels in Image Preview mode."""
+        self._preview_channel_shortcuts = []
+        for i in range(1, 10):
+            shortcut = QShortcut(QKeySequence(str(i)), self)
+            shortcut.setContext(Qt.ApplicationShortcut)
+            shortcut.activated.connect(lambda idx=i: self.toggle_preview_channel_by_number(idx))
+            self._preview_channel_shortcuts.append(shortcut)
+
+    def toggle_preview_channel_by_number(self, number: int):
+        """Toggle channel N with key N while Image Preview is active.
+
+        Example: pressing 1 toggles C0, pressing 2 toggles C1.
+        The shortcut is ignored while editing text/numeric fields.
+        """
+        try:
+            if not hasattr(self, "mode_combo") or self.mode_combo.currentText() != "Image Preview":
+                return
+            fw = QApplication.focusWidget()
+            if isinstance(fw, (QLineEdit, QSpinBox, QDoubleSpinBox)):
+                return
+            row = int(number) - 1
+            if not hasattr(self, "channel_table") or row < 0 or row >= self.channel_table.rowCount():
+                return
+            chk = self.channel_table.cellWidget(row, 0)
+            if chk is None:
+                return
+            chk.setChecked(not chk.isChecked())
+            self.info_label.setText(f"Channel {number} toggled {'ON' if chk.isChecked() else 'OFF'}")
+            self.update_channel_preview()
+        except Exception as exc:
+            self.info_label.setText(f"Channel shortcut error: {exc}")
+
+    def keyPressEvent(self, event):
+        # Fallback in case the QShortcut is not active on a platform/widget.
+        key = event.key()
+        if Qt.Key_1 <= key <= Qt.Key_9 and hasattr(self, "mode_combo") and self.mode_combo.currentText() == "Image Preview":
+            self.toggle_preview_channel_by_number(key - Qt.Key_0)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _set_widgets_visible(self, widgets, visible: bool):
         for w in widgets:
             w.setVisible(visible)
             w.setEnabled(visible)
+
+    def _worker_count(self):
+        try:
+            return int(self.worker_spin.value())
+        except Exception:
+            return 1
+
+    def _set_busy_state(self, busy: bool):
+        self.mode_combo.setEnabled(not busy)
+        self.worker_spin.setEnabled(not busy)
+        self.cancel_job_btn.setEnabled(busy)
+        if busy:
+            self.progress.setVisible(True)
+        else:
+            self.progress.setVisible(False)
+
+    def _start_background_job(self, title, job_func, done_callback, *args, **kwargs):
+        if self.active_worker is not None and self.active_worker.isRunning():
+            QMessageBox.warning(self, "Job already running", "Wait for the current job to finish or click Cancel job.")
+            return
+        self.info_label.setText(f"Started: {title}")
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        self._set_busy_state(True)
+        worker = AppWorker(job_func, *args, **kwargs)
+        self.active_worker = worker
+        worker.message.connect(self.info_label.setText)
+        worker.progress.connect(lambda value, total: (self.progress.setRange(0, max(1, int(total))), self.progress.setValue(int(value))))
+        worker.finished_ok.connect(lambda result: self._background_job_done(title, result, done_callback))
+        worker.failed.connect(lambda text: self._background_job_failed(title, text))
+        worker.finished.connect(lambda: self._set_busy_state(False))
+        worker.start()
+
+    def _background_job_done(self, title, result, done_callback):
+        self.active_worker = None
+        self.progress.setVisible(False)
+        try:
+            done_callback(result)
+        except Exception as exc:
+            QMessageBox.critical(self, f"{title} finished, but finalization failed", str(exc))
+
+    def _background_job_failed(self, title, text):
+        self.active_worker = None
+        self.progress.setVisible(False)
+        QMessageBox.critical(self, f"{title} error", text)
+        self.info_label.setText(f"{title} failed.")
+
+    def cancel_background_job(self):
+        if self.active_worker is not None and self.active_worker.isRunning():
+            self.active_worker.cancel()
 
     def _write_batch_log(self, output_folder: Path, rows):
         """Write a CSV log for batch tiling operations."""
@@ -2302,14 +3775,14 @@ class WSICropTileMergeGUI(QMainWindow):
                 writer.writerow({k: row.get(k, "") for k in fieldnames})
         return log_path
 
-    def _draw_fixed_grid_on_thumb(self, thumb_rgb, full_w, full_h, tile_size, overlap):
+    def _draw_fixed_grid_on_thumb(self, thumb_rgb, full_w, full_h, tile_size, overlap, edge_mode="edge_aligned"):
         pm = _numpy_rgb_to_qpixmap(thumb_rgb)
         painter = QPainter(pm)
         pen_grid = QPen(QColor(220, 0, 0), 1)
         pen_pad = QPen(QColor(230, 190, 0), 2)
         sx = pm.width() / float(full_w)
         sy = pm.height() / float(full_h)
-        xs, ys, stride, _ = _compute_tile_grid(full_w, full_h, tile_size, overlap)
+        xs, ys, stride, _ = _compute_tile_grid(full_w, full_h, tile_size, overlap, edge_mode=edge_mode)
 
         painter.setPen(pen_grid)
         for y in ys:
@@ -2372,6 +3845,8 @@ class WSICropTileMergeGUI(QMainWindow):
             <li>Manual grid-based tile merging when filenames do not encode position.</li>
             <li>OME-TIFF export with physical pixel size preservation when available.</li>
             <li>Leica LIF splitting into one OME-TIFF per internal scene/page, preserving IF channels.</li>
+            <li>Bulk downsampling with raw multichannel OME-TIFF preservation when possible.</li>
+            <li>Interactive image preview with channel on/off checkboxes, color assignment, region-based zoom, and JPG capture.</li>
             <li>BigTIFF output and optional lossless DEFLATE compression.</li>
           </ul>
 
@@ -2432,6 +3907,553 @@ class WSICropTileMergeGUI(QMainWindow):
         dlg.exec_()
 
     # ========================================================
+
+    # ========================================================
+    # Downsample page
+    # ========================================================
+
+    def _build_downsample_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        file_box = QGroupBox("Input images for downsampling")
+        file_layout = QVBoxLayout(file_box)
+        row1 = QHBoxLayout()
+        one_btn = QPushButton("Load one image + preview")
+        one_btn.clicked.connect(self.load_downsample_preview_file)
+        bulk_btn = QPushButton("Bulk select images")
+        bulk_btn.clicked.connect(self.load_downsample_bulk_files)
+        folder_btn = QPushButton("Bulk folder")
+        folder_btn.clicked.connect(self.load_downsample_bulk_folder)
+        self.downsample_file_label = QLabel("No image selected")
+        self.downsample_file_label.setStyleSheet("padding: 10px; border: 1px solid #bdc3c7; border-radius: 5px;")
+        row1.addWidget(one_btn)
+        row1.addWidget(bulk_btn)
+        row1.addWidget(folder_btn)
+        row1.addWidget(self.downsample_file_label, 1)
+        file_layout.addLayout(row1)
+        row2 = QHBoxLayout()
+        out_btn = QPushButton("Output folder optional")
+        out_btn.clicked.connect(self.browse_downsample_output_folder)
+        self.downsample_output_edit = QLineEdit("")
+        self.downsample_output_edit.setPlaceholderText("Leave empty to save beside each input file")
+        row2.addWidget(out_btn)
+        row2.addWidget(self.downsample_output_edit, 1)
+        file_layout.addLayout(row2)
+        layout.addWidget(file_box)
+
+        opt = QGroupBox("Downsample options")
+        grid = QGridLayout(opt)
+        self.downsample_factor_spin = QDoubleSpinBox()
+        self.downsample_factor_spin.setRange(1.01, 256.0)
+        self.downsample_factor_spin.setDecimals(2)
+        self.downsample_factor_spin.setValue(4.0)
+        self.downsample_factor_spin.valueChanged.connect(self.update_downsample_preview)
+        self.downsample_output_combo = QComboBox()
+        self.downsample_output_combo.addItems(["OME-TIFF (.ome.tif)", "TIFF (.tif)", "JPEG (.jpg)"])
+        self.downsample_preserve_chk = QCheckBox("Preserve raw multichannel data for TIFF/OME-TIFF")
+        self.downsample_preserve_chk.setChecked(True)
+        self.downsample_lossless_chk = QCheckBox("Lossless TIFF compression")
+        self.downsample_lossless_chk.setChecked(True)
+        self.downsample_overwrite_chk = QCheckBox("Overwrite existing")
+        self.downsample_square_spin = QSpinBox()
+        self.downsample_square_spin.setRange(64, 100000)
+        self.downsample_square_spin.setValue(650)
+        self.downsample_square_spin.valueChanged.connect(self.update_downsample_square_size)
+        grid.addWidget(QLabel("Downsample factor:"), 0, 0)
+        grid.addWidget(self.downsample_factor_spin, 0, 1)
+        grid.addWidget(QLabel("Output format:"), 0, 2)
+        grid.addWidget(self.downsample_output_combo, 0, 3)
+        grid.addWidget(QLabel("Preview square size at original resolution:"), 1, 0)
+        grid.addWidget(self.downsample_square_spin, 1, 1)
+        grid.addWidget(self.downsample_preserve_chk, 2, 0, 1, 2)
+        grid.addWidget(self.downsample_lossless_chk, 2, 2)
+        grid.addWidget(self.downsample_overwrite_chk, 2, 3)
+        layout.addWidget(opt)
+
+        prev = QGroupBox("Preview: drag the square over the whole image")
+        prev_layout = QHBoxLayout(prev)
+        self.downsample_whole_label = FixedSquarePreviewLabel()
+        self.downsample_whole_label.setFixedSize(520, 380)
+        self.downsample_original_label = QLabel("Original-resolution square")
+        self.downsample_original_label.setAlignment(Qt.AlignCenter)
+        self.downsample_original_label.setFixedSize(330, 330)
+        self.downsample_original_label.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
+        self.downsample_result_label = QLabel("Downsampled square")
+        self.downsample_result_label.setAlignment(Qt.AlignCenter)
+        self.downsample_result_label.setFixedSize(330, 330)
+        self.downsample_result_label.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
+        prev_layout.addWidget(self.downsample_whole_label)
+        prev_layout.addWidget(self.downsample_original_label)
+        prev_layout.addWidget(self.downsample_result_label)
+        layout.addWidget(prev, 1)
+
+        btn_row = QHBoxLayout()
+        preview_btn = QPushButton("Update preview")
+        preview_btn.clicked.connect(self.update_downsample_preview)
+        run_btn = QPushButton("RUN BULK DOWNSAMPLE")
+        run_btn.clicked.connect(self.run_downsample_bulk)
+        btn_row.addWidget(preview_btn)
+        btn_row.addWidget(run_btn)
+        layout.addLayout(btn_row)
+        return page
+
+    def browse_downsample_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select output folder for downsampled images")
+        if folder:
+            self.downsample_output_edit.setText(folder)
+
+    def load_downsample_preview_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select image", "", _image_file_filter())
+        if not path:
+            return
+        self.downsample_preview_path = Path(path)
+        self.downsample_paths = [Path(path)]
+        try:
+            self.backend = ImageBackend().load(path)
+            w, h = self.backend.slide_dims
+            thumb = self.backend.input_thumbnail(max_side=900)
+            self.downsample_whole_label.set_image(thumb, full_w=w, full_h=h,
+                square_size_full=self.downsample_square_spin.value(), callback=self._on_downsample_square_changed)
+            self.downsample_file_label.setText(f"Preview: {Path(path).name} | {w} × {h} px | Reader: {self.backend.reader}")
+            self.info_label.setText("Downsample preview loaded. Drag the square to compare original detail versus selected downsample.")
+            self.update_downsample_preview()
+        except Exception as e:
+            QMessageBox.critical(self, "Downsample load error", str(e))
+
+    def load_downsample_bulk_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select images for bulk downsample", "", _image_file_filter())
+        if paths:
+            self.downsample_paths = [Path(p) for p in paths]
+            self.downsample_file_label.setText(f"Bulk downsample: {len(self.downsample_paths)} file(s) selected")
+            self.info_label.setText("Bulk downsample ready. Preview is only loaded when using single-image preview mode.")
+
+    def load_downsample_bulk_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select folder with images to downsample")
+        if not folder:
+            return
+        folder = Path(folder)
+        self.downsample_paths = sorted([p for p in folder.iterdir() if p.is_file() and _has_ext(p.name, SUPPORTED_EXTENSIONS)])
+        self.downsample_file_label.setText(f"Bulk downsample folder: {len(self.downsample_paths)} file(s)")
+        self.info_label.setText("Bulk downsample folder loaded.")
+
+    def update_downsample_square_size(self):
+        if hasattr(self, "downsample_whole_label"):
+            self.downsample_whole_label.square_size_full = int(self.downsample_square_spin.value())
+            self.downsample_whole_label._emit_selection()
+            self.downsample_whole_label.update()
+        self.update_downsample_preview()
+
+    def _on_downsample_square_changed(self, x, y, w, h):
+        self.downsample_roi = (x, y, w, h)
+
+    def update_downsample_preview(self):
+        if not getattr(self, "downsample_preview_path", None) or not getattr(self, "backend", None) or not self.backend.path:
+            return
+        if not self.downsample_roi:
+            return
+        try:
+            x, y, w, h = self.downsample_roi
+            preserve_raw = self.downsample_preserve_chk.isChecked() and _has_ext(self.downsample_preview_path.name, TIFF_EXTENSIONS)
+            if preserve_raw and hasattr(self.backend, "crop_raw"):
+                arr, axes, _ = self.backend.crop_raw(x, y, w, h)
+                rgb_original = _array_to_rgb_preview(arr, axes)
+                ds_arr, ds_axes = _resize_spatial_array(arr, axes, self.downsample_factor_spin.value())
+                rgb_ds = _array_to_rgb_preview(ds_arr, ds_axes)
+            else:
+                rgb_original, _ = self.backend.crop(x, y, w, h)
+                from PIL import Image
+                new_w = max(1, int(round(rgb_original.shape[1] / self.downsample_factor_spin.value())))
+                new_h = max(1, int(round(rgb_original.shape[0] / self.downsample_factor_spin.value())))
+                rgb_ds = np.asarray(Image.fromarray(_to_uint8_rgb(rgb_original)).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
+            self._set_label_pixmap(self.downsample_original_label, _downsample_for_preview(rgb_original, 320))
+            self._set_label_pixmap(self.downsample_result_label, _downsample_for_preview(rgb_ds, 320))
+            self.info_label.setText(f"Downsample preview ROI X={x}, Y={y}, W={w}, H={h} | DS={self.downsample_factor_spin.value():g}")
+        except Exception as e:
+            self.info_label.setText(f"Downsample preview error: {e}")
+
+    def run_downsample_bulk(self):
+        if not self.downsample_paths:
+            QMessageBox.warning(self, "No images", "Select one or more images first.")
+            return
+        out_dir = self.downsample_output_edit.text().strip()
+        factor = float(self.downsample_factor_spin.value())
+        output_kind = self.downsample_output_combo.currentText()
+        preserve_raw = self.downsample_preserve_chk.isChecked()
+        lossless = self.downsample_lossless_chk.isChecked()
+        overwrite = self.downsample_overwrite_chk.isChecked()
+        self._start_background_job(
+            "Bulk downsample",
+            _downsample_bulk_job,
+            self._on_downsample_done,
+            [str(p) for p in self.downsample_paths],
+            out_dir,
+            factor,
+            output_kind,
+            preserve_raw,
+            lossless,
+            overwrite,
+            self._worker_count(),
+        )
+
+    def _on_downsample_done(self, result):
+        QMessageBox.information(
+            self,
+            "Downsample complete",
+            f"Done. Success: {result.get('ok', 0)}. Failed: {result.get('failed', 0)}.\n\nLog:\n{result.get('log_path', '')}",
+        )
+        self.info_label.setText(f"Downsample complete. Log: {result.get('log_path', '')}")
+
+    # ========================================================
+    # Image Preview page
+    # ========================================================
+
+    def _build_preview_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        top = QHBoxLayout()
+        load_btn = QPushButton("Load image")
+        load_btn.clicked.connect(self.load_preview_file)
+        self.preview_file_label = QLabel("No file loaded")
+        self.preview_file_label.setStyleSheet("padding: 10px; border: 1px solid #bdc3c7; border-radius: 5px;")
+        top.addWidget(load_btn)
+        top.addWidget(self.preview_file_label, 1)
+        layout.addLayout(top)
+
+        save_box = QGroupBox("Save displayed preview as JPG")
+        save_row = QHBoxLayout(save_box)
+        self.preview_suffix_edit = QLineEdit("preview")
+        self.preview_suffix_edit.setPlaceholderText("Suffix for JPG capture")
+        save_btn = QPushButton("Save current JPG capture")
+        save_btn.clicked.connect(self.save_channel_preview_jpg)
+        zoom_in_btn = QPushButton("Zoom +")
+        zoom_in_btn.clicked.connect(lambda: self.change_preview_zoom(1.25))
+        zoom_out_btn = QPushButton("Zoom -")
+        zoom_out_btn.clicked.connect(lambda: self.change_preview_zoom(0.8))
+        zoom_fit_btn = QPushButton("Fit")
+        zoom_fit_btn.clicked.connect(lambda: self.set_preview_zoom(1.0))
+        rect_zoom_btn = QPushButton("Zoom to rectangle")
+        rect_zoom_btn.setToolTip("Click this, then drag a rectangle on the current preview to zoom to that region.")
+        rect_zoom_btn.clicked.connect(self.start_preview_rectangle_zoom)
+        self.preview_zoom_label = QLabel("Zoom: 100%")
+        save_row.addWidget(QLabel("Suffix:"))
+        save_row.addWidget(self.preview_suffix_edit)
+        save_row.addWidget(save_btn)
+        save_row.addStretch()
+        save_row.addWidget(zoom_out_btn)
+        save_row.addWidget(zoom_in_btn)
+        save_row.addWidget(zoom_fit_btn)
+        save_row.addWidget(rect_zoom_btn)
+        save_row.addWidget(self.preview_zoom_label)
+        layout.addWidget(save_box)
+
+        main = QHBoxLayout()
+        main.setSpacing(10)
+
+        # Wider left panel so the channel/color controls do not need horizontal scrolling.
+        left_panel = QWidget()
+        left_panel.setMinimumWidth(320)
+        left_panel.setMaximumWidth(360)
+        left = QVBoxLayout(left_panel)
+        left.setContentsMargins(0, 0, 0, 0)
+
+        self.channel_table = QTableWidget()
+        self.channel_table.setColumnCount(3)
+        self.channel_table.setHorizontalHeaderLabels(["On", "Channel", "Color"])
+        self.channel_table.setColumnWidth(0, 55)
+        self.channel_table.setColumnWidth(1, 95)
+        self.channel_table.setColumnWidth(2, 150)
+        self.channel_table.setMinimumWidth(315)
+        self.channel_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.channel_table.setAlternatingRowColors(True)
+        left.addWidget(QLabel("Channels / display mapping"))
+        left.addWidget(self.channel_table, 1)
+        update_btn = QPushButton("Update preview")
+        update_btn.clicked.connect(self.update_channel_preview)
+        left.addWidget(update_btn)
+        main.addWidget(left_panel, 0)
+
+        # More square preview area: less wide than before, taller relative to width.
+        self.preview_image_label = ZoomRegionPreviewLabel()
+        self.preview_image_label.setText("Preview")
+        self.preview_image_label.setAlignment(Qt.AlignCenter)
+        self.preview_image_label.setMinimumSize(720, 560)
+        self.preview_image_label.setMaximumSize(900, 700)
+        main.addWidget(self.preview_image_label, 1)
+        main.addStretch(1)
+        layout.addLayout(main, 1)
+        return page
+
+    def load_preview_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select image to preview", "", _image_file_filter())
+        if not path:
+            return
+        try:
+            self.preview_path = Path(path)
+            self.preview_zoom = 1.0
+            # Read a memory-light full-image preview first to detect channels.
+            self.preview_arr, self.preview_axes, self.preview_meta = read_zoom_region_from_file(
+                path, center_xy=None, zoom=1.0,
+                viewport_size=(max(640, self.preview_image_label.width()), max(420, self.preview_image_label.height())),
+                max_side=1200,
+            )
+            full_dims = self.preview_meta.get("full_dims")
+            if full_dims:
+                self.preview_full_dims = tuple(full_dims)
+                self.preview_center = (self.preview_full_dims[0] / 2.0, self.preview_full_dims[1] / 2.0)
+            else:
+                h, w = np.asarray(self.preview_arr).shape[:2]
+                self.preview_full_dims = (w, h)
+                self.preview_center = (w / 2.0, h / 2.0)
+            self.preview_file_label.setText(
+                f"{self.preview_path.name} | axes={self.preview_axes} | reader={self.preview_meta.get('reader')} | full={self.preview_full_dims[0]} × {self.preview_full_dims[1]}"
+            )
+            self.populate_channel_table()
+            self.update_channel_preview()
+        except Exception as e:
+            QMessageBox.critical(self, "Preview load error", str(e))
+
+    def populate_channel_table(self, settings: Optional[List[Dict[str, Any]]] = None):
+        if self.preview_arr is None:
+            return
+        n = _count_display_channels(self.preview_arr, self.preview_axes)
+        self.channel_table.setRowCount(n)
+
+        # For normal RGB images, default mapping should preserve RGB appearance.
+        _, ax2 = _representative_yx_or_yxc(self.preview_arr, self.preview_axes)
+        rgb_sample = (ax2 == "YXS" and np.asarray(self.preview_arr).ndim == 3 and np.asarray(self.preview_arr).shape[-1] in (3, 4))
+        rgb_names = ["R", "G", "B", "A"]
+        rgb_colors = ["red", "green", "blue", "gray"]
+
+        for i in range(n):
+            st = settings[i] if settings and i < len(settings) else {}
+            chk = QCheckBox()
+            chk.setChecked(bool(st.get("visible", True)))
+            chk.stateChanged.connect(self.update_channel_preview)
+            self.channel_table.setCellWidget(i, 0, chk)
+
+            label = rgb_names[i] if rgb_sample and i < len(rgb_names) else f"C{i}"
+            item = QTableWidgetItem(label)
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.channel_table.setItem(i, 1, item)
+
+            color_combo = QComboBox()
+            color_combo.addItems(list(COLOR_MAPS.keys()))
+            default_color = st.get("color", rgb_colors[i] if rgb_sample and i < len(rgb_colors) else DEFAULT_CHANNEL_COLORS[i % len(DEFAULT_CHANNEL_COLORS)])
+            color_combo.setCurrentText(default_color if default_color in COLOR_MAPS else "gray")
+            color_combo.currentIndexChanged.connect(self.update_channel_preview)
+            self.channel_table.setCellWidget(i, 2, color_combo)
+
+    def get_channel_settings_from_table(self) -> List[Dict[str, Any]]:
+        settings = []
+        for r in range(self.channel_table.rowCount()):
+            chk = self.channel_table.cellWidget(r, 0)
+            color_combo = self.channel_table.cellWidget(r, 2)
+            settings.append({
+                "channel": r,
+                "visible": chk.isChecked() if chk else True,
+                "color": color_combo.currentText() if color_combo else DEFAULT_CHANNEL_COLORS[r % len(DEFAULT_CHANNEL_COLORS)],
+            })
+        return settings
+
+    def update_channel_preview(self):
+        if self.preview_path is None:
+            return
+        try:
+            viewport = (max(640, self.preview_image_label.width()), max(420, self.preview_image_label.height()))
+            arr, axes, meta = read_zoom_region_from_file(
+                str(self.preview_path),
+                center_xy=getattr(self, "preview_center", None),
+                zoom=max(1.0, float(self.preview_zoom)),
+                viewport_size=viewport,
+                max_side=max(1400, int(max(viewport) * 2)),
+            )
+            self.preview_arr = arr
+            self.preview_axes = axes
+            self.preview_meta = meta
+            if meta.get("full_dims"):
+                self.preview_full_dims = tuple(meta["full_dims"])
+            self.preview_last_rgb = render_channel_composite(arr, axes, self.get_channel_settings_from_table())
+            self._update_preview_pixmap()
+            roi = meta.get("roi")
+            self.info_label.setText(
+                f"Preview loaded at {int(self.preview_zoom * 100)}% | ROI={roi} | reader={meta.get('reader')}"
+            )
+        except Exception as e:
+            self.info_label.setText(f"Preview render error: {e}")
+
+    def _update_preview_pixmap(self):
+        if self.preview_last_rgb is None:
+            return
+        roi = self.preview_meta.get("roi") if isinstance(self.preview_meta, dict) else None
+        full_dims = getattr(self, "preview_full_dims", None)
+        self.preview_image_label.set_preview(
+            _to_uint8_rgb(self.preview_last_rgb),
+            roi_full=roi,
+            full_dims=full_dims,
+            center_callback=self._on_preview_center_changed,
+            rectangle_callback=self._on_preview_rectangle_zoom,
+        )
+        self.preview_zoom_label.setText(f"Zoom: {int(self.preview_zoom * 100)}%")
+
+    def _on_preview_center_changed(self, cx, cy):
+        self.preview_center = (float(cx), float(cy))
+        self.update_channel_preview()
+
+    def start_preview_rectangle_zoom(self):
+        if self.preview_path is None:
+            QMessageBox.warning(self, "No image", "Load an image first.")
+            return
+        self.preview_image_label.enable_rectangle_zoom(True)
+        self.info_label.setText("Rectangle zoom: drag a rectangle on the current preview.")
+
+    def _on_preview_rectangle_zoom(self, x, y, w, h):
+        if not getattr(self, "preview_full_dims", None):
+            return
+        full_w, full_h = self.preview_full_dims
+        if w <= 1 or h <= 1:
+            return
+        self.preview_center = (x + w / 2.0, y + h / 2.0)
+        # Add a small margin so the selected rectangle is visible inside the viewport.
+        zoom_w = float(full_w) / max(1.0, float(w))
+        zoom_h = float(full_h) / max(1.0, float(h))
+        self.preview_zoom = max(1.0, min(64.0, 0.90 * min(zoom_w, zoom_h)))
+        self.update_channel_preview()
+
+    def change_preview_zoom(self, factor: float):
+        self.preview_zoom = max(1.0, min(32.0, self.preview_zoom * float(factor)))
+        self.update_channel_preview()
+
+    def set_preview_zoom(self, value: float):
+        self.preview_zoom = max(1.0, float(value))
+        # Re-center on the full image when returning to fit.
+        if self.preview_zoom == 1.0 and getattr(self, "preview_full_dims", None):
+            self.preview_center = (self.preview_full_dims[0] / 2.0, self.preview_full_dims[1] / 2.0)
+        self.update_channel_preview()
+
+    def save_channel_preview_jpg(self):
+        if self.preview_path is None or self.preview_last_rgb is None:
+            QMessageBox.warning(self, "No preview", "Load and render an image first.")
+            return
+        suffix = self.preview_suffix_edit.text().strip() or "preview"
+        out_path = self.preview_path.parent / f"{self.preview_path.stem}_{suffix}.jpg"
+        try:
+            save_preview_jpg(out_path, self.preview_last_rgb)
+            QMessageBox.information(self, "Saved", f"Saved JPG preview:\n{out_path}")
+            self.info_label.setText(f"Saved preview JPG: {out_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save preview error", str(e))
+
+    # ========================================================
+    # Batch JPG Preview Export page
+    # ========================================================
+
+    def _build_batch_channel_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        file_box = QGroupBox("Batch export displayed-style JPG previews")
+        file_layout = QVBoxLayout(file_box)
+        row = QHBoxLayout()
+        files_btn = QPushButton("Select image files")
+        files_btn.clicked.connect(self.load_batch_channel_files)
+        folder_btn = QPushButton("Select folder")
+        folder_btn.clicked.connect(self.load_batch_channel_folder)
+        self.batch_channel_label = QLabel("No files selected. Configure checkboxes/colors in Image Preview first, or use defaults.")
+        self.batch_channel_label.setStyleSheet("padding: 10px; border: 1px solid #bdc3c7; border-radius: 5px;")
+        row.addWidget(files_btn)
+        row.addWidget(folder_btn)
+        row.addWidget(self.batch_channel_label, 1)
+        file_layout.addLayout(row)
+        row2 = QHBoxLayout()
+        out_btn = QPushButton("Output folder optional")
+        out_btn.clicked.connect(self.browse_batch_channel_output_folder)
+        self.batch_channel_output_edit = QLineEdit("")
+        self.batch_channel_output_edit.setPlaceholderText("Leave empty to create a channel_previews folder beside first input")
+        row2.addWidget(out_btn)
+        row2.addWidget(self.batch_channel_output_edit, 1)
+        file_layout.addLayout(row2)
+        layout.addWidget(file_box)
+        opts = QGroupBox("Batch preview options")
+        opt = QHBoxLayout(opts)
+        self.batch_channel_suffix_edit = QLineEdit("channel_preview")
+        self.batch_channel_max_side_spin = QSpinBox()
+        self.batch_channel_max_side_spin.setRange(128, 10000)
+        self.batch_channel_max_side_spin.setValue(1600)
+        self.batch_channel_recursive_chk = QCheckBox("Recursive folder search")
+        opt.addWidget(QLabel("Suffix:"))
+        opt.addWidget(self.batch_channel_suffix_edit)
+        opt.addWidget(QLabel("Max output side:"))
+        opt.addWidget(self.batch_channel_max_side_spin)
+        opt.addWidget(self.batch_channel_recursive_chk)
+        opt.addStretch()
+        layout.addWidget(opts)
+        note = QLabel("This applies the Image Preview channel checkboxes/colors to many files and saves JPG previews only. It does not modify the original OME-TIFF/IF data.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555; padding: 4px;")
+        layout.addWidget(note)
+        run_btn = QPushButton("RUN BATCH JPG PREVIEW EXPORT")
+        run_btn.clicked.connect(self.run_batch_channel_convert)
+        layout.addWidget(run_btn)
+        layout.addStretch()
+        return page
+
+    def load_batch_channel_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select images", "", _image_file_filter())
+        if paths:
+            self.batch_channel_paths = [Path(p) for p in paths]
+            self.batch_channel_label.setText(f"Selected {len(self.batch_channel_paths)} image file(s)")
+
+    def load_batch_channel_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select folder with images")
+        if not folder:
+            return
+        folder = Path(folder)
+        it = folder.rglob("*") if self.batch_channel_recursive_chk.isChecked() else folder.iterdir()
+        self.batch_channel_paths = sorted([p for p in it if p.is_file() and _has_ext(p.name, SUPPORTED_EXTENSIONS)])
+        self.batch_channel_label.setText(f"Folder loaded: {len(self.batch_channel_paths)} image file(s)")
+
+    def browse_batch_channel_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select output folder for JPG previews")
+        if folder:
+            self.batch_channel_output_edit.setText(folder)
+
+    def run_batch_channel_convert(self):
+        if not self.batch_channel_paths:
+            QMessageBox.warning(self, "No files", "Select files or a folder first.")
+            return
+        settings = self.get_channel_settings_from_table() if hasattr(self, "channel_table") and self.channel_table.rowCount() else []
+        suffix = self.batch_channel_suffix_edit.text().strip() or "channel_preview"
+        max_side = int(self.batch_channel_max_side_spin.value())
+        out_dir = Path(self.batch_channel_output_edit.text().strip()) if self.batch_channel_output_edit.text().strip() else self.batch_channel_paths[0].parent / "channel_previews"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, len(self.batch_channel_paths))
+        rows, ok, failed = [], 0, 0
+        for i, p in enumerate(self.batch_channel_paths, start=1):
+            try:
+                self.info_label.setText(f"Rendering channel preview {p.name} ({i}/{len(self.batch_channel_paths)})")
+                QApplication.processEvents()
+                arr, axes, meta = read_preview_array_from_file(str(p), max_side=max_side)
+                n = _count_display_channels(arr, axes)
+                st = settings if settings and max(s.get("channel", 0) for s in settings) < n else []
+                rgb = render_channel_composite(arr, axes, st)
+                out_path = out_dir / f"{p.stem}_{suffix}.jpg"
+                save_preview_jpg(out_path, rgb)
+                rows.append({"input": str(p), "output": str(out_path), "status": "success", "message": ""})
+                ok += 1
+            except Exception as e:
+                failed += 1
+                rows.append({"input": str(p), "output": "", "status": "failed", "message": f"{e}\n{traceback.format_exc()}"})
+            self.progress.setValue(i)
+            QApplication.processEvents()
+        log_path = out_dir / f"TiffCropper_channel_preview_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        with open(log_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["input", "output", "status", "message"])
+            writer.writeheader()
+            writer.writerows(rows)
+        self.progress.setVisible(False)
+        QMessageBox.information(self, "Batch channel convert", f"Done. Success: {ok}. Failed: {failed}.\n\nLog:\n{log_path}")
+        self.info_label.setText(f"Batch channel convert complete. Log: {log_path}")
+
     # LIF splitter page
     # ========================================================
 
@@ -2665,6 +4687,17 @@ class WSICropTileMergeGUI(QMainWindow):
         text = self.lif_compression_combo.currentText().strip()
         return None if text.lower() == "none" else text
 
+    def _lif_options(self):
+        return {
+            "output_base": self._lif_output_base(),
+            "save_xml": self.lif_xml_chk.isChecked(),
+            "save_json": self.lif_json_chk.isChecked(),
+            "overwrite": self.lif_overwrite_chk.isChecked(),
+            "skip_existing": self.lif_skip_existing_chk.isChecked(),
+            "compression": self._lif_compression(),
+            "stop_on_error": self.lif_stop_on_error_chk.isChecked(),
+        }
+
     def save_lif_selected_scenes(self):
         if self.lif_single_path is None or self.lif_single_obj is None:
             QMessageBox.warning(self, "No LIF loaded", "Load one LIF file first.")
@@ -2673,69 +4706,60 @@ class WSICropTileMergeGUI(QMainWindow):
         if not selected:
             QMessageBox.warning(self, "No scenes selected", "Select at least one scene/page to save.")
             return
-        try:
-            manifest = self._export_lif_file(
-                lif_path=self.lif_single_path,
-                scene_indices=selected,
-                lif_obj=self.lif_single_obj,
-                images=self.lif_single_images,
-            )
-            QMessageBox.information(self, "LIF export complete", f"Export finished.\n\nManifest:\n{manifest}")
-        except Exception as e:
-            self.progress.setVisible(False)
-            QMessageBox.critical(self, "LIF Export Error", str(e))
+        scene_map = {str(self.lif_single_path): selected}
+        self._start_background_job(
+            "LIF selected scene export",
+            _lif_export_job,
+            self._on_lif_export_done,
+            [str(self.lif_single_path)],
+            scene_map,
+            self._lif_options(),
+            1,
+        )
 
     def save_lif_all_single_scenes(self):
         if self.lif_single_path is None or self.lif_single_obj is None:
             QMessageBox.warning(self, "No LIF loaded", "Load one LIF file first.")
             return
-        try:
-            manifest = self._export_lif_file(
-                lif_path=self.lif_single_path,
-                scene_indices=None,
-                lif_obj=self.lif_single_obj,
-                images=self.lif_single_images,
-            )
-            QMessageBox.information(self, "LIF export complete", f"Export finished.\n\nManifest:\n{manifest}")
-        except Exception as e:
-            self.progress.setVisible(False)
-            QMessageBox.critical(self, "LIF Export Error", str(e))
+        self._start_background_job(
+            "LIF export",
+            _lif_export_job,
+            self._on_lif_export_done,
+            [str(self.lif_single_path)],
+            {},
+            self._lif_options(),
+            1,
+        )
 
     def run_lif_bulk_export(self):
         if not self.lif_bulk_paths:
             QMessageBox.warning(self, "No bulk LIF files", "Select LIF files or a folder first.")
             return
-        manifests = []
-        failures = []
-        self.progress.setVisible(True)
-        self.progress.setRange(0, len(self.lif_bulk_paths))
-        self.progress.setValue(0)
-        QApplication.processEvents()
+        # LIF files are usually very large. More than 2 workers can saturate disk/RAM.
+        workers = min(self._worker_count(), 2)
+        self._start_background_job(
+            "Bulk LIF export",
+            _lif_export_job,
+            self._on_lif_export_done,
+            [str(p) for p in self.lif_bulk_paths],
+            {},
+            self._lif_options(),
+            workers,
+        )
 
-        for i, lif_path in enumerate(self.lif_bulk_paths, start=1):
-            try:
-                self.info_label.setText(f"Bulk LIF export: {lif_path.name} ({i}/{len(self.lif_bulk_paths)})")
-                QApplication.processEvents()
-                manifests.append(self._export_lif_file(lif_path=lif_path, scene_indices=None))
-            except Exception as e:
-                failures.append((lif_path, e))
-                if self.lif_stop_on_error_chk.isChecked():
-                    break
-            self.progress.setRange(0, len(self.lif_bulk_paths))
-            self.progress.setValue(i)
-            QApplication.processEvents()
-
-        self.progress.setVisible(False)
-        msg = f"Bulk export finished.\n\nManifest files: {len(manifests)}"
+    def _on_lif_export_done(self, result):
+        manifests = result.get("manifests", []) if isinstance(result, dict) else []
+        failures = result.get("failures", []) if isinstance(result, dict) else []
+        msg = f"LIF export finished. Manifest files: {len(manifests)}"
         if manifests:
-            msg += "\n" + "\n".join(str(p) for p in manifests[:10])
-            if len(manifests) > 10:
-                msg += f"\n... and {len(manifests) - 10} more"
+            msg += "\n" + "\n".join(str(p) for p in manifests[:8])
+            if len(manifests) > 8:
+                msg += f"\n... and {len(manifests) - 8} more"
         if failures:
             msg += f"\n\nFailures: {len(failures)}"
-            for p, e in failures[:5]:
-                msg += f"\n{p.name}: {e}"
-        QMessageBox.information(self, "Bulk LIF export", msg)
+            for f in failures[:5]:
+                msg += f"\n{Path(f.get('file', '')).name}: {str(f.get('error', ''))[:300]}"
+        QMessageBox.information(self, "LIF export", msg)
         self.info_label.setText(msg.replace("\n", " | "))
 
     def _export_lif_file(self, lif_path: Path, scene_indices=None, lif_obj=None, images=None):
@@ -3114,7 +5138,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.tile_mode_combo.currentIndexChanged.connect(self.update_tile_mode_controls)
 
         self.tile_fixed_info_label = QLabel(
-            "Fixed square tiles. True border tiles are padded to tile size. Middle tiles are direct crops."
+            "Fixed square tiles. Edge-aligned avoids tiny final sliver tiles. Raw IF tiles preserve original dtype/channels."
         )
         self.tile_fixed_info_label.setStyleSheet("color: #555;")
         self.tile_division_info_label = QLabel(
@@ -3139,6 +5163,14 @@ class WSICropTileMergeGUI(QMainWindow):
         self.tile_padding_combo = QComboBox()
         self.tile_padding_combo.addItems(["black", "white"])
 
+        self.tile_edge_label = QLabel("Edge handling:")
+        self.tile_edge_combo = QComboBox()
+        self.tile_edge_combo.addItems(["Edge-aligned full tiles", "Partial edge tiles"])
+        self.tile_edge_combo.setToolTip(
+            "Edge-aligned avoids tiny last sliver tiles by shifting the final tile to the image boundary. "
+            "This is recommended for IF/OME-TIFF raw tiles. Partial edge tiles keeps the older behavior."
+        )
+
         self.tile_rows_label = QLabel("Rows:")
         self.tile_rows_spin = QSpinBox()
         self.tile_rows_spin.setRange(1, 10000)
@@ -3157,10 +5189,13 @@ class WSICropTileMergeGUI(QMainWindow):
 
         self.tile_format_label = QLabel("Format:")
         self.tile_out_combo = QComboBox()
-        self.tile_out_combo.addItems(["TIFF (.tif)", "JPEG (.jpg)"])
+        self.tile_out_combo.addItems(["OME-TIFF (.ome.tif)", "TIFF (.tif)", "JPEG (.jpg)"])
 
         self.tile_lossless_chk = QCheckBox("Lossless TIFF compression")
         self.tile_lossless_chk.setChecked(True)
+        self.tile_preserve_raw_chk = QCheckBox("Preserve raw multichannel data for TIFF/OME-TIFF tiles")
+        self.tile_preserve_raw_chk.setChecked(True)
+        self.tile_preserve_raw_chk.setToolTip("For IF/OME-TIFF inputs, save tile pixels with original channels and dtype. No RGB conversion or intensity normalization.")
 
         grid.addWidget(self.tile_mode_label, 0, 0)
         grid.addWidget(self.tile_mode_combo, 0, 1, 1, 2)
@@ -3173,6 +5208,8 @@ class WSICropTileMergeGUI(QMainWindow):
         grid.addWidget(self.tile_overlap_spin, 2, 3)
         grid.addWidget(self.tile_padding_label, 3, 0)
         grid.addWidget(self.tile_padding_combo, 3, 1)
+        grid.addWidget(self.tile_edge_label, 3, 2)
+        grid.addWidget(self.tile_edge_combo, 3, 3)
 
         grid.addWidget(self.tile_rows_label, 2, 0)
         grid.addWidget(self.tile_rows_spin, 2, 1)
@@ -3184,6 +5221,7 @@ class WSICropTileMergeGUI(QMainWindow):
         grid.addWidget(self.tile_format_label, 4, 2)
         grid.addWidget(self.tile_out_combo, 4, 3)
         grid.addWidget(self.tile_lossless_chk, 5, 0, 1, 4)
+        grid.addWidget(self.tile_preserve_raw_chk, 6, 0, 1, 4)
 
         layout.addWidget(params)
 
@@ -3195,6 +5233,8 @@ class WSICropTileMergeGUI(QMainWindow):
             self.tile_overlap_spin,
             self.tile_padding_label,
             self.tile_padding_combo,
+            self.tile_edge_label,
+            self.tile_edge_combo,
         ]
         self.tile_division_widgets = [
             self.tile_division_info_label,
@@ -3236,7 +5276,7 @@ class WSICropTileMergeGUI(QMainWindow):
         if hasattr(self, "info_label"):
             if is_fixed:
                 self.info_label.setText(
-                    "Tiles mode: fixed square tiles. True border tiles are padded; middle tiles are direct crops."
+                    "Tiles mode: fixed square tiles. Edge-aligned mode avoids tiny last sliver tiles; raw IF tiles are not normalized."
                 )
             else:
                 self.info_label.setText("Tiles mode: divide image by rows and columns. Tiles may be rectangular.")
@@ -3260,20 +5300,32 @@ class WSICropTileMergeGUI(QMainWindow):
         self.tiles_file_label.setText(
             f"Selected: {len(self.bulk_paths)} file(s) | Preview: {path.name} | {w} x {h} px | Reader: {self.backend.reader}"
         )
-        self._set_label_pixmap(self.tiles_thumb, self.backend.input_thumbnail(max_side=768))
-        self.info_label.setText(f"Loaded for tiling: {path.name} | Reader: {self.backend.reader}")
+        arr_prev, axes_prev, meta_prev = read_preview_array_from_file(str(path), max_side=768)
+        self._set_label_pixmap(self.tiles_thumb, _array_to_rgb_preview(arr_prev, axes_prev))
+        self.info_label.setText(f"Loaded for tiling: {path.name} | Reader: {self.backend.reader} | preview={meta_prev.get('reader', '')}")
 
     def _tile_params(self):
+        out_text = self.tile_out_combo.currentText()
+        preserve_raw = (
+            hasattr(self, "tile_preserve_raw_chk")
+            and self.tile_preserve_raw_chk.isChecked()
+            and _write_format_from_combo(out_text) != "jpeg"
+        )
+        edge_text = self.tile_edge_combo.currentText() if hasattr(self, "tile_edge_combo") else "Edge-aligned full tiles"
+        edge_mode = "partial" if "Partial" in edge_text else "edge_aligned"
         return {
             "mode": self.tile_mode_combo.currentText(),
+            "edge_mode": edge_mode,
             "tile_size": int(self.tile_size_spin.value()),
             "overlap": float(self.tile_overlap_spin.value()),
             "rows": int(self.tile_rows_spin.value()),
             "cols": int(self.tile_cols_spin.value()),
             "downsample": float(self.tile_downsample_spin.value()),
             "padding": self.tile_padding_combo.currentText(),
-            "output_format": _write_format_from_combo(self.tile_out_combo.currentText()),
-            "ext": _extension_from_combo(self.tile_out_combo.currentText()),
+            "output_format": _write_format_from_combo(out_text),
+            "write_ome": str(out_text).startswith("OME-TIFF"),
+            "preserve_raw": preserve_raw,
+            "ext": _extension_from_combo(out_text),
         }
 
     def preview_tiles_grid(self):
@@ -3283,16 +5335,17 @@ class WSICropTileMergeGUI(QMainWindow):
         try:
             params = self._tile_params()
             full_w, full_h = self.backend.slide_dims
-            thumb = self.backend.input_thumbnail(max_side=768)
+            arr_prev, axes_prev, meta_prev = read_preview_array_from_file(str(self.backend.path), max_side=768)
+            thumb = _array_to_rgb_preview(arr_prev, axes_prev)
 
             if params["mode"].startswith("Fixed"):
                 tile_size = params["tile_size"]
                 overlap = params["overlap"]
-                pm = self._draw_fixed_grid_on_thumb(thumb, full_w, full_h, tile_size, overlap)
-                xs, ys, stride, ovpx = _compute_tile_grid(full_w, full_h, tile_size, overlap)
+                pm = self._draw_fixed_grid_on_thumb(thumb, full_w, full_h, tile_size, overlap, edge_mode=params.get("edge_mode", "edge_aligned"))
+                xs, ys, stride, ovpx = _compute_tile_grid(full_w, full_h, tile_size, overlap, edge_mode=params.get("edge_mode", "edge_aligned"))
                 self.info_label.setText(
                     f"Fixed grid: {len(xs)} columns x {len(ys)} rows = {len(xs) * len(ys)} tiles | "
-                    f"Overlap {overlap:g}% ({ovpx}px) | Stride {stride}px | Reader: {self.backend.reader}"
+                    f"Overlap {overlap:g}% ({ovpx}px) | Stride {stride}px | Edge: {params.get('edge_mode', 'edge_aligned')} | Reader: {self.backend.reader}"
                 )
             else:
                 rows = params["rows"]
@@ -3313,105 +5366,27 @@ class WSICropTileMergeGUI(QMainWindow):
         if not self.bulk_paths:
             QMessageBox.warning(self, "Error", "Load one or more images first.")
             return
-        log_rows = []
-        try:
-            params = self._tile_params()
-            jobs = []
-            total_tiles = 0
-            for p in self.bulk_paths:
-                b = ImageBackend().load(str(p))
-                try:
-                    w, h = b.slide_dims
-                    if params["mode"].startswith("Fixed"):
-                        xs, ys, _, _ = _compute_tile_grid(w, h, params["tile_size"], params["overlap"])
-                        n_tiles = len(xs) * len(ys)
-                    else:
-                        n_tiles = params["rows"] * params["cols"]
-                    jobs.append((p, b.reader, n_tiles))
-                    total_tiles += n_tiles
-                finally:
-                    b.close()
+        params = self._tile_params()
+        lossless = self.tile_lossless_chk.isChecked()
+        if params.get("preserve_raw"):
+            self.info_label.setText("Raw multichannel tiling enabled: tiles preserve dtype/channels and are not normalized.")
+        self._start_background_job(
+            "Bulk tiling",
+            _tile_bulk_job,
+            self._on_tiles_done,
+            [str(p) for p in self.bulk_paths],
+            params,
+            lossless,
+            self._worker_count(),
+        )
 
-            if total_tiles == 0:
-                QMessageBox.warning(self, "No tiles", "No tiles would be generated with the current settings.")
-                return
-
-            self.progress.setVisible(True)
-            self.progress.setRange(0, total_tiles)
-            self.progress.setValue(0)
-            QApplication.processEvents()
-
-            written = 0
-            failed = 0
-            log_base = self.bulk_paths[0].parent if self.bulk_paths else Path.cwd()
-
-            for p, reader_name, expected_tiles in jobs:
-                try:
-                    if params["mode"].startswith("Fixed"):
-                        count = self._save_fixed_tiles_one_image(p, params, written)
-                        operation = "fixed_tiles"
-                        out_folder = p.parent / p.stem
-                    else:
-                        count = self._save_division_tiles_one_image(p, params, written)
-                        operation = "division_tiles"
-                        out_folder = p.parent / f"{p.stem}_{_suffix_for_division_tile(params['rows'], params['cols'], params['downsample'])}"
-                    written += count
-                    log_rows.append({
-                        "timestamp": datetime.now().isoformat(timespec="seconds"),
-                        "operation": operation,
-                        "status": "success",
-                        "image": str(p),
-                        "reader": reader_name,
-                        "output_folder": str(out_folder),
-                        "tiles_expected": expected_tiles,
-                        "tiles_written": count,
-                        "message": "",
-                    })
-                except Exception as image_error:
-                    failed += 1
-                    message = f"{image_error}\n{traceback.format_exc()}"
-                    log_rows.append({
-                        "timestamp": datetime.now().isoformat(timespec="seconds"),
-                        "operation": "fixed_tiles" if params["mode"].startswith("Fixed") else "division_tiles",
-                        "status": "failed",
-                        "image": str(p),
-                        "reader": reader_name,
-                        "output_folder": "",
-                        "tiles_expected": expected_tiles,
-                        "tiles_written": 0,
-                        "message": message,
-                    })
-                    self.info_label.setText(f"Failed: {p.name}. Continuing with remaining files...")
-                    QApplication.processEvents()
-
-            log_path = self._write_batch_log(log_base, log_rows)
-            self.progress.setVisible(False)
-
-            if failed:
-                self.info_label.setText(f"Done with warnings: saved {written} tiles; {failed} image(s) failed. Log: {log_path}")
-                QMessageBox.warning(
-                    self,
-                    "Done with warnings",
-                    f"Saved {written} tiles from {len(self.bulk_paths) - failed} image(s).\n"
-                    f"Failed images: {failed}\n\nLog saved to:\n{log_path}"
-                )
-            else:
-                self.info_label.setText(f"Done: saved {written} tiles from {len(self.bulk_paths)} image(s). Log: {log_path}")
-                QMessageBox.information(
-                    self,
-                    "Done",
-                    f"Saved {written} tiles from {len(self.bulk_paths)} image(s).\n\nLog saved to:\n{log_path}"
-                )
-        except Exception as e:
-            self.progress.setVisible(False)
-            if log_rows:
-                try:
-                    log_path = self._write_batch_log(self.bulk_paths[0].parent, log_rows)
-                    QMessageBox.critical(self, "Tiling Error", f"{e}\n\nPartial log saved to:\n{log_path}")
-                    return
-                except Exception:
-                    pass
-            QMessageBox.critical(self, "Tiling Error", str(e))
+    def _on_tiles_done(self, result):
+        QMessageBox.information(
+            self,
+            "Tiles complete",
+            f"Done. Success: {result.get('ok', 0)}. Failed: {result.get('failed', 0)}.\n\nLog:\n{result.get('log_path', '')}",
+        )
+        self.info_label.setText(f"Tiles complete. Log: {result.get('log_path', '')}")
 
     def _save_fixed_tiles_one_image(self, image_path, params, start_progress):
         backend = ImageBackend().load(str(image_path))
@@ -3425,7 +5400,8 @@ class WSICropTileMergeGUI(QMainWindow):
 
         suffix = _suffix_for_tile(overlap, downsample)
 
-        xs, ys, _, _ = _compute_tile_grid(full_w, full_h, tile_size, overlap)
+        edge_mode = params.get("edge_mode", "edge_aligned")
+        xs, ys, _, _ = _compute_tile_grid(full_w, full_h, tile_size, overlap, edge_mode=edge_mode)
         out_dir = image_path.parent / image_path.stem
         out_dir.mkdir(parents=True, exist_ok=True)
         count = 0
@@ -3550,9 +5526,12 @@ class WSICropTileMergeGUI(QMainWindow):
         self.merge_crop_padding_chk = QCheckBox("Crop external padding after merge")
         self.merge_crop_padding_chk.setChecked(True)
         self.merge_out_combo = QComboBox()
-        self.merge_out_combo.addItems(["TIFF (.tif)", "JPEG (.jpg)"])
+        self.merge_out_combo.addItems(["OME-TIFF (.ome.tif)", "TIFF (.tif)", "JPEG (.jpg)"])
         self.merge_lossless_chk = QCheckBox("Lossless TIFF compression")
         self.merge_lossless_chk.setChecked(True)
+        self.merge_preserve_raw_chk = QCheckBox("Preserve raw multichannel data for TIFF/OME-TIFF merge")
+        self.merge_preserve_raw_chk.setChecked(True)
+        self.merge_preserve_raw_chk.setToolTip("For IF tiles generated as raw OME-TIFF/TIFF, merge without RGB conversion or intensity normalization.")
         grid.addWidget(QLabel("Mode:"), 0, 0)
         grid.addWidget(self.merge_mode_combo, 0, 1)
         grid.addWidget(QLabel("Overlap %:"), 1, 0)
@@ -3564,6 +5543,7 @@ class WSICropTileMergeGUI(QMainWindow):
         grid.addWidget(QLabel("Format:"), 3, 0)
         grid.addWidget(self.merge_out_combo, 3, 1)
         grid.addWidget(self.merge_lossless_chk, 3, 2)
+        grid.addWidget(self.merge_preserve_raw_chk, 4, 0, 1, 3)
         layout.addWidget(params)
 
         prev = QGroupBox("Reconstruction Preview")
@@ -3626,11 +5606,154 @@ class WSICropTileMergeGUI(QMainWindow):
             return overlaps[0]
         return float(txt)
 
-    def _read_tile_file(self, path):
+    def _read_tile_file(self, path, display_limits=None):
+        """Read a tile for visual merge preview/output.
+
+        This path is display-oriented and converts to RGB/uint8. For IF data,
+        display_limits should be computed once from the full tile set and reused
+        for every tile. This avoids the visible seams caused by normalizing each
+        tile independently. Use the raw merge option for intensity-preserving
+        multichannel merges.
+        """
+        path = Path(path)
         if _has_ext(path.name, (".jpg", ".jpeg", ".png")):
             from PIL import Image
             return _to_uint8_rgb(np.asarray(Image.open(path).convert("RGB")))
-        return _to_uint8_rgb(tifffile.imread(str(path)))
+
+        if display_limits is not None:
+            arr, axes = self._read_tile_raw_file(path)
+            return self._render_tile_with_display_limits(arr, axes, display_limits)
+
+        # Fallback used only for small/manual previews. It may normalize one tile
+        # independently, so it should not be used for final stitched IF previews.
+        arr, axes = self._read_tile_raw_file(path)
+        return _array_to_rgb_preview(arr, axes)
+
+    def _read_tile_raw_file(self, path):
+        """Read a tile preserving dtype/channels/axes when possible."""
+        path = Path(path)
+        if _has_ext(path.name, (".jpg", ".jpeg", ".png")):
+            from PIL import Image
+            arr = np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
+            return arr, "YXS"
+        with tifffile.TiffFile(str(path)) as tif:
+            s = tif.series[0]
+            axes = getattr(s, "axes", "") or ""
+            arr = s.asarray()
+        axes = _guess_axes_for_array(arr, axes)
+        return np.asarray(arr), axes
+
+    def _sample_values_for_limits(self, arr2, max_samples_per_tile=12000):
+        """Return a small deterministic sample from a YX or YXC tile preview array."""
+        arr2 = np.asarray(arr2)
+        if arr2.ndim < 2 or arr2.size == 0:
+            return arr2
+        h, w = int(arr2.shape[0]), int(arr2.shape[1])
+        pixels = max(1, h * w)
+        step = max(1, int(math.ceil(math.sqrt(pixels / float(max_samples_per_tile)))))
+        if arr2.ndim == 2:
+            return arr2[::step, ::step]
+        return arr2[::step, ::step, :]
+
+    def _compute_tile_display_limits(self, metas, p_low=1.0, p_high=99.8):
+        """Compute global display limits for a tile set.
+
+        The previous preview path normalized each tile separately. That makes
+        tile borders visible even when raw pixels are correct. This function
+        samples all selected tiles and computes one low/high range per channel.
+        """
+        channel_samples = []
+        for m in metas:
+            try:
+                arr, axes = self._read_tile_raw_file(m["path"])
+                arr2, ax2 = _representative_yx_or_yxc(arr, axes)
+                arr2 = self._sample_values_for_limits(arr2)
+                if arr2.ndim == 2:
+                    channels = [arr2]
+                elif arr2.ndim == 3 and ax2.endswith(("C", "S")):
+                    channels = [arr2[:, :, i] for i in range(arr2.shape[-1])]
+                else:
+                    channels = [arr2]
+                while len(channel_samples) < len(channels):
+                    channel_samples.append([])
+                for i, ch in enumerate(channels):
+                    vals = np.asarray(ch).reshape(-1)
+                    if vals.size:
+                        channel_samples[i].append(vals)
+            except Exception:
+                continue
+
+        limits = []
+        for parts in channel_samples:
+            if not parts:
+                limits.append((0.0, 1.0))
+                continue
+            vals = np.concatenate(parts).astype(np.float32, copy=False)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                limits.append((0.0, 1.0))
+                continue
+            lo = float(np.percentile(vals, p_low))
+            hi = float(np.percentile(vals, p_high))
+            if hi <= lo:
+                lo = float(vals.min())
+                hi = float(vals.max())
+            if hi <= lo:
+                # Keep a non-zero range so the renderer remains stable.
+                hi = lo + 1.0
+            limits.append((lo, hi))
+        return limits or None
+
+    def _normalize_with_limit(self, plane, lo, hi):
+        plane = np.asarray(plane, dtype=np.float32)
+        if hi <= lo:
+            hi = lo + 1.0
+        return np.clip((plane - float(lo)) / (float(hi) - float(lo)), 0, 1)
+
+    def _render_tile_with_display_limits(self, arr, axes, display_limits):
+        """Render one raw tile using global limits shared by the entire tile set."""
+        arr2, ax2 = _representative_yx_or_yxc(arr, axes)
+        if arr2.ndim == 2:
+            lo, hi = display_limits[0] if display_limits else (float(np.min(arr2)), float(np.max(arr2)))
+            ch = self._normalize_with_limit(arr2, lo, hi)
+            return np.clip(np.stack([ch, ch, ch], axis=-1) * 255, 0, 255).astype(np.uint8)
+
+        if arr2.ndim == 3 and ax2 == "YXS" and arr2.shape[-1] in (3, 4):
+            # RGB-like data: apply global per-sample limits only when available.
+            rgb = np.zeros(arr2.shape[:2] + (3,), dtype=np.float32)
+            for c in range(min(3, arr2.shape[-1])):
+                if display_limits and c < len(display_limits):
+                    lo, hi = display_limits[c]
+                    rgb[:, :, c] = self._normalize_with_limit(arr2[:, :, c], lo, hi)
+                else:
+                    rgb[:, :, c] = _normalize_channel_float(arr2[:, :, c])
+            return np.clip(rgb * 255, 0, 255).astype(np.uint8)
+
+        if arr2.ndim == 3 and ax2.endswith(("C", "S")):
+            h, w = arr2.shape[:2]
+            rgb = np.zeros((h, w, 3), dtype=np.float32)
+            # Use the same default IF colors as Image Preview.
+            for c in range(arr2.shape[-1]):
+                color_name = DEFAULT_CHANNEL_COLORS[c % len(DEFAULT_CHANNEL_COLORS)]
+                color_vec = np.asarray(COLOR_MAPS.get(color_name, COLOR_MAPS["gray"]), dtype=np.float32)
+                if display_limits and c < len(display_limits):
+                    lo, hi = display_limits[c]
+                    ch = self._normalize_with_limit(arr2[:, :, c], lo, hi)
+                else:
+                    ch = _normalize_channel_float(arr2[:, :, c])
+                rgb += ch[:, :, None] * color_vec[None, None, :]
+            return np.clip(rgb, 0, 1).astype(np.float32).__mul__(255).astype(np.uint8)
+
+        return _array_to_rgb_preview(arr, axes)
+
+    def _spatial_shape_from_axes(self, arr, axes):
+        arr = np.asarray(arr)
+        axes = _guess_axes_for_array(arr, axes)
+        if axes and len(axes) == arr.ndim and "Y" in axes and "X" in axes:
+            return int(arr.shape[axes.index("Y")]), int(arr.shape[axes.index("X")])
+        if arr.ndim < 2:
+            raise ValueError(f"Cannot determine Y/X shape from tile with shape {arr.shape} and axes {axes}")
+        return int(arr.shape[-2]), int(arr.shape[-1])
 
     def _manual_overlap_value(self):
         txt = self.merge_overlap_edit.text().strip().lower()
@@ -3699,8 +5822,8 @@ class WSICropTileMergeGUI(QMainWindow):
             min_y = min(scaled_ys) if scaled_ys else 0
 
             for m, sx, sy in zip(metas, scaled_xs, scaled_ys):
-                tile = self._read_tile_file(m["path"])
-                th, tw = tile.shape[:2]
+                tile_raw, tile_axes = self._read_tile_raw_file(m["path"])
+                th, tw = self._spatial_shape_from_axes(tile_raw, tile_axes)
                 x = sx - min_x
                 y = sy - min_y
                 placements[m["path"]] = (tw, th, x, y)
@@ -3711,22 +5834,66 @@ class WSICropTileMergeGUI(QMainWindow):
             return int(max_right), int(max_bottom), 0, 0, placements
 
         # Fallback for older tile names without coordinate metadata.
-        first = self._read_tile_file(metas[0]["path"])
-        base_h, base_w = first.shape[:2]
+        first_raw, first_axes = self._read_tile_raw_file(metas[0]["path"])
+        base_h, base_w = self._spatial_shape_from_axes(first_raw, first_axes)
         stride_x = base_w - int(round(base_w * overlap / 100.0))
         stride_y = base_h - int(round(base_h * overlap / 100.0))
         if stride_x <= 0 or stride_y <= 0:
             raise ValueError("Overlap must be lower than 100%.")
 
         for m in metas:
-            tile = self._read_tile_file(m["path"])
-            th, tw = tile.shape[:2]
-            _, _, x, y = placements[m["path"]]
+            tile_raw, tile_axes = self._read_tile_raw_file(m["path"])
+            th, tw = self._spatial_shape_from_axes(tile_raw, tile_axes)
+            x = int(m.get("col", 0)) * stride_x
+            y = int(m.get("row", 0)) * stride_y
             placements[m["path"]] = (tw, th, x, y)
             max_right = max(max_right, x + tw)
             max_bottom = max(max_bottom, y + th)
 
         return int(max_right), int(max_bottom), stride_x, stride_y, placements
+
+    def _tile_canvas_geometry_raw(self, metas, overlap):
+        """Compute canvas geometry using raw tile shapes without RGB conversion."""
+        placements = {}
+        max_right = 0
+        max_bottom = 0
+        first_arr, first_axes = self._read_tile_raw_file(metas[0]["path"])
+        base_h, base_w = self._spatial_shape_from_axes(first_arr, first_axes)
+        use_coordinates = all(m.get("x") is not None and m.get("y") is not None for m in metas)
+
+        if use_coordinates:
+            scaled_xs, scaled_ys = [], []
+            for m in metas:
+                ds = float(m.get("downsample") or 1.0)
+                if ds <= 0:
+                    ds = 1.0
+                scaled_xs.append(int(round(float(m["x"]) / ds)))
+                scaled_ys.append(int(round(float(m["y"]) / ds)))
+            min_x = min(scaled_xs) if scaled_xs else 0
+            min_y = min(scaled_ys) if scaled_ys else 0
+            for m, sx, sy in zip(metas, scaled_xs, scaled_ys):
+                arr, axes = self._read_tile_raw_file(m["path"])
+                th, tw = self._spatial_shape_from_axes(arr, axes)
+                x = sx - min_x
+                y = sy - min_y
+                placements[m["path"]] = (tw, th, x, y)
+                max_right = max(max_right, x + tw)
+                max_bottom = max(max_bottom, y + th)
+            return int(max_right), int(max_bottom), 0, 0, placements, first_axes, first_arr.shape, first_arr.dtype
+
+        stride_x = base_w - int(round(base_w * overlap / 100.0))
+        stride_y = base_h - int(round(base_h * overlap / 100.0))
+        if stride_x <= 0 or stride_y <= 0:
+            raise ValueError("Overlap must be lower than 100%.")
+        for m in metas:
+            arr, axes = self._read_tile_raw_file(m["path"])
+            th, tw = self._spatial_shape_from_axes(arr, axes)
+            x = int(m.get("col", 0)) * stride_x
+            y = int(m.get("row", 0)) * stride_y
+            placements[m["path"]] = (tw, th, x, y)
+            max_right = max(max_right, x + tw)
+            max_bottom = max(max_bottom, y + th)
+        return int(max_right), int(max_bottom), stride_x, stride_y, placements, first_axes, first_arr.shape, first_arr.dtype
 
     def _reconstruct_tiles_manual(self, preview=False):
         if not self.manual_layout:
@@ -3801,6 +5968,10 @@ class WSICropTileMergeGUI(QMainWindow):
 
         metas, base = self._collect_tile_metadata()
         overlap = self._merge_overlap_value(metas)
+        # Use one shared display normalization for all tiles. Without this, each
+        # tile gets normalized independently and seams become visible in the
+        # stitched preview/JPG even when raw pixels are correct.
+        display_limits = self._compute_tile_display_limits(metas)
         out_w, out_h, stride_x, stride_y, placements = self._tile_canvas_geometry(metas, overlap)
 
         if preview:
@@ -3810,7 +5981,7 @@ class WSICropTileMergeGUI(QMainWindow):
             canvas = np.zeros((prev_h, prev_w, 3), dtype=np.uint8)
             from PIL import Image
             for m in metas:
-                tile = self._read_tile_file(m["path"])
+                tile = self._read_tile_file(m["path"], display_limits=display_limits)
                 small_w = max(1, int(round(tile.shape[1] * scale)))
                 small_h = max(1, int(round(tile.shape[0] * scale)))
                 small = np.asarray(Image.fromarray(tile).resize((small_w, small_h), Image.Resampling.BILINEAR), dtype=np.uint8)
@@ -3827,7 +5998,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.progress.setVisible(True)
         self.progress.setRange(0, len(metas))
         for i, m in enumerate(metas, start=1):
-            tile = self._read_tile_file(m["path"])
+            tile = self._read_tile_file(m["path"], display_limits=display_limits)
             _, _, x, y = placements[m["path"]]
             th, tw = tile.shape[:2]
             merged[y:y+th, x:x+tw, :] = tile
@@ -3838,6 +6009,78 @@ class WSICropTileMergeGUI(QMainWindow):
         if self.merge_crop_padding_chk.isChecked():
             merged = _crop_external_padding(merged, self.merge_padding_combo.currentText())
         return merged, base, overlap, min(stride_x, stride_y) if stride_x and stride_y else 0
+
+    def _paste_raw_tile_into_canvas(self, canvas, canvas_axes, tile, tile_axes, x, y):
+        canvas_axes = _guess_axes_for_array(canvas, canvas_axes)
+        tile_axes = _guess_axes_for_array(tile, tile_axes)
+        if canvas_axes != tile_axes:
+            raise ValueError(f"Tile axes mismatch. Canvas axes={canvas_axes}, tile axes={tile_axes}")
+        y_axis = canvas_axes.index("Y")
+        x_axis = canvas_axes.index("X")
+        for i, ax in enumerate(canvas_axes):
+            if ax not in ("Y", "X") and canvas.shape[i] != tile.shape[i]:
+                raise ValueError(
+                    f"Non-spatial dimension mismatch for axis {ax}: canvas={canvas.shape[i]}, tile={tile.shape[i]}"
+                )
+        slicer = [slice(None)] * canvas.ndim
+        th = int(tile.shape[y_axis])
+        tw = int(tile.shape[x_axis])
+        slicer[y_axis] = slice(int(y), int(y) + th)
+        slicer[x_axis] = slice(int(x), int(x) + tw)
+        canvas[tuple(slicer)] = tile
+
+    def _reconstruct_tiles_raw(self, output_hint: Path):
+        """Merge raw TIFF/OME-TIFF tiles without RGB conversion or intensity normalization.
+
+        Uses a disk-backed memmap for the merged canvas to avoid holding the full
+        multichannel image only in RAM. This is intended for tiles generated by
+        this app's raw multichannel tiling mode.
+        """
+        if self.merge_mode_combo.currentText().startswith("Manual"):
+            raise ValueError("Raw multichannel merge is currently supported for Auto-from-names mode only.")
+        metas, base = self._collect_tile_metadata()
+        overlap = self._merge_overlap_value(metas)
+        out_w, out_h, stride_x, stride_y, placements, axes, first_shape, dtype = self._tile_canvas_geometry_raw(metas, overlap)
+        axes = _guess_axes_for_array(np.empty(first_shape, dtype=dtype), axes)
+        if not axes or "Y" not in axes or "X" not in axes:
+            raise ValueError(f"Cannot raw-merge tiles without valid Y/X axes. Got axes={axes!r}")
+        out_shape = list(first_shape)
+        out_shape[axes.index("Y")] = int(out_h)
+        out_shape[axes.index("X")] = int(out_w)
+        out_shape = tuple(out_shape)
+        tmp_path = Path(output_hint).with_suffix(Path(output_hint).suffix + ".rawmerge.tmp.dat")
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+        canvas = np.memmap(str(tmp_path), mode="w+", dtype=dtype, shape=out_shape)
+        canvas[:] = 0
+        self.progress.setVisible(True)
+        self.progress.setRange(0, len(metas))
+        try:
+            for i, m in enumerate(metas, start=1):
+                tile, tile_axes = self._read_tile_raw_file(m["path"])
+                _, _, x, y = placements[m["path"]]
+                self._paste_raw_tile_into_canvas(canvas, axes, tile, tile_axes, x, y)
+                self.progress.setValue(i)
+                if i % 3 == 0:
+                    self.info_label.setText(f"Raw merge: {i}/{len(metas)} tiles")
+                    QApplication.processEvents()
+            canvas.flush()
+            return canvas, axes, base, overlap, min(stride_x, stride_y) if stride_x and stride_y else 0, tmp_path
+        except Exception:
+            try:
+                del canvas
+            except Exception:
+                pass
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+        finally:
+            self.progress.setVisible(False)
 
     def preview_merge(self):
         if not self.tile_files:
@@ -3859,12 +6102,15 @@ class WSICropTileMergeGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Select a tile folder or tile files first.")
             return
         try:
-            rgb, base, overlap, stride = self._reconstruct_tiles(preview=False)
             combo = self.merge_out_combo.currentText()
             output_format = _write_format_from_combo(combo)
             ext = _extension_from_combo(combo)
-            suffix = _suffix_for_tile(overlap, 1)
-            out_path = self.tile_files[0].parent / f"{base}_merged{suffix}{ext}"
+            write_ome = str(combo).startswith("OME-TIFF")
+            raw_merge = (
+                hasattr(self, "merge_preserve_raw_chk")
+                and self.merge_preserve_raw_chk.isChecked()
+                and output_format != "jpeg"
+            )
 
             # Reuse calibration from the first tile. The tiles already contain the
             # final pixel size, so no additional scaling is applied during merge.
@@ -3879,10 +6125,45 @@ class WSICropTileMergeGUI(QMainWindow):
                 source_resolution = None
                 source_mpp = None
 
+            if raw_merge:
+                metas, base_for_name = self._collect_tile_metadata()
+                overlap_for_name = self._merge_overlap_value(metas)
+                suffix = _suffix_for_tile(overlap_for_name, 1)
+                out_path = self.tile_files[0].parent / f"{base_for_name}_merged_raw{suffix}{ext}"
+                canvas = None
+                tmp_path = None
+                try:
+                    canvas, axes, base, overlap, stride, tmp_path = self._reconstruct_tiles_raw(out_path)
+                    save_multichannel_image(
+                        out_path, canvas, axes=axes, write_ome=write_ome,
+                        lossless=self.merge_lossless_chk.isChecked(),
+                        source_resolution=source_resolution, source_mpp=source_mpp,
+                        image_name=out_path.stem, pixel_scale=1.0,
+                    )
+                    # Display a safe preview from the saved output rather than rendering the full memmap.
+                    arr_prev, axes_prev, _ = read_preview_array_from_file(str(out_path), max_side=900)
+                    self._set_label_pixmap(self.merge_thumb, _array_to_rgb_preview(arr_prev, axes_prev))
+                    self.info_label.setText(f"Saved raw multichannel merged image: {out_path}")
+                    QMessageBox.information(self, "Done", f"Saved raw multichannel merged image:\n{out_path}")
+                finally:
+                    try:
+                        del canvas
+                    except Exception:
+                        pass
+                    if tmp_path is not None:
+                        try:
+                            Path(tmp_path).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                return
+
+            rgb, base, overlap, stride = self._reconstruct_tiles(preview=False)
+            suffix = _suffix_for_tile(overlap, 1)
+            out_path = self.tile_files[0].parent / f"{base}_merged{suffix}{ext}"
             save_rgb_image(
-                out_path, rgb, output_format, False, self.merge_lossless_chk.isChecked(),
+                out_path, rgb, output_format, write_ome, self.merge_lossless_chk.isChecked(),
                 source_resolution=source_resolution, source_mpp=source_mpp,
-                image_name=out_path.stem, pixel_scale=1.0
+                image_name=out_path.stem, pixel_scale=1.0,
             )
             self._set_label_pixmap(self.merge_thumb, _downsample_for_preview(rgb, 900))
             self.info_label.setText(f"Saved merged image: {out_path}")
@@ -3913,4 +6194,3 @@ if __name__ == "__main__":
     window = WSICropTileMergeGUI()
     window.show()
     sys.exit(app.exec_())
-
