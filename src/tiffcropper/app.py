@@ -22,10 +22,10 @@ from PyQt5.QtWidgets import (
     QSpinBox, QMessageBox, QComboBox, QCheckBox, QGroupBox,
     QStackedWidget, QDoubleSpinBox, QProgressBar, QDialog,
     QTableWidget, QTableWidgetItem, QTextBrowser, QDialogButtonBox,
-    QScrollArea, QShortcut
+    QScrollArea, QShortcut, QSlider, QColorDialog, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QRect, QPoint, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QIcon, QKeySequence
+from PyQt5.QtCore import Qt, QRect, QPoint, QPointF, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QIcon, QKeySequence, QPainterPath, QBrush
 
 # ============================================================
 # App metadata
@@ -661,11 +661,41 @@ def _count_display_channels(arr: np.ndarray, axes: str = None) -> int:
 
 def render_channel_composite(arr: np.ndarray, axes: str, channel_settings: List[Dict[str, Any]],
                              p_low: float = 1.0, p_high: float = 99.8) -> np.ndarray:
-    """Render multichannel scientific data into a display RGB image."""
+    """Render scientific multichannel data or preserve true RGB for display.
+
+    Important: RGB/H&E images must not be percentile-normalized channel-by-channel,
+    because that changes the colour balance and can create a strange appearance
+    when zooming out. If the source has an S/samples axis or is a normal RGB/RGBA
+    image, the preview preserves the original RGB values by default.
+    """
     arr2, ax2 = _representative_yx_or_yxc(arr, axes)
+
+    # True RGB/RGBA image: preserve colour balance. Channel checkboxes can still
+    # hide individual RGB channels, but values are not re-normalized.
     if arr2.ndim == 3 and ax2 == "YXS" and arr2.shape[-1] in (3, 4):
+        rgb = _to_uint8_rgb(arr2)
         if not channel_settings:
-            return _to_uint8_rgb(arr2)
+            return rgb
+        out = np.zeros_like(rgb)
+        default_rgb_colors = ["red", "green", "blue"]
+        for st in channel_settings:
+            if not st.get("visible", True):
+                continue
+            c = int(st.get("channel", 0))
+            if c < 0 or c >= min(3, rgb.shape[-1]):
+                continue
+            color_name = str(st.get("color", default_rgb_colors[c] if c < 3 else "gray")).lower()
+            # Default RGB mapping keeps true RGB. Non-default choices are allowed
+            # for visual inspection, but still use raw 8-bit values rather than
+            # percentile normalization.
+            if c < 3 and color_name == default_rgb_colors[c]:
+                out[:, :, c] = rgb[:, :, c]
+            else:
+                color_vec = np.asarray(COLOR_MAPS.get(color_name, COLOR_MAPS["gray"]), dtype=np.float32)
+                ch = rgb[:, :, c].astype(np.float32) / 255.0
+                out = np.clip(out.astype(np.float32) + ch[:, :, None] * color_vec[None, None, :] * 255.0, 0, 255).astype(np.uint8)
+        return out
+
     if arr2.ndim == 2:
         ch = _normalize_channel_float(arr2, p_low, p_high)
         return np.clip(np.stack([ch, ch, ch], axis=-1) * 255, 0, 255).astype(np.uint8)
@@ -678,9 +708,9 @@ def render_channel_composite(arr: np.ndarray, axes: str, channel_settings: List[
             {"channel": i, "visible": True, "color": DEFAULT_CHANNEL_COLORS[i % len(DEFAULT_CHANNEL_COLORS)]}
             for i in range(n)
         ]
-    # Draw in the natural channel order. Colors and visibility are user-controlled;
-    # order was intentionally removed from the GUI because it did not add much value
-    # for additive IF overlays.
+    # Draw in natural channel order. Colors and visibility are user-controlled;
+    # order was intentionally removed from the GUI because it did not add much
+    # value for additive IF overlays.
     for st in channel_settings:
         if not st.get("visible", True):
             continue
@@ -692,7 +722,6 @@ def render_channel_composite(arr: np.ndarray, axes: str, channel_settings: List[
         ch = _normalize_channel_float(arr2[:, :, c], p_low, p_high)
         rgb += ch[:, :, None] * color_vec[None, None, :]
     return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
-
 
 
 def _placeholder_rgb(message: str, width: int = 900, height: int = 600) -> np.ndarray:
@@ -734,7 +763,7 @@ def read_preview_array_from_file(path: str, max_side: int = 1200, allow_full_fal
         arr = np.asarray(im.convert("RGB"))
         return arr, "YXS", {**meta, "reader": "PIL", "shape": tuple(arr.shape), "axes": "YXS"}
 
-    if _has_ext(p.name, TIFF_EXTENSIONS):
+    if _has_ext(p.name, TIFF_EXTENSIONS) and not p.name.lower().endswith(".svs"):
         with tifffile.TiffFile(path) as tif:
             s = tif.series[0]
             axes = getattr(s, "axes", "") or ""
@@ -1613,32 +1642,425 @@ def _lif_write_manifest(manifest_path: Path, rows: List[Dict[str, Any]]) -> Path
 # Crop rectangle widget
 # ============================================================
 
+def _clean_annotation_display_name(value: Any) -> str:
+    """Make GeoJSON feature ids/classes readable in the annotation menu.
+
+    Some annotation exporters encode the real class in Feature.id using helper
+    prefixes, for example:
+        parent_Neoplastic_Tissue
+        merged_Neoplastic_Tissue
+        child_Stroma
+    The menu should show the biological/pathology class, not the exporter role.
+    """
+    text = str(value or "annotation").strip()
+    if not text:
+        return "annotation"
+
+    # Remove repeated exporter/helper prefixes while preserving the real class.
+    # Keep this list conservative: these words describe annotation grouping/role,
+    # not biological classes. The user's ArtidisNet-like files use parent_* and
+    # merged_* ids; QuPath-like files may use annotation/object prefixes.
+    removable_prefixes = (
+        "merged", "merge", "parent", "child", "annotation", "annotations",
+        "object", "objects", "feature", "roi", "polygon", "multipolygon"
+    )
+    previous = None
+    while previous != text:
+        previous = text
+        for prefix in removable_prefixes:
+            pattern = rf"^{prefix}[_:\-\s]+(.+)$"
+            m = re.match(pattern, text, flags=re.I)
+            if m:
+                text = m.group(1).strip()
+                break
+
+    text = re.sub(r"[_\s]+", " ", text).strip()
+    return text or "annotation"
+
+
+def _is_generic_geojson_name(value: Any) -> bool:
+    """Return True for metadata words that are not useful class names."""
+    if value in (None, ""):
+        return True
+    text = str(value).strip().lower().replace("_", " ").replace("-", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text in {
+        "annotation", "annotations", "object", "objects", "feature", "features",
+        "detection", "detections", "polygon", "multipolygon", "geometry",
+        "geojson", "pathobject", "path object"
+    }
+
+
+def _geojson_feature_class_name(feature: Dict[str, Any], properties: Dict[str, Any]) -> str:
+    """Return a readable class/name from QuPath, ArtidisNet, or generic GeoJSON.
+
+    Priority is important:
+    1. QuPath classification.name / class_name / label.
+    2. Explicit class/name/label properties.
+    3. Top-level Feature id/name/label, because ArtidisNet-like exports often
+       store class names only there, e.g. id="merged_Neoplastic_Tissue".
+    4. Generic objectType/type metadata only as a last resort.
+
+    This avoids classifying everything as simply "annotation" when a file has
+    properties.objectType="annotation" but the real class is in Feature.id.
+    """
+    props = properties or {}
+
+    # QuPath classification block is the most reliable source when present.
+    classification = props.get("classification")
+    if isinstance(classification, dict):
+        for key in ("name", "class_name", "className", "label", "class"):
+            value = classification.get(key)
+            if not _is_generic_geojson_name(value):
+                return _clean_annotation_display_name(value)
+    elif not _is_generic_geojson_name(classification):
+        return _clean_annotation_display_name(classification)
+
+    # Explicit class-like properties. Avoid generic object/type fields here.
+    for key in (
+        "class_name", "className", "class", "label", "name", "annotation_name",
+        "annotationName", "category", "category_name", "categoryName"
+    ):
+        value = props.get(key)
+        if not _is_generic_geojson_name(value):
+            return _clean_annotation_display_name(value)
+
+    # ArtidisNet / parent-child / merged style: the class can be top-level id.
+    if isinstance(feature, dict):
+        for key in ("id", "name", "label"):
+            value = feature.get(key)
+            if not _is_generic_geojson_name(value):
+                return _clean_annotation_display_name(value)
+
+    # Last resort: only use object/type metadata if it is not a generic word.
+    for key in ("object_type", "objectType", "type"):
+        value = props.get(key)
+        if not _is_generic_geojson_name(value):
+            return _clean_annotation_display_name(value)
+
+    return "annotation"
+
+
+# Backward compatible name for any older internal calls.
+def _geojson_properties_class_name(properties: Dict[str, Any]) -> str:
+    return _geojson_feature_class_name({}, properties or {})
+
+
+def _qcolor_from_any(value: Any) -> Optional[QColor]:
+    """Convert many GeoJSON/QuPath colour encodings to QColor.
+
+    Supported examples:
+    - "#RRGGBB", "RRGGBB", "#AARRGGBB"
+    - signed/unsigned QuPath colorRGB integers
+    - [R, G, B], [A, R, G, B], or 0..1 float triples
+    - {"r": 255, "g": 0, "b": 0} / {"red": ..., "green": ..., "blue": ...}
+    """
+    try:
+        if value is None:
+            return None
+        if isinstance(value, QColor):
+            return QColor(value) if value.isValid() else None
+        if isinstance(value, dict):
+            low = {str(k).lower(): v for k, v in value.items()}
+            r = low.get("r", low.get("red"))
+            g = low.get("g", low.get("green"))
+            b = low.get("b", low.get("blue"))
+            if r is not None and g is not None and b is not None:
+                vals = [float(r), float(g), float(b)]
+                if max(vals) <= 1.0:
+                    vals = [v * 255.0 for v in vals]
+                return QColor(int(round(vals[0])), int(round(vals[1])), int(round(vals[2])))
+            return None
+        if isinstance(value, (list, tuple)) and len(value) >= 3:
+            vals = [float(v) for v in value]
+            if len(vals) >= 4:
+                # Most JSON colour arrays are RGBA, so preserve the first three
+                # values. QuPath normally uses colorRGB integer rather than ARGB
+                # arrays, so this default avoids converting red RGBA to blue.
+                vals = vals[:3]
+            else:
+                vals = vals[:3]
+            if max(vals) <= 1.0:
+                vals = [v * 255.0 for v in vals]
+            return QColor(int(round(vals[0])), int(round(vals[1])), int(round(vals[2])))
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            # CSS-like rgb(r,g,b)
+            m = re.match(r"rgba?\s*\(([^)]+)\)", text, flags=re.I)
+            if m:
+                parts = [p.strip() for p in m.group(1).split(",")]
+                if len(parts) >= 3:
+                    return _qcolor_from_any([float(parts[0]), float(parts[1]), float(parts[2])])
+            if not text.startswith("#") and re.fullmatch(r"[0-9A-Fa-f]{6,8}", text):
+                text = "#" + text[-6:]
+            qc = QColor(text)
+            if qc.isValid():
+                return qc
+            if text.lstrip("+-").isdigit():
+                value = int(text)
+            else:
+                return None
+        if isinstance(value, (int, float)):
+            # QuPath classification.colorRGB is often a signed Java int. Treat as
+            # ARGB/RGB and keep the lower 24 bits.
+            intval = int(value)
+            if intval < 0:
+                intval &= 0xFFFFFFFF
+            r = (intval >> 16) & 255
+            g = (intval >> 8) & 255
+            b = intval & 255
+            return QColor(r, g, b)
+    except Exception:
+        return None
+    return None
+
+
+def _deterministic_qcolor_for_text(text: str) -> QColor:
+    """Stable fallback colour so classes without explicit colours are not all red."""
+    palette = [
+        QColor(230, 25, 75), QColor(60, 180, 75), QColor(0, 130, 200),
+        QColor(245, 130, 48), QColor(145, 30, 180), QColor(70, 240, 240),
+        QColor(240, 50, 230), QColor(210, 245, 60), QColor(250, 190, 190),
+        QColor(0, 128, 128), QColor(230, 190, 255), QColor(170, 110, 40),
+    ]
+    s = str(text or "annotation")
+    idx = sum((i + 1) * ord(ch) for i, ch in enumerate(s)) % len(palette)
+    return QColor(palette[idx])
+
+
+def _qcolor_from_geojson_feature(feature: Dict[str, Any], properties: Dict[str, Any],
+                                 default: QColor = QColor(255, 0, 0), class_name: str = "annotation") -> QColor:
+    """Extract annotation colour from QuPath / ArtidisNet / generic GeoJSON."""
+    props = properties or {}
+    candidates = []
+
+    # Direct properties used by generic annotation tools.
+    for key in (
+        "class_color_hex", "classColor", "class_color", "color", "colour",
+        "stroke", "fill", "strokeColor", "fillColor", "lineColor", "borderColor",
+        "colorRGB", "rgb"
+    ):
+        if key in props:
+            candidates.append(props.get(key))
+
+    # QuPath classification block.
+    classification = props.get("classification")
+    if isinstance(classification, dict):
+        for key in (
+            "colorRGB", "color", "colour", "class_color_hex", "classColor",
+            "stroke", "fill", "strokeColor", "fillColor", "rgb"
+        ):
+            if key in classification:
+                candidates.append(classification.get(key))
+
+    # Some exporters place colour fields at the Feature level.
+    if isinstance(feature, dict):
+        for key in ("color", "colour", "stroke", "fill", "strokeColor", "fillColor", "colorRGB", "rgb"):
+            if key in feature:
+                candidates.append(feature.get(key))
+
+    for value in candidates:
+        qc = _qcolor_from_any(value)
+        if qc is not None and qc.isValid():
+            return qc
+
+    # If the file has class names but no explicit colour, use a stable per-class
+    # fallback instead of one red colour for everything.
+    if class_name and class_name != "annotation":
+        return _deterministic_qcolor_for_text(class_name)
+    return QColor(default)
+
+
+def _qcolor_from_geojson_properties(properties: Dict[str, Any], default: QColor = QColor(255, 0, 0)) -> QColor:
+    # Backward-compatible wrapper.
+    class_name = _geojson_properties_class_name(properties or {})
+    return _qcolor_from_geojson_feature({}, properties or {}, default=default, class_name=class_name)
+
+
+def _clean_geojson_ring(raw_ring: Any) -> List[Tuple[float, float]]:
+    ring = []
+    if not isinstance(raw_ring, (list, tuple)):
+        return ring
+    for pt in raw_ring:
+        try:
+            if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                x = float(pt[0])
+                y = float(pt[1])
+                if np.isfinite(x) and np.isfinite(y):
+                    ring.append((x, y))
+        except Exception:
+            continue
+    return ring
+
+
+def _geojson_geometry_to_rings(geometry: Dict[str, Any]) -> List[List[Tuple[float, float]]]:
+    """Return polygon rings from Polygon, MultiPolygon, or GeometryCollection GeoJSON."""
+    if not isinstance(geometry, dict):
+        return []
+    gtype = str(geometry.get("type", "")).lower()
+    coords = geometry.get("coordinates")
+    rings: List[List[Tuple[float, float]]] = []
+
+    if gtype == "polygon":
+        for raw_ring in coords or []:
+            ring = _clean_geojson_ring(raw_ring)
+            if len(ring) >= 2:
+                rings.append(ring)
+    elif gtype == "multipolygon":
+        for polygon in coords or []:
+            for raw_ring in polygon or []:
+                ring = _clean_geojson_ring(raw_ring)
+                if len(ring) >= 2:
+                    rings.append(ring)
+    elif gtype == "linestring":
+        ring = _clean_geojson_ring(coords)
+        if len(ring) >= 2:
+            rings.append(ring)
+    elif gtype == "multilinestring":
+        for raw_ring in coords or []:
+            ring = _clean_geojson_ring(raw_ring)
+            if len(ring) >= 2:
+                rings.append(ring)
+    elif gtype == "geometrycollection":
+        for child in geometry.get("geometries", []) or []:
+            rings.extend(_geojson_geometry_to_rings(child))
+    return rings
+
+
+def load_geojson_annotations(path: str) -> List[Dict[str, Any]]:
+    """Load QuPath / ArtidisNet / generic GeoJSON polygon annotations.
+
+    Coordinates are assumed to be in image pixel coordinates, which is the usual
+    convention for QuPath GeoJSON exports and ArtidisNet-style image annotation files.
+    """
+    path = str(path)
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    features = []
+    if isinstance(data, dict) and data.get("type") == "FeatureCollection":
+        features = data.get("features", []) or []
+    elif isinstance(data, dict) and data.get("type") == "Feature":
+        features = [data]
+    elif isinstance(data, dict) and "geometry" in data:
+        features = [{"type": "Feature", "geometry": data.get("geometry"), "properties": data.get("properties", {})}]
+    elif isinstance(data, dict) and "coordinates" in data and "type" in data:
+        features = [{"type": "Feature", "geometry": data, "properties": {}}]
+    elif isinstance(data, list):
+        features = data
+
+    annotations: List[Dict[str, Any]] = []
+    for i, feature in enumerate(features):
+        if not isinstance(feature, dict):
+            continue
+        props = feature.get("properties", {}) or {}
+        geom = feature.get("geometry") if "geometry" in feature else feature
+        rings = _geojson_geometry_to_rings(geom)
+        if not rings:
+            continue
+        class_name = _geojson_feature_class_name(feature, props)
+        annotations.append({
+            "id": feature.get("id", props.get("id", props.get("object_id", i))),
+            "class_name": class_name,
+            "rings": rings,
+            "color": _qcolor_from_geojson_feature(feature, props, class_name=class_name),
+            "properties": props,
+            "feature_id": feature.get("id", None),
+        })
+    return annotations
+
+
+def _apply_display_adjustments(rgb: np.ndarray, brightness: int = 0, negative: bool = False) -> np.ndarray:
+    """Apply display-only brightness and negative mode. Does not modify saved scientific data."""
+    arr = _to_uint8_rgb(rgb).astype(np.int16, copy=False)
+    try:
+        brightness = int(brightness)
+    except Exception:
+        brightness = 0
+    if brightness != 0:
+        arr = arr + int(round(brightness * 2.55))
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if negative:
+        arr = 255 - arr
+    return np.ascontiguousarray(arr)
+
+
 class CropSelectionLabel(QLabel):
+    """Interactive crop preview with zoom-region coordinates.
+
+    Left-drag selects the crop rectangle.
+    Mouse wheel zooms in/out around the cursor if a zoom callback is connected.
+    Right-drag or middle-drag pans the preview using natural grab-and-move behavior.
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
-        
         self.setAlignment(Qt.AlignCenter)
         self.setMouseTracking(True)
+        self._rgb_original = None
         self._pixmap_original = None
         self._thumb_w = None
         self._thumb_h = None
         self._full_w = None
         self._full_h = None
+        self._roi_full = None
         self._dragging = False
+        self._panning = False
         self._start = QPoint()
         self._end = QPoint()
-        self._selection_rect_widget = None
+        self._selection_full = None
+        self._drag_rect_widget = None
         self.selection_callback = None
+        self.center_callback = None
+        self.zoom_callback = None
+        self.pan_callback = None
+        self._pan_start_full = None
+        self._negative = False
+        self._brightness = 0
+        self.setToolTip(
+            "Left-drag: select crop rectangle. Mouse wheel: zoom. "
+            "Right/middle-drag: pan/recenter when zoomed."
+        )
         self.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
 
-    def set_image(self, rgb, full_w, full_h, callback=None):
+    def set_image(self, rgb, full_w, full_h, callback=None, roi_full=None,
+                  center_callback=None, zoom_callback=None, pan_callback=None):
         rgb = _to_uint8_rgb(rgb)
+        self._rgb_original = rgb
         self._thumb_h, self._thumb_w = rgb.shape[:2]
         self._full_w = int(full_w)
         self._full_h = int(full_h)
+        if roi_full is None:
+            roi_full = (0, 0, self._full_w, self._full_h)
+        self._roi_full = tuple(int(round(float(v))) for v in roi_full)
         self.selection_callback = callback
-        self._pixmap_original = _numpy_rgb_to_qpixmap(rgb)
-        self._selection_rect_widget = None
+        self.center_callback = center_callback
+        self.zoom_callback = zoom_callback
+        self.pan_callback = pan_callback
+        self._drag_rect_widget = None
+        self._update_pixmap_from_display_settings()
+        self.update()
+
+    def _update_pixmap_from_display_settings(self):
+        if self._rgb_original is None:
+            self._pixmap_original = None
+            return
+        adjusted = _apply_display_adjustments(
+            self._rgb_original,
+            brightness=self._brightness,
+            negative=self._negative,
+        )
+        self._pixmap_original = _numpy_rgb_to_qpixmap(adjusted)
+
+    def set_negative(self, enabled: bool):
+        self._negative = bool(enabled)
+        self._update_pixmap_from_display_settings()
+        self.update()
+
+    def set_brightness(self, value: int):
+        self._brightness = int(value)
+        self._update_pixmap_from_display_settings()
         self.update()
 
     def has_image(self):
@@ -1660,11 +2082,49 @@ class CropSelectionLabel(QLabel):
         y0 = int(round((label_h - disp_h) / 2))
         return QRect(x0, y0, disp_w, disp_h)
 
+    def _roi(self):
+        if self._roi_full is not None:
+            rx, ry, rw, rh = self._roi_full
+            return float(rx), float(ry), max(1.0, float(rw)), max(1.0, float(rh))
+        return 0.0, 0.0, max(1.0, float(self._full_w or 1)), max(1.0, float(self._full_h or 1))
+
     def _clamp_point_to_display_rect(self, p: QPoint):
         r = self._display_rect()
         x = max(r.left(), min(p.x(), r.right()))
         y = max(r.top(), min(p.y(), r.bottom()))
         return QPoint(x, y)
+
+    def _widget_to_full_xy(self, p: QPoint):
+        if not self.has_image():
+            return None
+        disp = self._display_rect()
+        if disp.width() <= 0 or disp.height() <= 0:
+            return None
+        p = self._clamp_point_to_display_rect(p)
+        rx, ry, rw, rh = self._roi()
+        fx = (p.x() - disp.left()) / max(1.0, float(disp.width()))
+        fy = (p.y() - disp.top()) / max(1.0, float(disp.height()))
+        x = rx + fx * rw
+        y = ry + fy * rh
+        x = max(0.0, min(x, float(self._full_w or x)))
+        y = max(0.0, min(y, float(self._full_h or y)))
+        return x, y
+
+    def _widget_to_roi_fraction(self, p: QPoint):
+        disp = self._display_rect()
+        if disp.width() <= 0 or disp.height() <= 0:
+            return None
+        p = self._clamp_point_to_display_rect(p)
+        fx = (p.x() - disp.left()) / max(1.0, float(disp.width()))
+        fy = (p.y() - disp.top()) / max(1.0, float(disp.height()))
+        return max(0.0, min(1.0, float(fx))), max(0.0, min(1.0, float(fy)))
+
+    def _full_to_widget_xy(self, x: float, y: float) -> QPointF:
+        disp = self._display_rect()
+        rx, ry, rw, rh = self._roi()
+        px = disp.left() + ((float(x) - rx) / rw) * disp.width()
+        py = disp.top() + ((float(y) - ry) / rh) * disp.height()
+        return QPointF(float(px), float(py))
 
     def _widget_rect_to_full_coords(self, rect: QRect):
         if not self.has_image():
@@ -1676,20 +2136,17 @@ class CropSelectionLabel(QLabel):
         if inter.width() <= 1 or inter.height() <= 1:
             return None
 
-        x0_img = (inter.left() - disp.left()) / disp.width() * self._thumb_w
-        y0_img = (inter.top() - disp.top()) / disp.height() * self._thumb_h
-        x1_img = (inter.right() - disp.left()) / disp.width() * self._thumb_w
-        y1_img = (inter.bottom() - disp.top()) / disp.height() * self._thumb_h
+        p0 = self._widget_to_full_xy(inter.topLeft())
+        p1 = self._widget_to_full_xy(inter.bottomRight())
+        if p0 is None or p1 is None:
+            return None
+        x0_full, y0_full = p0
+        x1_full, y1_full = p1
 
-        x0_full = int(round(x0_img / self._thumb_w * self._full_w))
-        y0_full = int(round(y0_img / self._thumb_h * self._full_h))
-        x1_full = int(round(x1_img / self._thumb_w * self._full_w))
-        y1_full = int(round(y1_img / self._thumb_h * self._full_h))
-
-        x0_full = max(0, min(x0_full, self._full_w - 1))
-        y0_full = max(0, min(y0_full, self._full_h - 1))
-        x1_full = max(1, min(x1_full, self._full_w))
-        y1_full = max(1, min(y1_full, self._full_h))
+        x0_full = max(0, min(int(round(x0_full)), self._full_w - 1))
+        y0_full = max(0, min(int(round(y0_full)), self._full_h - 1))
+        x1_full = max(1, min(int(round(x1_full)), self._full_w))
+        y1_full = max(1, min(int(round(y1_full)), self._full_h))
 
         x = min(x0_full, x1_full)
         y = min(y0_full, y1_full)
@@ -1700,51 +2157,94 @@ class CropSelectionLabel(QLabel):
     def set_selection_from_full_coords(self, x, y, w, h):
         if not self.has_image():
             return
-        disp = self._display_rect()
-        if disp.width() <= 0 or disp.height() <= 0:
-            return
-        x0 = float(x)
-        y0 = float(y)
-        x1 = float(x + w)
-        y1 = float(y + h)
-        px0 = disp.left() + (x0 / self._full_w) * disp.width()
-        py0 = disp.top() + (y0 / self._full_h) * disp.height()
-        px1 = disp.left() + (x1 / self._full_w) * disp.width()
-        py1 = disp.top() + (y1 / self._full_h) * disp.height()
-        self._selection_rect_widget = QRect(
-            int(round(px0)),
-            int(round(py0)),
-            int(round(px1 - px0)),
-            int(round(py1 - py0))
-        ).normalized()
+        x = max(0, min(int(x), max(0, self._full_w - 1)))
+        y = max(0, min(int(y), max(0, self._full_h - 1)))
+        w = max(1, min(int(w), self._full_w - x))
+        h = max(1, min(int(h), self._full_h - y))
+        self._selection_full = (x, y, w, h)
+        self._drag_rect_widget = None
         self.update()
 
+    def _selection_widget_rect_for_current_roi(self):
+        if not self._selection_full or not self.has_image():
+            return None
+        sx, sy, sw, sh = self._selection_full
+        rx, ry, rw, rh = self._roi()
+        ix0 = max(float(sx), rx)
+        iy0 = max(float(sy), ry)
+        ix1 = min(float(sx + sw), rx + rw)
+        iy1 = min(float(sy + sh), ry + rh)
+        if ix1 <= ix0 or iy1 <= iy0:
+            return None
+        p0 = self._full_to_widget_xy(ix0, iy0)
+        p1 = self._full_to_widget_xy(ix1, iy1)
+        return QRect(
+            int(round(p0.x())),
+            int(round(p0.y())),
+            int(round(p1.x() - p0.x())),
+            int(round(p1.y() - p0.y()))
+        ).normalized().intersected(self._display_rect())
+
+    def wheelEvent(self, event):
+        if self.zoom_callback is None or not self.has_image():
+            super().wheelEvent(event)
+            return
+        xy = self._pos_to_full_xy(event.pos())
+        if xy is None:
+            return
+        delta = event.angleDelta().y()
+        factor = 1.25 if delta > 0 else 0.8
+        self.zoom_callback(float(factor), (float(xy[0]), float(xy[1])))
+        event.accept()
+
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and self.has_image():
-            disp = self._display_rect()
-            if disp.contains(event.pos()):
-                self._dragging = True
-                self._start = self._clamp_point_to_display_rect(event.pos())
-                self._end = self._start
-                self._selection_rect_widget = QRect(self._start, self._end)
-                self.update()
+        if not self.has_image() or not self._display_rect().contains(event.pos()):
+            return
+        if event.button() == Qt.LeftButton:
+            self._dragging = True
+            self._start = self._clamp_point_to_display_rect(event.pos())
+            self._end = self._start
+            self._drag_rect_widget = QRect(self._start, self._end)
+            self.update()
+        elif event.button() in (Qt.RightButton, Qt.MiddleButton):
+            self._panning = True
+            self._start = self._clamp_point_to_display_rect(event.pos())
+            self._end = self._start
+            self._pan_start_full = self._widget_to_full_xy(self._start)
+            self.setCursor(Qt.ClosedHandCursor)
 
     def mouseMoveEvent(self, event):
         if self._dragging and self.has_image():
             self._end = self._clamp_point_to_display_rect(event.pos())
-            self._selection_rect_widget = QRect(self._start, self._end).normalized()
+            self._drag_rect_widget = QRect(self._start, self._end).normalized()
             self.update()
+        elif self._panning and self.has_image():
+            self._end = self._clamp_point_to_display_rect(event.pos())
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self._dragging:
             self._dragging = False
             self._end = self._clamp_point_to_display_rect(event.pos())
-            self._selection_rect_widget = QRect(self._start, self._end).normalized()
-            coords = self._widget_rect_to_full_coords(self._selection_rect_widget)
-            if coords is not None and self.selection_callback is not None:
+            rect = QRect(self._start, self._end).normalized()
+            coords = self._widget_rect_to_full_coords(rect)
+            if coords is not None:
                 x, y, w, h = coords
-                self.selection_callback(x, y, w, h)
+                self._selection_full = (x, y, w, h)
+                if self.selection_callback is not None:
+                    self.selection_callback(x, y, w, h)
+            self._drag_rect_widget = None
             self.update()
+        elif event.button() in (Qt.RightButton, Qt.MiddleButton) and self._panning:
+            self._panning = False
+            self.setCursor(Qt.ArrowCursor)
+            frac = self._widget_to_roi_fraction(event.pos())
+            if self.pan_callback is not None and self._pan_start_full is not None and frac is not None:
+                self.pan_callback((float(self._pan_start_full[0]), float(self._pan_start_full[1])), frac)
+            elif self.center_callback is not None:
+                xy = self._pos_to_full_xy(event.pos())
+                if xy is not None:
+                    self.center_callback(float(xy[0]), float(xy[1]))
+            self._pan_start_full = None
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1753,13 +2253,15 @@ class CropSelectionLabel(QLabel):
             disp = self._display_rect()
             scaled = self._pixmap_original.scaled(disp.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             painter.drawPixmap(disp.topLeft(), scaled)
-        if self._selection_rect_widget is not None:
-            pen = QPen(QColor(255, 0, 0), 2)
-            painter.setPen(pen)
-            painter.drawRect(self._selection_rect_widget.normalized())
-            painter.fillRect(self._selection_rect_widget.normalized(), QColor(255, 0, 0, 35))
+        rect_to_draw = self._drag_rect_widget if self._drag_rect_widget is not None else self._selection_widget_rect_for_current_roi()
+        if rect_to_draw is not None:
+            rect_to_draw = rect_to_draw.normalized().intersected(self._display_rect())
+            if rect_to_draw.width() > 0 and rect_to_draw.height() > 0:
+                pen = QPen(QColor(255, 0, 0), 2)
+                painter.setPen(pen)
+                painter.drawRect(rect_to_draw)
+                painter.fillRect(rect_to_draw, QColor(255, 0, 0, 35))
         painter.end()
-
 
 
 class FixedSquarePreviewLabel(QLabel):
@@ -1880,12 +2382,14 @@ class FixedSquarePreviewLabel(QLabel):
 
 
 class ZoomRegionPreviewLabel(QLabel):
-    """Fixed preview label that pans by click/drag and supports rectangle zoom.
+    """Preview label that supports panning, rectangle zoom, GeoJSON overlays, and tile capture overlay.
 
     Normal mode:
-        click/drag recenters the preview on the clicked point.
+        right-drag pans/moves the view. Mouse wheel zooms in/out.
     Rectangle-zoom mode:
-        click-drag a rectangle; on release, the app zooms to that full-resolution ROI.
+        left-drag a rectangle; on release, the app zooms to that full-resolution ROI.
+    Tile mode:
+        left-drag places the square tile capture box on the desired image position.
     """
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1899,22 +2403,98 @@ class ZoomRegionPreviewLabel(QLabel):
         self._dragging = False
         self._selecting = False
         self._rect_zoom_enabled = False
+        self._tile_mode_enabled = False
         self._sel_start = QPoint()
         self._sel_end = QPoint()
         self.center_callback = None
         self.rectangle_callback = None
+        self.tile_callback = None
+        self.zoom_callback = None
+        self._pan_start_pos = QPoint()
+        self._pan_start_center = None
 
-    def set_preview(self, rgb, roi_full=None, full_dims=None, center_callback=None, rectangle_callback=None):
+        self._annotations = []
+        self._show_annotations = True
+        self._annotation_color = QColor(255, 0, 0)
+        self._annotation_opacity = 110
+        self._annotation_fill = True
+        self._annotation_boundary_width = 2
+        self._annotation_class_styles = {}
+
+        self._tile_center_full = None
+        self._tile_size_full = 1024
+        self._show_tile = False
+        self.setToolTip(
+            "Mouse wheel: zoom in/out. Right-drag: pan/move the view. "
+            "Left-drag moves the tile box in tile mode, or draws a rectangle when rectangle zoom is active."
+        )
+
+    def set_preview(self, rgb, roi_full=None, full_dims=None, center_callback=None, rectangle_callback=None, zoom_callback=None):
         self._pixmap_original = _numpy_rgb_to_qpixmap(_to_uint8_rgb(rgb))
         self._roi_full = roi_full
         self._full_dims = full_dims
         self.center_callback = center_callback
         if rectangle_callback is not None:
             self.rectangle_callback = rectangle_callback
+        if zoom_callback is not None:
+            self.zoom_callback = zoom_callback
+        self.update()
+
+    def set_annotations(self, annotations: Optional[List[Dict[str, Any]]]):
+        self._annotations = list(annotations or [])
+        self.update()
+
+    def clear_annotations(self):
+        self._annotations = []
+        self.update()
+
+    def set_annotations_visible(self, visible: bool):
+        self._show_annotations = bool(visible)
+        self.update()
+
+    def set_annotation_style(self, color: Optional[QColor] = None, opacity: Optional[int] = None,
+                             fill: Optional[bool] = None, boundary_width: Optional[int] = None):
+        if color is not None:
+            self._annotation_color = QColor(color)
+        if opacity is not None:
+            self._annotation_opacity = max(0, min(255, int(opacity)))
+        if fill is not None:
+            self._annotation_fill = bool(fill)
+        if boundary_width is not None:
+            self._annotation_boundary_width = max(1, int(boundary_width))
+        self.update()
+
+    def set_annotation_class_styles(self, class_styles: Optional[Dict[str, Dict[str, Any]]]):
+        """Set per-class visibility and colour for GeoJSON overlays."""
+        cleaned = {}
+        for name, st in (class_styles or {}).items():
+            cls = str(name or "annotation")
+            cleaned[cls] = {
+                "visible": bool(st.get("visible", True)),
+                "color": QColor(st.get("color", self._annotation_color)),
+            }
+        self._annotation_class_styles = cleaned
+        self.update()
+
+    def set_tile_overlay(self, center_xy=None, size_full: int = 1024, visible: bool = False, tile_callback=None):
+        self._tile_center_full = center_xy
+        self._tile_size_full = max(1, int(size_full))
+        self._show_tile = bool(visible)
+        if tile_callback is not None:
+            self.tile_callback = tile_callback
+        self.update()
+
+    def enable_tile_mode(self, enabled: bool = True):
+        self._tile_mode_enabled = bool(enabled)
+        if enabled:
+            self.enable_rectangle_zoom(False)
+        self.setCursor(Qt.CrossCursor if self._tile_mode_enabled else Qt.ArrowCursor)
         self.update()
 
     def enable_rectangle_zoom(self, enabled: bool = True):
         self._rect_zoom_enabled = bool(enabled)
+        if enabled:
+            self._tile_mode_enabled = False
         self._selecting = False
         self._dragging = False
         self._sel_start = QPoint()
@@ -1956,6 +2536,41 @@ class ZoomRegionPreviewLabel(QLabel):
         fy = (p.y() - disp.top()) / max(1, disp.height())
         return rx + fx * rw, ry + fy * rh
 
+    def _full_to_widget_xy(self, x: float, y: float) -> QPointF:
+        disp = self._display_rect()
+        if not self._roi_full:
+            return QPointF(float(disp.center().x()), float(disp.center().y()))
+        rx, ry, rw, rh = self._roi_full
+        px = disp.left() + ((float(x) - float(rx)) / max(1.0, float(rw))) * disp.width()
+        py = disp.top() + ((float(y) - float(ry)) / max(1.0, float(rh))) * disp.height()
+        return QPointF(float(px), float(py))
+
+    def wheelEvent(self, event):
+        if self.zoom_callback is None or self._pixmap_original is None:
+            super().wheelEvent(event)
+            return
+        disp = self._display_rect()
+        if not disp.contains(event.pos()):
+            super().wheelEvent(event)
+            return
+        xy = self._pos_to_full_xy(event.pos())
+        if xy is None:
+            super().wheelEvent(event)
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+        factor = 1.25 if delta > 0 else 0.8
+        self.zoom_callback(float(factor), (float(xy[0]), float(xy[1])))
+        event.accept()
+
+    def _current_roi_center(self):
+        if not self._roi_full:
+            return None
+        rx, ry, rw, rh = self._roi_full
+        return float(rx) + float(rw) / 2.0, float(ry) + float(rh) / 2.0
+
     def _emit_center_from_pos(self, pos):
         if not self.center_callback:
             return
@@ -1963,6 +2578,33 @@ class ZoomRegionPreviewLabel(QLabel):
         if xy is None:
             return
         self.center_callback(float(xy[0]), float(xy[1]))
+
+    def _emit_pan_from_pos(self, pos):
+        """Natural grab-and-move pan: the grabbed image point follows the cursor."""
+        if not self.center_callback or not self._roi_full or self._pan_start_center is None:
+            return
+        disp = self._display_rect()
+        if disp.width() <= 0 or disp.height() <= 0:
+            return
+        rx, ry, rw, rh = self._roi_full
+        dx = float(pos.x() - self._pan_start_pos.x())
+        dy = float(pos.y() - self._pan_start_pos.y())
+        cx = float(self._pan_start_center[0]) - dx / max(1.0, float(disp.width())) * float(rw)
+        cy = float(self._pan_start_center[1]) - dy / max(1.0, float(disp.height())) * float(rh)
+        if self._full_dims:
+            full_w, full_h = self._full_dims
+            cx = max(0.0, min(float(cx), float(full_w)))
+            cy = max(0.0, min(float(cy), float(full_h)))
+        self.center_callback(float(cx), float(cy))
+
+    def _emit_tile_from_pos(self, pos):
+        xy = self._pos_to_full_xy(pos)
+        if xy is None:
+            return
+        self._tile_center_full = (float(xy[0]), float(xy[1]))
+        if self.tile_callback:
+            self.tile_callback(float(xy[0]), float(xy[1]))
+        self.update()
 
     def _emit_rectangle_from_widget_rect(self, rect):
         if not self.rectangle_callback or not self._roi_full:
@@ -1985,34 +2627,155 @@ class ZoomRegionPreviewLabel(QLabel):
             self.rectangle_callback(float(x), float(y), float(w), float(h))
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and self._pixmap_original is not None and self._display_rect().contains(event.pos()):
+        if self._pixmap_original is None:
+            super().mousePressEvent(event)
+            return
+
+        if event.button() == Qt.LeftButton:
+            if self._tile_mode_enabled:
+                self._dragging = True
+                self._drag_button = Qt.LeftButton
+                self.grabMouse()
+                self._emit_tile_from_pos(event.pos())
+                event.accept()
+                return
             if self._rect_zoom_enabled:
                 self._selecting = True
+                self.grabMouse()
                 self._sel_start = self._clamp_to_display(event.pos())
                 self._sel_end = self._sel_start
                 self.update()
-            else:
-                self._dragging = True
-                self._emit_center_from_pos(event.pos())
+                event.accept()
+                return
+            # In normal Image Preview mode, left-drag is intentionally not used
+            # for panning. Right-drag is used to move the view.
+            event.accept()
+            return
+
+        if event.button() in (Qt.RightButton, Qt.MiddleButton):
+            self._dragging = True
+            self._drag_button = event.button()
+            self.grabMouse()
+            self._pan_start_pos = self._clamp_to_display(event.pos())
+            self._pan_start_center = self._current_roi_center()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._tile_mode_enabled and self._dragging and getattr(self, "_drag_button", None) == Qt.LeftButton:
+            self._emit_tile_from_pos(event.pos())
+            event.accept()
+            return
         if self._rect_zoom_enabled and self._selecting:
             self._sel_end = self._clamp_to_display(event.pos())
             self.update()
-        elif self._dragging:
-            self._emit_center_from_pos(event.pos())
+            event.accept()
+            return
+        if self._dragging and getattr(self, "_drag_button", None) in (Qt.RightButton, Qt.MiddleButton):
+            self._emit_pan_from_pos(event.pos())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._tile_mode_enabled and self._dragging:
+            self._dragging = False
+            self._drag_button = None
+            try:
+                self.releaseMouse()
+            except Exception:
+                pass
+            self._emit_tile_from_pos(event.pos())
+            event.accept()
+            return
         if event.button() == Qt.LeftButton and self._rect_zoom_enabled and self._selecting:
             self._selecting = False
+            try:
+                self.releaseMouse()
+            except Exception:
+                pass
             self._sel_end = self._clamp_to_display(event.pos())
             rect = QRect(self._sel_start, self._sel_end).normalized()
             self.enable_rectangle_zoom(False)
             self._emit_rectangle_from_widget_rect(rect)
             self.update()
-        elif event.button() == Qt.LeftButton and self._dragging:
+            event.accept()
+            return
+        if event.button() in (Qt.RightButton, Qt.MiddleButton) and self._dragging:
             self._dragging = False
-            self._emit_center_from_pos(event.pos())
+            self._drag_button = None
+            try:
+                self.releaseMouse()
+            except Exception:
+                pass
+            self.setCursor(Qt.ArrowCursor)
+            self._emit_pan_from_pos(event.pos())
+            self._pan_start_center = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _draw_annotations(self, painter: QPainter):
+        if not self._show_annotations or not self._annotations or not self._roi_full:
+            return
+        disp = self._display_rect()
+        if disp.width() <= 0 or disp.height() <= 0:
+            return
+        painter.save()
+        painter.setClipRect(disp)
+        alpha = max(0, min(255, int(self._annotation_opacity)))
+        for ann in self._annotations:
+            cls = str(ann.get("class_name", "annotation") or "annotation")
+            st = self._annotation_class_styles.get(cls, {})
+            if not bool(st.get("visible", True)):
+                continue
+            base = QColor(st.get("color", ann.get("color", self._annotation_color)))
+            pen_color = QColor(base.red(), base.green(), base.blue(), max(1, alpha))
+            fill_color = QColor(base.red(), base.green(), base.blue(), alpha)
+            painter.setPen(QPen(pen_color, max(1, int(self._annotation_boundary_width))))
+            painter.setBrush(QBrush(fill_color) if self._annotation_fill else Qt.NoBrush)
+            for ring in ann.get("rings", []) or []:
+                if len(ring) < 2:
+                    continue
+                path = QPainterPath()
+                first = True
+                for x, y in ring:
+                    pt = self._full_to_widget_xy(x, y)
+                    if first:
+                        path.moveTo(pt)
+                        first = False
+                    else:
+                        path.lineTo(pt)
+                if len(ring) >= 3:
+                    path.closeSubpath()
+                painter.drawPath(path)
+        painter.restore()
+
+    def _draw_tile_overlay(self, painter: QPainter):
+        if not self._show_tile or not self._tile_center_full or not self._roi_full:
+            return
+        cx, cy = self._tile_center_full
+        s = float(self._tile_size_full)
+        x0 = float(cx) - s / 2.0
+        y0 = float(cy) - s / 2.0
+        x1 = x0 + s
+        y1 = y0 + s
+        p0 = self._full_to_widget_xy(x0, y0)
+        p1 = self._full_to_widget_xy(x1, y1)
+        rect = QRect(int(round(p0.x())), int(round(p0.y())), int(round(p1.x() - p0.x())), int(round(p1.y() - p0.y()))).normalized()
+        rect = rect.intersected(self._display_rect())
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        painter.save()
+        painter.setClipRect(self._display_rect())
+        painter.setPen(QPen(QColor(20, 120, 255), 2))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(rect)
+        painter.fillRect(rect, QColor(20, 120, 255, 25))
+        painter.restore()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -2021,6 +2784,8 @@ class ZoomRegionPreviewLabel(QLabel):
             disp = self._display_rect()
             scaled = self._pixmap_original.scaled(disp.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             painter.drawPixmap(disp.topLeft(), scaled)
+            self._draw_annotations(painter)
+            self._draw_tile_overlay(painter)
         if self._rect_zoom_enabled and (self._selecting or not self._sel_start.isNull()):
             rect = QRect(self._sel_start, self._sel_end).normalized().intersected(self._display_rect())
             if rect.width() > 0 and rect.height() > 0:
@@ -2079,7 +2844,7 @@ def read_zoom_region_from_file(path: str, center_xy=None, zoom: float = 1.0,
         arr = np.asarray(crop, dtype=np.uint8)
         return arr, "YXS", {**meta, "reader": "PIL-region", "shape": (full_h, full_w), "axes": "YXS", "roi": roi, "full_dims": (full_w, full_h)}
 
-    if _has_ext(p.name, TIFF_EXTENSIONS):
+    if _has_ext(p.name, TIFF_EXTENSIONS) and not p.name.lower().endswith(".svs"):
         with tifffile.TiffFile(path) as tif:
             s0 = tif.series[0]
             axes = getattr(s0, "axes", "") or ""
@@ -2184,6 +2949,270 @@ def read_zoom_region_from_file(path: str, center_xy=None, zoom: float = 1.0,
         return arr, "YXS", {**meta, "reader": f"{b.reader}-region", "roi": roi, "full_dims": (full_w, full_h)}
     finally:
         b.close()
+
+
+
+def _slice_preview_zarr_region(za, axes: str, roi, step: int = 1, level_downsample: float = 1.0):
+    """Return a Y/X(/C/S) preview slice from a zarr/memmap-like TIFF array."""
+    x, y, w, h = roi
+    ds = max(1.0, float(level_downsample))
+    lx = int(round(float(x) / ds))
+    ly = int(round(float(y) / ds))
+    lw = max(1, int(round(float(w) / ds)))
+    lh = max(1, int(round(float(h) / ds)))
+    step = max(1, int(step))
+    slicer = []
+    kept = []
+    if axes and len(axes) == za.ndim and "Y" in axes and "X" in axes:
+        for ax in axes:
+            if ax == "Y":
+                slicer.append(slice(ly, ly + lh, step)); kept.append("Y")
+            elif ax == "X":
+                slicer.append(slice(lx, lx + lw, step)); kept.append("X")
+            elif ax in ("C", "S"):
+                slicer.append(slice(None)); kept.append(ax)
+            else:
+                slicer.append(0)
+        return np.asarray(za[tuple(slicer)]), "".join(kept)
+
+    # Conservative fallback: assume last two dimensions are Y/X.
+    for dim_i in range(za.ndim):
+        if dim_i == za.ndim - 2:
+            slicer.append(slice(ly, ly + lh, step)); kept.append("Y")
+        elif dim_i == za.ndim - 1:
+            slicer.append(slice(lx, lx + lw, step)); kept.append("X")
+        else:
+            slicer.append(0)
+    return np.asarray(za[tuple(slicer)]), "".join(kept)
+
+
+def read_zoom_region_from_backend(backend, center_xy=None, zoom: float = 1.0,
+                                  viewport_size=(900, 600), max_side: int = 1800):
+    """Read only the visible Image Preview region from an already-open backend.
+
+    This is the efficient path used by Image Preview. It keeps OpenSlide/TIFF
+    handles cached through ImageBackend, prefers existing pyramid levels when
+    possible, and never loads a large full-resolution image just to display the
+    current screen region.
+    """
+    if backend is None or not getattr(backend, "path", None) or not getattr(backend, "slide_dims", None):
+        raise RuntimeError("No cached preview backend is loaded.")
+
+    vw, vh = viewport_size
+    full_w, full_h = backend.slide_dims
+    roi = _compute_zoom_roi(full_w, full_h, center_xy, zoom, vw, vh)
+    x, y, w, h = roi
+    target_ds = max(1.0, max(float(w), float(h)) / float(max(1, max_side)))
+    meta = {
+        "path": backend.path,
+        "reader": f"{backend.reader}-cached-region",
+        "roi": roi,
+        "full_dims": (int(full_w), int(full_h)),
+    }
+
+    if backend.reader == "openslide":
+        slide = backend._get_openslide()
+        level = slide.get_best_level_for_downsample(target_ds)
+        ds = float(slide.level_downsamples[level])
+        lw = max(1, int(round(float(w) / ds)))
+        lh = max(1, int(round(float(h) / ds)))
+        arr = np.asarray(slide.read_region((int(x), int(y)), int(level), (lw, lh)).convert("RGB"), dtype=np.uint8)
+        return arr, "YXS", {**meta, "reader": "openslide-cached-region", "level": int(level), "step": ds}
+
+    if backend.reader == "tifffile":
+        za, series, axes, zarr_error = backend._get_tiff_zarr()
+        axes = axes or getattr(series, "axes", "") or ""
+        shape = tuple(getattr(series, "shape", ()) or ())
+
+        # Prefer pyramid levels for pyramidal TIFF/OME-TIFF when available.
+        # This reduces decompression and RAM use when zoomed out.
+        try:
+            levels = list(getattr(series, "levels", []) or [])
+            if len(levels) > 1:
+                best_level = levels[0]
+                best_ds = 1.0
+                best_score = float("inf")
+                for lv in levels:
+                    lv_axes = getattr(lv, "axes", axes) or axes
+                    lv_shape = tuple(getattr(lv, "shape", ()) or ())
+                    if not lv_shape:
+                        continue
+                    if lv_axes and len(lv_axes) == len(lv_shape) and "Y" in lv_axes and "X" in lv_axes:
+                        lv_w = int(lv_shape[lv_axes.index("X")])
+                        lv_h = int(lv_shape[lv_axes.index("Y")])
+                    elif len(lv_shape) >= 2:
+                        lv_h, lv_w = int(lv_shape[-2]), int(lv_shape[-1])
+                    else:
+                        continue
+                    ds_x = float(full_w) / max(1.0, float(lv_w))
+                    ds_y = float(full_h) / max(1.0, float(lv_h))
+                    ds = max(1.0, (ds_x + ds_y) / 2.0)
+                    score = abs(math.log(ds / target_ds)) if target_ds > 0 else ds
+                    if score < best_score:
+                        best_score = score
+                        best_level = lv
+                        best_ds = ds
+                if best_level is not series and best_ds > 1.01:
+                    import zarr
+                    z = best_level.aszarr()
+                    lza = zarr.open(z, mode="r")
+                    lax = getattr(best_level, "axes", axes) or axes
+                    lxw = max(1, int(round(float(w) / best_ds)))
+                    lxh = max(1, int(round(float(h) / best_ds)))
+                    step = max(1, int(math.ceil(max(lxw, lxh) / float(max_side))))
+                    arr, out_axes = _slice_preview_zarr_region(lza, lax, roi, step=step, level_downsample=best_ds)
+                    return arr, out_axes, {**meta, "reader": "tifffile-pyramid-zarr-cached-region", "shape": shape, "axes": axes, "level_downsample": best_ds, "step": step}
+        except Exception as level_error:
+            # Pyramid levels are optional; fall through to highest-resolution zarr/memmap region access.
+            meta["level_error"] = str(level_error)
+
+        step = max(1, int(math.ceil(max(float(w), float(h)) / float(max_side))))
+        if za is not None:
+            arr, out_axes = _slice_preview_zarr_region(za, axes, roi, step=step, level_downsample=1.0)
+            return arr, out_axes, {**meta, "reader": "tifffile-zarr-cached-region", "shape": shape, "axes": axes, "step": step}
+
+        # Try memory mapping for uncompressed/non-tiled TIFFs without reading the full image.
+        try:
+            mm = tifffile.memmap(backend.path, series=0)
+            mm_axes = axes if axes and len(axes) == mm.ndim else _guess_axes_for_array(mm, axes)
+            arr, out_axes = _slice_preview_zarr_region(mm, mm_axes, roi, step=step, level_downsample=1.0)
+            return arr, out_axes, {**meta, "reader": "tifffile-memmap-cached-region", "shape": shape, "axes": mm_axes, "step": step}
+        except Exception as mmap_error:
+            pass
+
+        # Last safe fallback only for genuinely small images.
+        spatial_pixels = int(full_w) * int(full_h)
+        if spatial_pixels <= 25_000_000:
+            arr = series.asarray()
+            arr, out_axes = _slice_preview_zarr_region(arr, axes if axes and len(axes) == arr.ndim else _guess_axes_for_array(arr, axes), roi, step=step, level_downsample=1.0)
+            return arr, out_axes, {**meta, "reader": "tifffile-small-full-cached-region", "shape": shape, "axes": axes, "step": step}
+
+        msg = (
+            "Zoom preview skipped to keep GUI responsive.\n"
+            f"File: {Path(backend.path).name}\nShape: {shape} axes={axes}\n"
+            "This TIFF could not expose pyramid, zarr, or memmap region access.\n"
+            "Convert to a tiled/pyramidal OME-TIFF for fast interactive viewing."
+        )
+        return _placeholder_rgb(msg, width=max(600, int(vw)), height=max(400, int(vh))), "YXS", {**meta, "reader": "safe-placeholder-cached-region", "shape": shape, "axes": axes, "error": str(zarr_error)}
+
+    if backend.reader == "pil":
+        from PIL import Image
+        im = Image.open(backend.path).convert("RGB")
+        crop = im.crop((x, y, x + w, y + h))
+        crop.thumbnail((max_side, max_side))
+        return np.asarray(crop, dtype=np.uint8), "YXS", {**meta, "reader": "PIL-cached-region", "shape": (full_h, full_w), "axes": "YXS"}
+
+    # Generic fallback through ImageBackend crop only for the selected display region.
+    arr, _ = backend.crop(x, y, w, h)
+    arr = _downsample_for_preview(arr, max_side=max_side)
+    return arr, "YXS", {**meta, "reader": f"{backend.reader}-cached-region-fallback"}
+
+
+def read_roi_region_from_backend(backend, roi_full: Tuple[int, int, int, int], max_side: int = 1200):
+    """Read a specific full-resolution ROI for display without loading it at full size.
+
+    This is used by the tile pop-up. It chooses an OpenSlide/TIFF pyramid level
+    or strided zarr/memmap slice according to the display size. The full-size
+    tile is only read when the user explicitly saves the tile JPG.
+    """
+    if backend is None or not getattr(backend, "path", None) or not getattr(backend, "slide_dims", None):
+        raise RuntimeError("No cached preview backend is loaded.")
+    full_w, full_h = backend.slide_dims
+    x, y, w, h = backend.clip_roi(int(roi_full[0]), int(roi_full[1]), int(roi_full[2]), int(roi_full[3]), full_w, full_h)
+    roi = (int(x), int(y), int(w), int(h))
+    target_ds = max(1.0, max(float(w), float(h)) / float(max(1, max_side)))
+    meta = {
+        "path": backend.path,
+        "reader": f"{backend.reader}-cached-roi-preview",
+        "roi": roi,
+        "full_dims": (int(full_w), int(full_h)),
+    }
+
+    if backend.reader == "openslide":
+        slide = backend._get_openslide()
+        level = slide.get_best_level_for_downsample(target_ds)
+        ds = float(slide.level_downsamples[level])
+        lw = max(1, int(round(float(w) / ds)))
+        lh = max(1, int(round(float(h) / ds)))
+        arr = np.asarray(slide.read_region((int(x), int(y)), int(level), (lw, lh)).convert("RGB"), dtype=np.uint8)
+        return arr, "YXS", {**meta, "reader": "openslide-cached-roi-preview", "level": int(level), "step": ds}
+
+    if backend.reader == "tifffile":
+        za, series, axes, zarr_error = backend._get_tiff_zarr()
+        axes = axes or getattr(series, "axes", "") or ""
+        shape = tuple(getattr(series, "shape", ()) or ())
+        try:
+            levels = list(getattr(series, "levels", []) or [])
+            if len(levels) > 1:
+                best_level = levels[0]
+                best_ds = 1.0
+                best_score = float("inf")
+                for lv in levels:
+                    lv_axes = getattr(lv, "axes", axes) or axes
+                    lv_shape = tuple(getattr(lv, "shape", ()) or ())
+                    if not lv_shape:
+                        continue
+                    if lv_axes and len(lv_axes) == len(lv_shape) and "Y" in lv_axes and "X" in lv_axes:
+                        lv_w = int(lv_shape[lv_axes.index("X")])
+                        lv_h = int(lv_shape[lv_axes.index("Y")])
+                    elif len(lv_shape) >= 2:
+                        lv_h, lv_w = int(lv_shape[-2]), int(lv_shape[-1])
+                    else:
+                        continue
+                    ds_x = float(full_w) / max(1.0, float(lv_w))
+                    ds_y = float(full_h) / max(1.0, float(lv_h))
+                    ds = max(1.0, (ds_x + ds_y) / 2.0)
+                    score = abs(math.log(ds / target_ds)) if target_ds > 0 else ds
+                    if score < best_score:
+                        best_score = score
+                        best_level = lv
+                        best_ds = ds
+                if best_level is not series and best_ds > 1.01:
+                    import zarr
+                    lza = zarr.open(best_level.aszarr(), mode="r")
+                    lax = getattr(best_level, "axes", axes) or axes
+                    step = max(1, int(math.ceil(max(float(w) / best_ds, float(h) / best_ds) / float(max_side))))
+                    arr, out_axes = _slice_preview_zarr_region(lza, lax, roi, step=step, level_downsample=best_ds)
+                    return arr, out_axes, {**meta, "reader": "tifffile-pyramid-zarr-cached-roi-preview", "shape": shape, "axes": axes, "level_downsample": best_ds, "step": step}
+        except Exception as level_error:
+            meta["level_error"] = str(level_error)
+
+        step = max(1, int(math.ceil(max(float(w), float(h)) / float(max_side))))
+        if za is not None:
+            arr, out_axes = _slice_preview_zarr_region(za, axes, roi, step=step, level_downsample=1.0)
+            return arr, out_axes, {**meta, "reader": "tifffile-zarr-cached-roi-preview", "shape": shape, "axes": axes, "step": step}
+
+        try:
+            mm = tifffile.memmap(backend.path, series=0)
+            mm_axes = axes if axes and len(axes) == mm.ndim else _guess_axes_for_array(mm, axes)
+            arr, out_axes = _slice_preview_zarr_region(mm, mm_axes, roi, step=step, level_downsample=1.0)
+            return arr, out_axes, {**meta, "reader": "tifffile-memmap-cached-roi-preview", "shape": shape, "axes": mm_axes, "step": step}
+        except Exception:
+            pass
+
+        if int(full_w) * int(full_h) <= 25_000_000:
+            arr = series.asarray()
+            arr, out_axes = _slice_preview_zarr_region(arr, axes if axes and len(axes) == arr.ndim else _guess_axes_for_array(arr, axes), roi, step=step, level_downsample=1.0)
+            return arr, out_axes, {**meta, "reader": "tifffile-small-full-cached-roi-preview", "shape": shape, "axes": axes, "step": step}
+
+        msg = (
+            "Tile preview skipped to keep GUI responsive.\n"
+            f"File: {Path(backend.path).name}\nShape: {shape} axes={axes}\n"
+            "This TIFF could not expose pyramid, zarr, or memmap region access.\n"
+            "Saving may still work, but fast interactive viewing requires tiled/pyramidal OME-TIFF."
+        )
+        return _placeholder_rgb(msg, width=700, height=500), "YXS", {**meta, "reader": "safe-placeholder-cached-roi-preview", "shape": shape, "axes": axes, "error": str(zarr_error)}
+
+    if backend.reader == "pil":
+        from PIL import Image
+        im = Image.open(backend.path).convert("RGB")
+        crop = im.crop((x, y, x + w, y + h))
+        crop.thumbnail((max_side, max_side))
+        return np.asarray(crop, dtype=np.uint8), "YXS", {**meta, "reader": "PIL-cached-roi-preview", "shape": (full_h, full_w), "axes": "YXS"}
+
+    arr, _ = backend.crop(x, y, w, h)
+    arr = _downsample_for_preview(arr, max_side=max_side)
+    return arr, "YXS", {**meta, "reader": f"{backend.reader}-cached-roi-preview-fallback"}
 
 # ============================================================
 # Tile helpers
@@ -3559,6 +4588,143 @@ def _lif_export_job(cancel_event, progress_cb, message_cb, lif_paths, scene_indi
     return {"task": "lif", "manifests": manifests, "failures": failures}
 
 
+
+
+def draw_geojson_annotations_on_rgb(rgb: np.ndarray, annotations: List[Dict[str, Any]], roi_full: Tuple[int, int, int, int],
+                                    color: Optional[QColor] = None, opacity: int = 110,
+                                    fill: bool = True, boundary_width: int = 2,
+                                    class_styles: Optional[Dict[str, Dict[str, Any]]] = None) -> np.ndarray:
+    """Draw GeoJSON annotation overlays onto an RGB array for exported preview/tile captures.
+
+    class_styles optionally maps annotation class/name to {visible: bool, color: QColor}.
+    """
+    if not annotations or roi_full is None:
+        return _to_uint8_rgb(rgb)
+    out = _to_uint8_rgb(rgb)
+    h, w = out.shape[:2]
+    rx, ry, rw, rh = [float(v) for v in roi_full]
+    if rw <= 0 or rh <= 0:
+        return out
+    qimg = QImage(out.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+    painter = QPainter(qimg)
+    fallback = QColor(color or QColor(255, 0, 0))
+    alpha = max(0, min(255, int(opacity)))
+    class_styles = class_styles or {}
+
+    def map_xy(x, y):
+        px = (float(x) - rx) / rw * w
+        py = (float(y) - ry) / rh * h
+        return QPointF(float(px), float(py))
+
+    for ann in annotations:
+        cls = str(ann.get("class_name", "annotation") or "annotation")
+        st = class_styles.get(cls, {})
+        if not bool(st.get("visible", True)):
+            continue
+        base = QColor(st.get("color", ann.get("color", fallback)))
+        pen_color = QColor(base.red(), base.green(), base.blue(), max(1, alpha))
+        fill_color = QColor(base.red(), base.green(), base.blue(), alpha)
+        painter.setPen(QPen(pen_color, max(1, int(boundary_width))))
+        painter.setBrush(QBrush(fill_color) if fill else Qt.NoBrush)
+        for ring in ann.get("rings", []) or []:
+            if len(ring) < 2:
+                continue
+            path = QPainterPath()
+            first = True
+            for x, y in ring:
+                pt = map_xy(x, y)
+                if first:
+                    path.moveTo(pt)
+                    first = False
+                else:
+                    path.lineTo(pt)
+            if len(ring) >= 3:
+                path.closeSubpath()
+            painter.drawPath(path)
+    painter.end()
+    qimg = qimg.convertToFormat(QImage.Format_RGB888)
+    ptr = qimg.bits()
+    ptr.setsize(qimg.byteCount())
+    arr = np.frombuffer(ptr, np.uint8).reshape((qimg.height(), qimg.width(), 3)).copy()
+    return np.ascontiguousarray(arr)
+
+
+
+class TilePopupImageLabel(QLabel):
+    """Scalable image label used by the non-modal tile capture popup."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(420, 420)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
+        self._pixmap = None
+
+    def set_rgb(self, rgb: Optional[np.ndarray]):
+        self._pixmap = _numpy_rgb_to_qpixmap(_to_uint8_rgb(rgb)) if rgb is not None else None
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("white"))
+        if self._pixmap is not None and not self._pixmap.isNull():
+            scaled = self._pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            x = int((self.width() - scaled.width()) / 2)
+            y = int((self.height() - scaled.height()) / 2)
+            painter.drawPixmap(x, y, scaled)
+        else:
+            painter.setPen(QPen(QColor(80, 80, 80), 1))
+            painter.drawText(self.rect(), Qt.AlignCenter, "Tile preview")
+        painter.end()
+
+
+class TileCapturePopup(QDialog):
+    """Non-modal movable popup that shows the currently selected square tile."""
+    def __init__(self, owner, parent=None):
+        super().__init__(parent)
+        self.owner = owner
+        self.setWindowTitle("Tile capture preview")
+        self.setModal(False)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.resize(650, 720)
+
+        layout = QVBoxLayout(self)
+        self.image_label = TilePopupImageLabel()
+        layout.addWidget(self.image_label, 1)
+
+        self.info_label = QLabel("Tile: not set")
+        self.info_label.setWordWrap(True)
+        self.info_label.setStyleSheet("color: #555; padding: 4px;")
+        layout.addWidget(self.info_label)
+
+        controls = QHBoxLayout()
+        self.include_geojson_chk = QCheckBox("Include visible GeoJSON")
+        self.include_geojson_chk.setChecked(True)
+        self.include_geojson_chk.stateChanged.connect(lambda *_: self.owner.schedule_preview_tile_popup_update())
+        controls.addWidget(self.include_geojson_chk)
+        controls.addStretch()
+        self.save_btn = QPushButton("Save Tile JPG")
+        self.save_btn.clicked.connect(self.owner.save_preview_tile_capture_jpg)
+        controls.addWidget(self.save_btn)
+        layout.addLayout(controls)
+
+    def closeEvent(self, event):
+        # Keep the dialog reusable and synchronize the checkbox in the main panel.
+        event.ignore()
+        self.hide()
+        if hasattr(self.owner, "preview_tile_capture_chk"):
+            self.owner.preview_tile_capture_chk.blockSignals(True)
+            self.owner.preview_tile_capture_chk.setChecked(False)
+            self.owner.preview_tile_capture_chk.blockSignals(False)
+        self.owner.preview_tile_mode = False
+        if hasattr(self.owner, "preview_image_label"):
+            self.owner.preview_image_label.enable_tile_mode(False)
+        self.owner.update_preview_tile_overlay()
+
+    def set_tile(self, rgb: Optional[np.ndarray], info: str):
+        self.image_label.set_rgb(rgb)
+        self.info_label.setText(info)
+
 # ============================================================
 # Main GUI
 # ============================================================
@@ -3567,7 +4733,7 @@ class WSICropTileMergeGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowIcon(QIcon(resource_path(APP_ICON_PATH)))
-        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Tile / Merge")
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Preview / Tile / Merge")
         self.setGeometry(100, 80, 1180, 820)
         self.setStyleSheet("background-color: #f0f0f0;")
 
@@ -3583,6 +4749,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.downsample_preview_path = None
         self.downsample_roi = None
         self.preview_path = None
+        self.preview_backend = None  # cached reader for fast repeated Image Preview region reads
         self.preview_arr = None
         self.preview_axes = None
         self.preview_meta = {}
@@ -3590,6 +4757,21 @@ class WSICropTileMergeGUI(QMainWindow):
         self.preview_center = None
         self.preview_zoom = 1.0
         self.preview_last_rgb = None
+        self.preview_annotations = []
+        self.preview_annotation_color = QColor(255, 0, 0)
+        self.preview_annotation_styles = {}
+        self.preview_tile_center = None
+        self.preview_tile_mode = False
+        self.preview_tile_popup = None
+        self._preview_tile_popup_timer = QTimer(self)
+        self._preview_tile_popup_timer.setSingleShot(True)
+        self._preview_tile_popup_timer.timeout.connect(self.update_preview_tile_popup_now)
+        self._preview_render_timer = QTimer(self)
+        self._preview_render_timer.setSingleShot(True)
+        self._preview_render_timer.timeout.connect(self.update_channel_preview)
+        self.crop_zoom = 1.0
+        self.crop_center = None
+        self.crop_preview_meta = {}
         self.batch_channel_paths = []
         self.active_worker = None
         self.setFocusPolicy(Qt.StrongFocus)
@@ -4110,6 +5292,8 @@ class WSICropTileMergeGUI(QMainWindow):
     def _build_preview_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+
         top = QHBoxLayout()
         load_btn = QPushButton("Load image")
         load_btn.clicked.connect(self.load_preview_file)
@@ -4119,7 +5303,7 @@ class WSICropTileMergeGUI(QMainWindow):
         top.addWidget(self.preview_file_label, 1)
         layout.addLayout(top)
 
-        save_box = QGroupBox("Save displayed preview as JPG")
+        save_box = QGroupBox("Image Preview display tools")
         save_row = QHBoxLayout(save_box)
         self.preview_suffix_edit = QLineEdit("preview")
         self.preview_suffix_edit.setPlaceholderText("Suffix for JPG capture")
@@ -4149,37 +5333,110 @@ class WSICropTileMergeGUI(QMainWindow):
         main = QHBoxLayout()
         main.setSpacing(10)
 
-        # Wider left panel so the channel/color controls do not need horizontal scrolling.
         left_panel = QWidget()
-        left_panel.setMinimumWidth(320)
-        left_panel.setMaximumWidth(360)
+        left_panel.setMinimumWidth(340)
+        left_panel.setMaximumWidth(410)
+        left_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         left = QVBoxLayout(left_panel)
         left.setContentsMargins(0, 0, 0, 0)
 
         self.channel_table = QTableWidget()
         self.channel_table.setColumnCount(3)
         self.channel_table.setHorizontalHeaderLabels(["On", "Channel", "Color"])
-        self.channel_table.setColumnWidth(0, 55)
-        self.channel_table.setColumnWidth(1, 95)
-        self.channel_table.setColumnWidth(2, 150)
-        self.channel_table.setMinimumWidth(315)
+        self.channel_table.setColumnWidth(0, 45)
+        self.channel_table.setColumnWidth(1, 80)
+        self.channel_table.setColumnWidth(2, 140)
+        self.channel_table.setMinimumWidth(300)
+        self.channel_table.setMaximumHeight(190)
+        self.channel_table.verticalHeader().setVisible(False)
+        self.channel_table.verticalHeader().setDefaultSectionSize(24)
         self.channel_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.channel_table.setAlternatingRowColors(True)
-        left.addWidget(QLabel("Channels / display mapping"))
-        left.addWidget(self.channel_table, 1)
+        left.addWidget(QLabel("Channels / display mapping (max. 6 shown)"))
+        left.addWidget(self.channel_table, 0)
         update_btn = QPushButton("Update preview")
         update_btn.clicked.connect(self.update_channel_preview)
         left.addWidget(update_btn)
+
+        geo_box = QGroupBox("GeoJSON overlay for Image Preview")
+        geo_layout = QGridLayout(geo_box)
+        load_geo_btn = QPushButton("Load GeoJSON")
+        load_geo_btn.clicked.connect(self.load_preview_geojson)
+        clear_geo_btn = QPushButton("Clear")
+        clear_geo_btn.clicked.connect(self.clear_preview_geojson)
+        self.preview_show_annotations_chk = QCheckBox("Show all")
+        self.preview_show_annotations_chk.setChecked(True)
+        self.preview_show_annotations_chk.stateChanged.connect(self.update_preview_annotation_style)
+        geo_layout.addWidget(load_geo_btn, 0, 0)
+        geo_layout.addWidget(clear_geo_btn, 0, 1)
+        geo_layout.addWidget(self.preview_show_annotations_chk, 0, 2)
+
+        self.annotation_table = QTableWidget()
+        self.annotation_table.setColumnCount(3)
+        self.annotation_table.setHorizontalHeaderLabels(["On", "Name", "Color"])
+        self.annotation_table.setColumnWidth(0, 42)
+        self.annotation_table.setColumnWidth(1, 165)
+        self.annotation_table.setColumnWidth(2, 72)
+        self.annotation_table.verticalHeader().setVisible(False)
+        self.annotation_table.verticalHeader().setDefaultSectionSize(24)
+        self.annotation_table.setMinimumHeight(320)
+        self.annotation_table.setMaximumHeight(560)
+        self.annotation_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.annotation_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.annotation_table.setAlternatingRowColors(True)
+        geo_layout.addWidget(self.annotation_table, 1, 0, 1, 3)
+
+        self.preview_annotation_fill_chk = QCheckBox("Fill polygons")
+        self.preview_annotation_fill_chk.setChecked(True)
+        self.preview_annotation_fill_chk.stateChanged.connect(self.update_preview_annotation_style)
+        geo_layout.addWidget(self.preview_annotation_fill_chk, 2, 0, 1, 2)
+        geo_layout.addWidget(QLabel("Opacity:"), 3, 0)
+        self.preview_annotation_opacity_slider = QSlider(Qt.Horizontal)
+        self.preview_annotation_opacity_slider.setRange(0, 100)
+        self.preview_annotation_opacity_slider.setValue(45)
+        self.preview_annotation_opacity_slider.valueChanged.connect(self.update_preview_annotation_style)
+        self.preview_annotation_opacity_value_label = QLabel("45%")
+        geo_layout.addWidget(self.preview_annotation_opacity_slider, 3, 1)
+        geo_layout.addWidget(self.preview_annotation_opacity_value_label, 3, 2)
+        geo_layout.addWidget(QLabel("Boundary:"), 4, 0)
+        self.preview_annotation_boundary_spin = QSpinBox()
+        self.preview_annotation_boundary_spin.setRange(1, 25)
+        self.preview_annotation_boundary_spin.setValue(2)
+        self.preview_annotation_boundary_spin.valueChanged.connect(self.update_preview_annotation_style)
+        geo_layout.addWidget(self.preview_annotation_boundary_spin, 4, 1)
+        left.addWidget(geo_box, 1)
+
+        tile_box = QGroupBox("Specific square tile capture")
+        tile_layout = QGridLayout(tile_box)
+        tile_layout.addWidget(QLabel("Tile size px:"), 0, 0)
+        self.preview_tile_size_spin = QSpinBox()
+        self.preview_tile_size_spin.setRange(16, 100000)
+        self.preview_tile_size_spin.setValue(1024)
+        self.preview_tile_size_spin.valueChanged.connect(self.update_preview_tile_overlay)
+        tile_layout.addWidget(self.preview_tile_size_spin, 0, 1)
+        self.preview_tile_capture_chk = QCheckBox("Tile capture pop-up")
+        self.preview_tile_capture_chk.setToolTip("Shows a movable non-modal window with the selected square tile. Left-drag on the image moves the tile. Right-drag pans the view.")
+        self.preview_tile_capture_chk.stateChanged.connect(self.toggle_preview_tile_mode)
+        tile_layout.addWidget(self.preview_tile_capture_chk, 1, 0, 1, 2)
+        self.preview_tile_info_label = QLabel("Tile: not set")
+        self.preview_tile_info_label.setWordWrap(True)
+        tile_layout.addWidget(self.preview_tile_info_label, 2, 0, 1, 2)
+        note = QLabel("When enabled, left-drag on the main preview moves the blue square. Right-drag pans the view. The pop-up updates and contains the Save Tile JPG button.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555;")
+        tile_layout.addWidget(note, 3, 0, 1, 2)
+        left.addWidget(tile_box)
+        left.addStretch(1)
+
         main.addWidget(left_panel, 0)
 
-        # More square preview area: less wide than before, taller relative to width.
         self.preview_image_label = ZoomRegionPreviewLabel()
         self.preview_image_label.setText("Preview")
         self.preview_image_label.setAlignment(Qt.AlignCenter)
         self.preview_image_label.setMinimumSize(720, 560)
-        self.preview_image_label.setMaximumSize(900, 700)
+        self.preview_image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # No maximum size: in full-screen the preview uses all available space.
         main.addWidget(self.preview_image_label, 1)
-        main.addStretch(1)
         layout.addLayout(main, 1)
         return page
 
@@ -4188,11 +5445,17 @@ class WSICropTileMergeGUI(QMainWindow):
         if not path:
             return
         try:
+            if getattr(self, "preview_backend", None) is not None:
+                try:
+                    self.preview_backend.close()
+                except Exception:
+                    pass
             self.preview_path = Path(path)
+            self.preview_backend = ImageBackend().load(path)
             self.preview_zoom = 1.0
-            # Read a memory-light full-image preview first to detect channels.
-            self.preview_arr, self.preview_axes, self.preview_meta = read_zoom_region_from_file(
-                path, center_xy=None, zoom=1.0,
+            # Read a memory-light visible-region preview first to detect channels.
+            self.preview_arr, self.preview_axes, self.preview_meta = read_zoom_region_from_backend(
+                self.preview_backend, center_xy=None, zoom=1.0,
                 viewport_size=(max(640, self.preview_image_label.width()), max(420, self.preview_image_label.height())),
                 max_side=1200,
             )
@@ -4200,10 +5463,12 @@ class WSICropTileMergeGUI(QMainWindow):
             if full_dims:
                 self.preview_full_dims = tuple(full_dims)
                 self.preview_center = (self.preview_full_dims[0] / 2.0, self.preview_full_dims[1] / 2.0)
+                self.preview_tile_center = self.preview_center
             else:
                 h, w = np.asarray(self.preview_arr).shape[:2]
                 self.preview_full_dims = (w, h)
                 self.preview_center = (w / 2.0, h / 2.0)
+                self.preview_tile_center = self.preview_center
             self.preview_file_label.setText(
                 f"{self.preview_path.name} | axes={self.preview_axes} | reader={self.preview_meta.get('reader')} | full={self.preview_full_dims[0]} × {self.preview_full_dims[1]}"
             )
@@ -4215,8 +5480,14 @@ class WSICropTileMergeGUI(QMainWindow):
     def populate_channel_table(self, settings: Optional[List[Dict[str, Any]]] = None):
         if self.preview_arr is None:
             return
-        n = _count_display_channels(self.preview_arr, self.preview_axes)
+        n_total = _count_display_channels(self.preview_arr, self.preview_axes)
+        n = min(int(n_total), 6)
         self.channel_table.setRowCount(n)
+        try:
+            h = self.channel_table.horizontalHeader().height() + n * self.channel_table.verticalHeader().defaultSectionSize() + 8
+            self.channel_table.setMaximumHeight(max(90, min(190, h)))
+        except Exception:
+            pass
 
         # For normal RGB images, default mapping should preserve RGB appearance.
         _, ax2 = _representative_yx_or_yxc(self.preview_arr, self.preview_axes)
@@ -4260,8 +5531,10 @@ class WSICropTileMergeGUI(QMainWindow):
             return
         try:
             viewport = (max(640, self.preview_image_label.width()), max(420, self.preview_image_label.height()))
-            arr, axes, meta = read_zoom_region_from_file(
-                str(self.preview_path),
+            if getattr(self, "preview_backend", None) is None:
+                self.preview_backend = ImageBackend().load(str(self.preview_path))
+            arr, axes, meta = read_zoom_region_from_backend(
+                self.preview_backend,
                 center_xy=getattr(self, "preview_center", None),
                 zoom=max(1.0, float(self.preview_zoom)),
                 viewport_size=viewport,
@@ -4292,12 +5565,27 @@ class WSICropTileMergeGUI(QMainWindow):
             full_dims=full_dims,
             center_callback=self._on_preview_center_changed,
             rectangle_callback=self._on_preview_rectangle_zoom,
+            zoom_callback=self._on_preview_view_zoom,
         )
+        self.preview_image_label.set_annotations(getattr(self, "preview_annotations", []))
+        self.update_preview_annotation_style()
+        self.update_preview_tile_overlay()
         self.preview_zoom_label.setText(f"Zoom: {int(self.preview_zoom * 100)}%")
+
+    def schedule_preview_region_update(self, delay_ms: int = 35):
+        if hasattr(self, "_preview_render_timer"):
+            self._preview_render_timer.start(max(0, int(delay_ms)))
+        else:
+            self.update_channel_preview()
 
     def _on_preview_center_changed(self, cx, cy):
         self.preview_center = (float(cx), float(cy))
-        self.update_channel_preview()
+        # Debounce left-drag panning so very large slides do not queue many
+        # expensive region reads while the mouse is moving.
+        self.schedule_preview_region_update(delay_ms=35)
+
+    def _on_preview_view_zoom(self, factor: float, center_xy=None):
+        self.change_preview_zoom(factor, center_xy=center_xy)
 
     def start_preview_rectangle_zoom(self):
         if self.preview_path is None:
@@ -4319,9 +5607,13 @@ class WSICropTileMergeGUI(QMainWindow):
         self.preview_zoom = max(1.0, min(64.0, 0.90 * min(zoom_w, zoom_h)))
         self.update_channel_preview()
 
-    def change_preview_zoom(self, factor: float):
+    def change_preview_zoom(self, factor: float, center_xy=None):
+        if center_xy is not None:
+            self.preview_center = (float(center_xy[0]), float(center_xy[1]))
         self.preview_zoom = max(1.0, min(32.0, self.preview_zoom * float(factor)))
-        self.update_channel_preview()
+        if self.preview_zoom == 1.0 and getattr(self, "preview_full_dims", None):
+            self.preview_center = (self.preview_full_dims[0] / 2.0, self.preview_full_dims[1] / 2.0)
+        self.schedule_preview_region_update(delay_ms=20)
 
     def set_preview_zoom(self, value: float):
         self.preview_zoom = max(1.0, float(value))
@@ -4337,11 +5629,345 @@ class WSICropTileMergeGUI(QMainWindow):
         suffix = self.preview_suffix_edit.text().strip() or "preview"
         out_path = self.preview_path.parent / f"{self.preview_path.stem}_{suffix}.jpg"
         try:
-            save_preview_jpg(out_path, self.preview_last_rgb)
-            QMessageBox.information(self, "Saved", f"Saved JPG preview:\n{out_path}")
-            self.info_label.setText(f"Saved preview JPG: {out_path}")
+            pixmap = self.preview_image_label.grab()
+            ok = pixmap.save(str(out_path), "JPG", 95)
+            if not ok:
+                raise RuntimeError("Qt could not save the displayed preview capture.")
+            QMessageBox.information(self, "Saved", f"Saved displayed JPG capture:\n{out_path}")
+            self.info_label.setText(f"Saved displayed preview capture: {out_path}")
         except Exception as e:
             QMessageBox.critical(self, "Save preview error", str(e))
+
+
+
+    def _annotation_default_color_for_class(self, class_name: str) -> QColor:
+        for ann in getattr(self, "preview_annotations", []) or []:
+            if str(ann.get("class_name", "annotation") or "annotation") == str(class_name):
+                return QColor(ann.get("color", QColor(255, 0, 0)))
+        return QColor(255, 0, 0)
+
+    def populate_annotation_table(self):
+        if not hasattr(self, "annotation_table"):
+            return
+        annotations = getattr(self, "preview_annotations", []) or []
+        classes = []
+        for ann in annotations:
+            cls = str(ann.get("class_name", "annotation") or "annotation")
+            if cls not in classes:
+                classes.append(cls)
+        classes.sort(key=lambda x: x.lower())
+        self.annotation_table.setRowCount(len(classes))
+
+        # Preserve previous user edits when loading/repopulating.
+        old_styles = getattr(self, "preview_annotation_styles", {}) or {}
+        new_styles = {}
+        for row, cls in enumerate(classes):
+            old = old_styles.get(cls, {})
+            default_color = QColor(old.get("color", self._annotation_default_color_for_class(cls)))
+            visible = bool(old.get("visible", True))
+            new_styles[cls] = {"visible": visible, "color": default_color}
+
+            chk = QCheckBox()
+            chk.setChecked(visible)
+            chk.stateChanged.connect(self.update_preview_annotation_style)
+            self.annotation_table.setCellWidget(row, 0, chk)
+
+            item = QTableWidgetItem(cls)
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.annotation_table.setItem(row, 1, item)
+
+            btn = QPushButton(default_color.name())
+            btn.setStyleSheet(
+                f"background-color: {default_color.name()}; "
+                f"color: {'white' if default_color.lightness() < 140 else 'black'};"
+            )
+            btn.clicked.connect(lambda _, name=cls: self.choose_preview_annotation_class_color(name))
+            self.annotation_table.setCellWidget(row, 2, btn)
+
+        self.preview_annotation_styles = new_styles
+        try:
+            n = min(12, max(1, len(classes)))
+            h = self.annotation_table.horizontalHeader().height() + n * self.annotation_table.verticalHeader().defaultSectionSize() + 12
+            self.annotation_table.setMaximumHeight(max(230, min(360, h)))
+        except Exception:
+            pass
+        self.update_preview_annotation_style()
+
+    def get_preview_annotation_class_styles_from_table(self) -> Dict[str, Dict[str, Any]]:
+        styles = {}
+        if not hasattr(self, "annotation_table"):
+            return getattr(self, "preview_annotation_styles", {}) or {}
+        for row in range(self.annotation_table.rowCount()):
+            item = self.annotation_table.item(row, 1)
+            if item is None:
+                continue
+            cls = item.text()
+            chk = self.annotation_table.cellWidget(row, 0)
+            old = (getattr(self, "preview_annotation_styles", {}) or {}).get(cls, {})
+            styles[cls] = {
+                "visible": chk.isChecked() if chk else True,
+                "color": QColor(old.get("color", self._annotation_default_color_for_class(cls))),
+            }
+        self.preview_annotation_styles = styles
+        return styles
+
+    def update_preview_annotation_style(self, *args):
+        if not hasattr(self, "preview_image_label"):
+            return
+        opacity_percent = int(self.preview_annotation_opacity_slider.value()) if hasattr(self, "preview_annotation_opacity_slider") else 45
+        opacity_255 = int(round(opacity_percent / 100.0 * 255))
+        if hasattr(self, "preview_annotation_opacity_value_label"):
+            self.preview_annotation_opacity_value_label.setText(f"{opacity_percent}%")
+        visible = bool(getattr(self, "preview_show_annotations_chk", None) and self.preview_show_annotations_chk.isChecked())
+        fill = bool(getattr(self, "preview_annotation_fill_chk", None) and self.preview_annotation_fill_chk.isChecked())
+        boundary = int(self.preview_annotation_boundary_spin.value()) if hasattr(self, "preview_annotation_boundary_spin") else 2
+        styles = self.get_preview_annotation_class_styles_from_table()
+        self.preview_image_label.set_annotations_visible(visible)
+        self.preview_image_label.set_annotation_style(
+            color=QColor(getattr(self, "preview_annotation_color", QColor(255, 0, 0))),
+            opacity=opacity_255,
+            fill=fill,
+            boundary_width=boundary,
+        )
+        self.preview_image_label.set_annotation_class_styles(styles)
+        self.schedule_preview_tile_popup_update()
+
+    def choose_preview_annotation_class_color(self, class_name: str):
+        styles = getattr(self, "preview_annotation_styles", {}) or {}
+        current = QColor(styles.get(class_name, {}).get("color", self._annotation_default_color_for_class(class_name)))
+        color = QColorDialog.getColor(current, self, f"Choose colour for {class_name}")
+        if color.isValid():
+            if class_name not in styles:
+                styles[class_name] = {"visible": True, "color": color}
+            else:
+                styles[class_name]["color"] = color
+            self.preview_annotation_styles = styles
+            # Update just the button visual, then refresh overlays.
+            if hasattr(self, "annotation_table"):
+                for row in range(self.annotation_table.rowCount()):
+                    item = self.annotation_table.item(row, 1)
+                    if item and item.text() == class_name:
+                        btn = self.annotation_table.cellWidget(row, 2)
+                        if btn:
+                            btn.setText(color.name())
+                            btn.setStyleSheet(
+                                f"background-color: {color.name()}; "
+                                f"color: {'white' if color.lightness() < 140 else 'black'};"
+                            )
+                        break
+            self.update_preview_annotation_style()
+
+    def choose_preview_annotation_color(self):
+        # Backward-compatible global colour picker retained for old calls.
+        current = QColor(getattr(self, "preview_annotation_color", QColor(255, 0, 0)))
+        color = QColorDialog.getColor(current, self, "Choose annotation overlay colour")
+        if color.isValid():
+            self.preview_annotation_color = color
+            for cls in list((getattr(self, "preview_annotation_styles", {}) or {}).keys()):
+                self.preview_annotation_styles[cls]["color"] = QColor(color)
+            self.populate_annotation_table()
+            self.update_preview_annotation_style()
+
+    def load_preview_geojson(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load GeoJSON annotations for Image Preview",
+            "",
+            "GeoJSON files (*.geojson *.json);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            annotations = load_geojson_annotations(path)
+            self.preview_annotations = annotations
+            self.preview_image_label.set_annotations(annotations)
+            self.preview_annotation_styles = {}
+            self.populate_annotation_table()
+            classes = sorted({a.get("class_name", "annotation") for a in annotations})
+            class_text = ", ".join(classes[:8]) + ("..." if len(classes) > 8 else "")
+            self.info_label.setText(
+                f"Loaded {len(annotations)} GeoJSON annotation object(s) for Image Preview from {Path(path).name}"
+                + (f" | names/classes: {class_text}" if class_text else "")
+            )
+            self.schedule_preview_tile_popup_update()
+        except Exception as e:
+            QMessageBox.critical(self, "GeoJSON error", str(e))
+
+    def clear_preview_geojson(self):
+        self.preview_annotations = []
+        self.preview_annotation_styles = {}
+        if hasattr(self, "annotation_table"):
+            self.annotation_table.setRowCount(0)
+        if hasattr(self, "preview_image_label"):
+            self.preview_image_label.clear_annotations()
+            self.preview_image_label.set_annotation_class_styles({})
+        self.schedule_preview_tile_popup_update()
+        self.info_label.setText("GeoJSON annotations cleared from Image Preview.")
+
+    def _current_preview_tile_roi(self):
+        if not getattr(self, "preview_full_dims", None):
+            return None
+        full_w, full_h = self.preview_full_dims
+        size = int(self.preview_tile_size_spin.value()) if hasattr(self, "preview_tile_size_spin") else 1024
+        size = max(1, min(size, max(int(full_w), int(full_h))))
+        if self.preview_tile_center is None:
+            self.preview_tile_center = self.preview_center or (full_w / 2.0, full_h / 2.0)
+        cx, cy = self.preview_tile_center
+        crop_w = min(size, int(full_w))
+        crop_h = min(size, int(full_h))
+        x = int(round(float(cx) - crop_w / 2.0))
+        y = int(round(float(cy) - crop_h / 2.0))
+        x = max(0, min(x, int(full_w) - crop_w))
+        y = max(0, min(y, int(full_h) - crop_h))
+        cx = x + crop_w / 2.0
+        cy = y + crop_h / 2.0
+        self.preview_tile_center = (cx, cy)
+        return int(x), int(y), int(crop_w), int(crop_h)
+
+    def update_preview_tile_overlay(self, *args):
+        if not hasattr(self, "preview_image_label"):
+            return
+        roi = self._current_preview_tile_roi() if getattr(self, "preview_full_dims", None) else None
+        visible = bool(getattr(self, "preview_tile_capture_chk", None) and self.preview_tile_capture_chk.isChecked())
+        if roi:
+            x, y, w, h = roi
+            center = (x + w / 2.0, y + h / 2.0)
+            size = int(self.preview_tile_size_spin.value()) if hasattr(self, "preview_tile_size_spin") else w
+            self.preview_image_label.set_tile_overlay(center, size_full=size, visible=visible, tile_callback=self._on_preview_tile_center_changed)
+            if hasattr(self, "preview_tile_info_label"):
+                self.preview_tile_info_label.setText(f"Tile: X={x}, Y={y}, size={w} × {h} px")
+        else:
+            self.preview_image_label.set_tile_overlay(None, visible=False, tile_callback=self._on_preview_tile_center_changed)
+        self.schedule_preview_tile_popup_update()
+
+    def ensure_preview_tile_popup(self):
+        if self.preview_tile_popup is None:
+            self.preview_tile_popup = TileCapturePopup(self, self)
+        return self.preview_tile_popup
+
+    def toggle_preview_tile_mode(self, *args):
+        enabled = bool(getattr(self, "preview_tile_capture_chk", None) and self.preview_tile_capture_chk.isChecked())
+        self.preview_tile_mode = enabled
+        if hasattr(self, "preview_image_label"):
+            self.preview_image_label.enable_tile_mode(enabled)
+        self.update_preview_tile_overlay()
+        if enabled:
+            if self.preview_path is None:
+                QMessageBox.warning(self, "No image", "Load an image first.")
+                self.preview_tile_capture_chk.blockSignals(True)
+                self.preview_tile_capture_chk.setChecked(False)
+                self.preview_tile_capture_chk.blockSignals(False)
+                self.preview_image_label.enable_tile_mode(False)
+                return
+            popup = self.ensure_preview_tile_popup()
+            popup.show()
+            popup.raise_()
+            self.schedule_preview_tile_popup_update(delay_ms=10)
+            self.info_label.setText("Tile capture mode: left-drag the blue square to move the tile. Right-drag the main preview to pan the view. The pop-up updates with the tile section.")
+        else:
+            if self.preview_tile_popup is not None:
+                self.preview_tile_popup.hide()
+
+    def _on_preview_tile_center_changed(self, cx, cy):
+        self.preview_tile_center = (float(cx), float(cy))
+        self.update_preview_tile_overlay()
+
+    def schedule_preview_tile_popup_update(self, delay_ms: int = 120):
+        if not hasattr(self, "_preview_tile_popup_timer"):
+            return
+        popup = getattr(self, "preview_tile_popup", None)
+        if popup is None or not popup.isVisible():
+            return
+        self._preview_tile_popup_timer.start(max(0, int(delay_ms)))
+
+    def _tile_popup_include_geojson(self) -> bool:
+        popup = getattr(self, "preview_tile_popup", None)
+        if popup is not None and hasattr(popup, "include_geojson_chk"):
+            return popup.include_geojson_chk.isChecked()
+        return True
+
+    def _render_current_preview_tile_rgb(self, include_geojson: bool = True, preview_max_side: Optional[int] = None) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+        if self.preview_path is None:
+            raise RuntimeError("No image loaded.")
+        roi = self._current_preview_tile_roi()
+        if roi is None:
+            raise RuntimeError("Tile ROI is not defined.")
+        x, y, w, h = roi
+        b = getattr(self, "preview_backend", None)
+        close_after = False
+        if b is None:
+            b = ImageBackend().load(str(self.preview_path))
+            close_after = True
+        try:
+            if preview_max_side is not None:
+                raw, axes, _ = read_roi_region_from_backend(b, (x, y, w, h), max_side=int(preview_max_side))
+            else:
+                raw, axes, _ = b.crop_raw(x, y, w, h)
+        finally:
+            if close_after:
+                b.close()
+        rgb = render_channel_composite(raw, axes, self.get_channel_settings_from_table())
+        if include_geojson:
+            if bool(getattr(self, "preview_show_annotations_chk", None) and self.preview_show_annotations_chk.isChecked()):
+                opacity_percent = int(self.preview_annotation_opacity_slider.value()) if hasattr(self, "preview_annotation_opacity_slider") else 45
+                opacity_255 = int(round(opacity_percent / 100.0 * 255))
+                rgb = draw_geojson_annotations_on_rgb(
+                    rgb,
+                    getattr(self, "preview_annotations", []),
+                    roi_full=(x, y, w, h),
+                    color=QColor(getattr(self, "preview_annotation_color", QColor(255, 0, 0))),
+                    opacity=opacity_255,
+                    fill=bool(getattr(self, "preview_annotation_fill_chk", None) and self.preview_annotation_fill_chk.isChecked()),
+                    boundary_width=int(self.preview_annotation_boundary_spin.value()) if hasattr(self, "preview_annotation_boundary_spin") else 2,
+                    class_styles=self.get_preview_annotation_class_styles_from_table(),
+                )
+        return rgb, roi
+
+    def update_preview_tile_popup_now(self):
+        popup = getattr(self, "preview_tile_popup", None)
+        if popup is None or not popup.isVisible():
+            return
+        try:
+            rgb, roi = self._render_current_preview_tile_rgb(include_geojson=self._tile_popup_include_geojson(), preview_max_side=1200)
+            # The popup uses a display-resolution ROI read, not a full-resolution tile read.
+            rgb_small = _downsample_for_preview(rgb, max_side=1200)
+            x, y, w, h = roi
+            popup.set_tile(rgb_small, f"Tile: X={x}, Y={y}, size={w} × {h} px | GeoJSON: {'on' if self._tile_popup_include_geojson() else 'off'}")
+        except Exception as e:
+            popup.set_tile(None, f"Tile preview error: {e}")
+
+    def save_preview_tile_capture_jpg(self):
+        if self.preview_path is None:
+            QMessageBox.warning(self, "No image", "Load an image first.")
+            return
+        try:
+            rgb, roi = self._render_current_preview_tile_rgb(include_geojson=self._tile_popup_include_geojson())
+            x, y, w, h = roi
+            suffix = self.preview_suffix_edit.text().strip() or "tile"
+            out_path = self.preview_path.parent / f"{self.preview_path.stem}_tile_x{x}_y{y}_s{w}_{suffix}.jpg"
+            i = 2
+            while out_path.exists():
+                out_path = self.preview_path.parent / f"{self.preview_path.stem}_tile_x{x}_y{y}_s{w}_{suffix}_{i}.jpg"
+                i += 1
+            save_preview_jpg(out_path, rgb)
+            self.info_label.setText(f"Saved tile capture JPG: {out_path}")
+            QMessageBox.information(self, "Tile saved", f"Saved tile capture JPG:\n{out_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Tile capture error", str(e))
+
+
+    def closeEvent(self, event):
+        try:
+            if getattr(self, "preview_backend", None) is not None:
+                self.preview_backend.close()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "backend", None) is not None:
+                self.backend.close()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     # ========================================================
     # Batch JPG Preview Export page
@@ -4918,13 +6544,43 @@ class WSICropTileMergeGUI(QMainWindow):
         self.crop_preserve_channels_chk.setChecked(True)
         self.crop_preview_chk = QCheckBox("Preview panel")
         self.crop_preview_chk.setChecked(True)
+        self.crop_preview_chk.stateChanged.connect(self.refresh_crop_input_preview)
         opt_layout.addWidget(self.crop_lossless_chk)
         opt_layout.addWidget(self.crop_preserve_channels_chk)
         opt_layout.addWidget(self.crop_preview_chk)
         opt_layout.addStretch()
         layout.addWidget(opt)
 
-        prev = QGroupBox("Preview - drag a rectangle on the input thumbnail")
+        display_box = QGroupBox("Crop display tools - zoom, brightness and negative")
+        display_layout = QGridLayout(display_box)
+        zoom_out_btn = QPushButton("Zoom -")
+        zoom_out_btn.clicked.connect(lambda: self.change_crop_zoom(0.8))
+        zoom_in_btn = QPushButton("Zoom +")
+        zoom_in_btn.clicked.connect(lambda: self.change_crop_zoom(1.25))
+        fit_btn = QPushButton("Fit")
+        fit_btn.clicked.connect(lambda: self.set_crop_zoom(1.0))
+        self.crop_zoom_label = QLabel("Zoom: 100%")
+        display_layout.addWidget(zoom_out_btn, 0, 0)
+        display_layout.addWidget(zoom_in_btn, 0, 1)
+        display_layout.addWidget(fit_btn, 0, 2)
+        display_layout.addWidget(self.crop_zoom_label, 0, 3)
+
+        self.crop_negative_chk = QCheckBox("Negative")
+        self.crop_negative_chk.stateChanged.connect(self.update_crop_display_adjustments)
+        display_layout.addWidget(self.crop_negative_chk, 0, 4)
+
+        display_layout.addWidget(QLabel("Brightness:"), 1, 0)
+        self.crop_brightness_slider = QSlider(Qt.Horizontal)
+        self.crop_brightness_slider.setRange(-100, 100)
+        self.crop_brightness_slider.setValue(0)
+        self.crop_brightness_slider.valueChanged.connect(self.update_crop_display_adjustments)
+        self.crop_brightness_value_label = QLabel("0")
+        display_layout.addWidget(self.crop_brightness_slider, 1, 1, 1, 3)
+        display_layout.addWidget(self.crop_brightness_value_label, 1, 4)
+        display_layout.setColumnStretch(3, 1)
+        layout.addWidget(display_box)
+
+        prev = QGroupBox("Preview - left-drag a rectangle; wheel zooms; right/middle-drag pans")
         prev_layout = QHBoxLayout(prev)
         self.crop_thumb_in = CropSelectionLabel()
         self.crop_thumb_in.setFixedSize(540, 330)
@@ -4954,6 +6610,147 @@ class WSICropTileMergeGUI(QMainWindow):
         self.h_spin.setValue(h)
         self.info_label.setText(f"Rectangle selected: X={x}, Y={y}, W={w}, H={h}")
 
+
+    def refresh_crop_input_preview(self, *args):
+        """Render the crop input preview using the current zoom, brightness and GeoJSON state."""
+        if not hasattr(self, "crop_thumb_in"):
+            return
+        if not self.backend.path or not self.backend.slide_dims:
+            return
+        if hasattr(self, "crop_preview_chk") and not self.crop_preview_chk.isChecked():
+            return
+        full_w, full_h = self.backend.slide_dims
+        if self.crop_center is None:
+            self.crop_center = (full_w / 2.0, full_h / 2.0)
+        try:
+            viewport = (
+                max(480, int(self.crop_thumb_in.width())),
+                max(300, int(self.crop_thumb_in.height())),
+            )
+            arr, axes, meta = read_zoom_region_from_file(
+                str(self.backend.path),
+                center_xy=self.crop_center,
+                zoom=max(1.0, float(self.crop_zoom)),
+                viewport_size=viewport,
+                max_side=max(1200, int(max(viewport) * 2)),
+            )
+            rgb = _array_to_rgb_preview(arr, axes)
+            roi = meta.get("roi") or (0, 0, full_w, full_h)
+            self.crop_preview_meta = meta
+            if meta.get("full_dims"):
+                full_w, full_h = tuple(meta["full_dims"])
+            self.crop_thumb_in.set_image(
+                rgb,
+                full_w=full_w,
+                full_h=full_h,
+                callback=self._on_rectangle_selected,
+                roi_full=roi,
+                center_callback=self._on_crop_view_center_changed,
+                zoom_callback=self._on_crop_view_zoom,
+                pan_callback=self._on_crop_view_pan,
+            )
+        except Exception as e:
+            # Safe fallback: use the existing full-image thumbnail behavior.
+            thumb = self.backend.input_thumbnail(max_side=900)
+            self.crop_preview_meta = {"reader": "input_thumbnail-fallback", "roi": (0, 0, full_w, full_h), "error": str(e)}
+            self.crop_thumb_in.set_image(
+                thumb,
+                full_w=full_w,
+                full_h=full_h,
+                callback=self._on_rectangle_selected,
+                roi_full=(0, 0, full_w, full_h),
+                center_callback=self._on_crop_view_center_changed,
+                zoom_callback=self._on_crop_view_zoom,
+                pan_callback=self._on_crop_view_pan,
+            )
+        self.update_crop_display_adjustments()
+        self.crop_thumb_in.set_selection_from_full_coords(
+            self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
+        )
+        if hasattr(self, "crop_zoom_label"):
+            roi = self.crop_preview_meta.get("roi") if isinstance(self.crop_preview_meta, dict) else None
+            self.crop_zoom_label.setText(f"Zoom: {int(self.crop_zoom * 100)}%")
+            if roi:
+                self.info_label.setText(f"Crop preview updated | zoom={int(self.crop_zoom * 100)}% | ROI={roi}")
+
+    def update_crop_display_adjustments(self, *args):
+        if not hasattr(self, "crop_thumb_in"):
+            return
+        negative = bool(getattr(self, "crop_negative_chk", None) and self.crop_negative_chk.isChecked())
+        brightness = int(self.crop_brightness_slider.value()) if hasattr(self, "crop_brightness_slider") else 0
+        if hasattr(self, "crop_brightness_value_label"):
+            self.crop_brightness_value_label.setText(str(brightness))
+        self.crop_thumb_in.set_negative(negative)
+        self.crop_thumb_in.set_brightness(brightness)
+
+    def _on_crop_view_zoom(self, factor: float, center_xy=None):
+        self.change_crop_zoom(factor, center_xy=center_xy)
+
+    def _on_crop_view_center_changed(self, cx, cy):
+        self.crop_center = (float(cx), float(cy))
+        self.refresh_crop_input_preview()
+
+    def _on_crop_view_pan(self, start_full_xy, dest_fraction):
+        """Natural grab-and-move pan: the point clicked at mouse-down follows the cursor."""
+        if not self.backend.path or not self.backend.slide_dims:
+            return
+        roi = self.crop_preview_meta.get("roi") if isinstance(self.crop_preview_meta, dict) else None
+        if not roi:
+            return
+        rx, ry, rw, rh = roi
+        fx, fy = dest_fraction
+        start_x, start_y = start_full_xy
+        new_cx = float(start_x) + (0.5 - float(fx)) * float(rw)
+        new_cy = float(start_y) + (0.5 - float(fy)) * float(rh)
+        full_w, full_h = self.backend.slide_dims
+        self.crop_center = (max(0.0, min(float(full_w), new_cx)), max(0.0, min(float(full_h), new_cy)))
+        self.refresh_crop_input_preview()
+
+    def change_crop_zoom(self, factor: float, center_xy=None):
+        if not self.backend.path or not self.backend.slide_dims:
+            return
+        if center_xy is not None:
+            self.crop_center = (float(center_xy[0]), float(center_xy[1]))
+        self.crop_zoom = max(1.0, min(64.0, float(self.crop_zoom) * float(factor)))
+        if self.crop_zoom == 1.0 and self.backend.slide_dims:
+            full_w, full_h = self.backend.slide_dims
+            self.crop_center = (full_w / 2.0, full_h / 2.0)
+        self.refresh_crop_input_preview()
+
+    def set_crop_zoom(self, value: float):
+        if not self.backend.path or not self.backend.slide_dims:
+            return
+        self.crop_zoom = max(1.0, min(64.0, float(value)))
+        if self.crop_zoom == 1.0:
+            full_w, full_h = self.backend.slide_dims
+            self.crop_center = (full_w / 2.0, full_h / 2.0)
+        self.refresh_crop_input_preview()
+
+    def save_crop_display_capture(self):
+        if not hasattr(self, "crop_thumb_in") or not self.crop_thumb_in.has_image():
+            QMessageBox.warning(self, "No preview", "Load an image first.")
+            return
+        if not self.backend.path_obj:
+            QMessageBox.warning(self, "No image", "Load an image first.")
+            return
+        suffix = self.crop_suffix_edit.text().strip() or "display"
+        out_path = self.backend.path_obj.parent / f"{self.backend.path_obj.stem}_crop_display_{suffix}.jpg"
+        if out_path.exists():
+            i = 2
+            while True:
+                candidate = self.backend.path_obj.parent / f"{self.backend.path_obj.stem}_crop_display_{suffix}_{i}.jpg"
+                if not candidate.exists():
+                    out_path = candidate
+                    break
+                i += 1
+        pixmap = self.crop_thumb_in.grab()
+        ok = pixmap.save(str(out_path), "JPG", 95)
+        if ok:
+            self.info_label.setText(f"Saved displayed crop view: {out_path}")
+            QMessageBox.information(self, "Display saved", f"Saved displayed crop view:\n{out_path}")
+        else:
+            QMessageBox.critical(self, "Save error", f"Could not save display capture:\n{out_path}")
+
     def update_crop_rectangle_from_spinboxes(self):
         if not self.backend.path or not self.backend.slide_dims:
             QMessageBox.warning(self, "Error", "Please select a file first.")
@@ -4978,11 +6775,13 @@ class WSICropTileMergeGUI(QMainWindow):
             self.y_spin.setMaximum(max(0, h - 1))
             self.w_spin.setMaximum(max(1, w))
             self.h_spin.setMaximum(max(1, h))
+            self.crop_zoom = 1.0
+            self.crop_center = (w / 2.0, h / 2.0)
+            self.crop_preview_meta = {}
             print("Loaded with:", self.backend.reader, self.backend.file_kind, self.backend.path_obj.suffix)
             self.info_label.setText(f"Loaded: {Path(file_path).name} | Size: {w} x {h} px | Reader: {self.backend.reader}")
             if self.crop_preview_chk.isChecked():
-                thumb = self.backend.input_thumbnail(max_side=900)
-                self.crop_thumb_in.set_image(thumb, full_w=w, full_h=h, callback=self._on_rectangle_selected)
+                self.refresh_crop_input_preview()
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
@@ -5030,12 +6829,7 @@ class WSICropTileMergeGUI(QMainWindow):
 
             if self.crop_preview_chk.isChecked():
                 if self.backend.slide_dims:
-                    full_w, full_h = self.backend.slide_dims
-                    thumb = self.backend.input_thumbnail(max_side=900)
-                    self.crop_thumb_in.set_image(thumb, full_w=full_w, full_h=full_h, callback=self._on_rectangle_selected)
-                    self.crop_thumb_in.set_selection_from_full_coords(
-                        self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
-                    )
+                    self.refresh_crop_input_preview()
                 self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(roi_preview, 512))
             self.info_label.setText(f"Preview ready: {shape_text} | Reader: {self.backend.reader}")
         except Exception as e:
