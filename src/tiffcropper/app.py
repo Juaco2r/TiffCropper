@@ -32,7 +32,7 @@ from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QIcon, Q
 # ============================================================
 
 APP_NAME = "TiffCropper"
-APP_VERSION = "1.4"
+APP_VERSION = "1.2"
 APP_TITLE = "PathoImage Toolkit: WSI, IF, OME-TIFF and LIF Image Utility"
 APP_DOI = "10.5281/zenodo.20316535"
 APP_GITHUB = "https://github.com/Juaco2r/TiffCropper"
@@ -4781,7 +4781,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
 
-        title = QLabel(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Tile / Merge Tool")
+        title = QLabel(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Preview / Tile / Merge")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("color: #2c3e50; margin: 12px;")
