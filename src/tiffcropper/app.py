@@ -22,9 +22,10 @@ from PyQt5.QtWidgets import (
     QSpinBox, QMessageBox, QComboBox, QCheckBox, QGroupBox,
     QStackedWidget, QDoubleSpinBox, QProgressBar, QDialog,
     QTableWidget, QTableWidgetItem, QTextBrowser, QDialogButtonBox,
-    QScrollArea, QShortcut, QSlider, QColorDialog, QSizePolicy
+    QScrollArea, QShortcut, QSlider, QColorDialog, QSizePolicy,
+    QListWidget, QListWidgetItem, QAbstractItemView
 )
-from PyQt5.QtCore import Qt, QRect, QPoint, QPointF, QThread, pyqtSignal, QTimer
+from PyQt5.QtCore import Qt, QRect, QPoint, QPointF, QThread, pyqtSignal, QTimer, QSize
 from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QIcon, QKeySequence, QPainterPath, QBrush
 
 # ============================================================
@@ -1972,6 +1973,80 @@ def load_geojson_annotations(path: str) -> List[Dict[str, Any]]:
     return annotations
 
 
+
+def _qcolor_to_qupath_color_rgb(color: Any) -> int:
+    """Return QuPath-style signed colorRGB integer from QColor-like input."""
+    q = QColor(color if color is not None else QColor(255, 0, 0))
+    value = (255 << 24) | (q.red() << 16) | (q.green() << 8) | q.blue()
+    if value >= 2 ** 31:
+        value -= 2 ** 32
+    return int(value)
+
+
+def save_geojson_annotations(path: str, annotations: List[Dict[str, Any]], image_path: Optional[str] = None) -> int:
+    """Save editable/loaded annotations as a GeoJSON FeatureCollection.
+
+    Coordinates are written in full-resolution image pixel coordinates. Rings are
+    explicitly closed in the exported GeoJSON, which is what QuPath expects for
+    polygon annotations.
+    """
+    features = []
+    for i, ann in enumerate(annotations or []):
+        cls = str(ann.get("class_name", "annotation") or "annotation")
+        color = QColor(ann.get("color", _deterministic_qcolor_for_text(cls)))
+        rings_out = []
+        for ring in ann.get("rings", []) or []:
+            clean = []
+            for pt in ring or []:
+                try:
+                    x, y = float(pt[0]), float(pt[1])
+                    if np.isfinite(x) and np.isfinite(y):
+                        clean.append([x, y])
+                except Exception:
+                    continue
+            if len(clean) >= 3:
+                if clean[0] != clean[-1]:
+                    clean.append(list(clean[0]))
+                rings_out.append(clean)
+        if not rings_out:
+            continue
+        if len(rings_out) == 1:
+            geometry = {"type": "Polygon", "coordinates": [rings_out[0]]}
+        else:
+            geometry = {"type": "MultiPolygon", "coordinates": [[r] for r in rings_out]}
+        props = dict(ann.get("properties", {}) or {})
+        props.update({
+            "objectType": "annotation",
+            "name": cls,
+            "classification": {
+                "name": cls,
+                "colorRGB": _qcolor_to_qupath_color_rgb(color),
+            },
+            "source": props.get("source", "TiffCropper manual annotation"),
+        })
+        feature_id = ann.get("feature_id", ann.get("id", f"annotation_{i + 1:04d}"))
+        features.append({
+            "type": "Feature",
+            "id": str(feature_id),
+            "geometry": geometry,
+            "properties": props,
+        })
+    data = {
+        "type": "FeatureCollection",
+        "features": features,
+        "properties": {
+            "software": f"{APP_NAME} v{APP_VERSION}",
+            "coordinate_space": "full-resolution image pixels",
+        },
+    }
+    if image_path:
+        data["properties"]["image"] = str(image_path)
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    return len(features)
+
+
 def _apply_display_adjustments(rgb: np.ndarray, brightness: int = 0, negative: bool = False) -> np.ndarray:
     """Apply display-only brightness and negative mode. Does not modify saved scientific data."""
     arr = _to_uint8_rgb(rgb).astype(np.int16, copy=False)
@@ -2421,12 +2496,20 @@ class ZoomRegionPreviewLabel(QLabel):
         self._annotation_boundary_width = 2
         self._annotation_class_styles = {}
 
+        # Lightweight editable annotation state. Coordinates are stored in
+        # full-resolution image pixels, matching QuPath-style GeoJSON exports.
+        self._annotation_draw_mode = "none"
+        self._drawing_annotation = False
+        self._active_annotation_ring = []
+        self._annotation_created_callback = None
+        self._annotation_preview_callback = None
+
         self._tile_center_full = None
         self._tile_size_full = 1024
         self._show_tile = False
         self.setToolTip(
             "Mouse wheel: zoom in/out. Right-drag: pan/move the view. "
-            "Left-drag moves the tile box in tile mode, or draws a rectangle when rectangle zoom is active."
+            "In annotation mode, left-click/drag draws polygon, freehand, or rectangle objects."
         )
 
     def set_preview(self, rgb, roi_full=None, full_dims=None, center_callback=None, rectangle_callback=None, zoom_callback=None):
@@ -2476,6 +2559,136 @@ class ZoomRegionPreviewLabel(QLabel):
         self._annotation_class_styles = cleaned
         self.update()
 
+    def set_annotation_draw_callbacks(self, created_callback=None, preview_callback=None):
+        """Register callbacks used by the GUI annotation tools."""
+        self._annotation_created_callback = created_callback
+        self._annotation_preview_callback = preview_callback
+
+    def set_annotation_draw_mode(self, mode: str = "none"):
+        """Enable an editable annotation drawing mode.
+
+        Supported modes are: none, polygon, freehand, rectangle.
+        """
+        mode = str(mode or "none").strip().lower()
+        if mode not in {"none", "polygon", "freehand", "rectangle"}:
+            mode = "none"
+        if mode != self._annotation_draw_mode:
+            self.cancel_active_annotation(emit=False)
+        self._annotation_draw_mode = mode
+        if mode != "none":
+            self._tile_mode_enabled = False
+            self._rect_zoom_enabled = False
+        self.setCursor(Qt.CrossCursor if mode != "none" else Qt.ArrowCursor)
+        self.update()
+
+    def cancel_active_annotation(self, emit: bool = True):
+        self._drawing_annotation = False
+        self._active_annotation_ring = []
+        self._selecting = False
+        try:
+            self.releaseMouse()
+        except Exception:
+            pass
+        if emit and self._annotation_preview_callback:
+            self._annotation_preview_callback([])
+        self.update()
+
+    def finish_polygon_annotation(self):
+        if self._annotation_draw_mode != "polygon":
+            return False
+        return self._create_annotation_from_ring(self._active_annotation_ring, "polygon")
+
+    def _notify_annotation_preview(self):
+        if self._annotation_preview_callback:
+            self._annotation_preview_callback(list(self._active_annotation_ring))
+
+    def _append_active_point_from_pos(self, pos, min_dist_full: float = 2.0):
+        xy = self._pos_to_full_xy(pos)
+        if xy is None:
+            return False
+        x, y = float(xy[0]), float(xy[1])
+        if self._active_annotation_ring:
+            lx, ly = self._active_annotation_ring[-1]
+            if math.hypot(float(x) - float(lx), float(y) - float(ly)) < float(min_dist_full):
+                return False
+        self._active_annotation_ring.append((x, y))
+        self._notify_annotation_preview()
+        self.update()
+        return True
+
+    def _create_annotation_from_ring(self, ring, source: str = "manual"):
+        pts = []
+        for pt in ring or []:
+            try:
+                x, y = float(pt[0]), float(pt[1])
+                if np.isfinite(x) and np.isfinite(y):
+                    pts.append((x, y))
+            except Exception:
+                continue
+        if len(pts) < 3:
+            self.cancel_active_annotation()
+            return False
+        # Remove duplicated closing point; export will close the ring explicitly.
+        if len(pts) > 3 and math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) < 1e-6:
+            pts = pts[:-1]
+        self._drawing_annotation = False
+        self._active_annotation_ring = []
+        try:
+            self.releaseMouse()
+        except Exception:
+            pass
+        if self._annotation_created_callback:
+            self._annotation_created_callback(list(pts), source)
+        if self._annotation_preview_callback:
+            self._annotation_preview_callback([])
+        self.update()
+        return True
+
+    def _emit_draw_rectangle_from_widget_rect(self, rect):
+        if not self._roi_full:
+            return False
+        disp = self._display_rect()
+        rect = rect.normalized().intersected(disp)
+        if rect.width() < 3 or rect.height() < 3:
+            self.cancel_active_annotation()
+            return False
+        p0 = self._pos_to_full_xy(rect.topLeft())
+        p1 = self._pos_to_full_xy(rect.bottomRight())
+        if p0 is None or p1 is None:
+            self.cancel_active_annotation()
+            return False
+        x0, y0 = p0
+        x1, y1 = p1
+        x0, x1 = sorted([float(x0), float(x1)])
+        y0, y1 = sorted([float(y0), float(y1)])
+        ring = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        return self._create_annotation_from_ring(ring, "rectangle")
+
+    def _draw_active_annotation(self, painter: QPainter):
+        if not self._active_annotation_ring or not self._roi_full:
+            return
+        disp = self._display_rect()
+        if disp.width() <= 0 or disp.height() <= 0:
+            return
+        painter.save()
+        painter.setClipRect(disp)
+        painter.setPen(QPen(QColor(255, 210, 0, 230), max(2, int(self._annotation_boundary_width))))
+        painter.setBrush(QBrush(QColor(255, 210, 0, 45)) if self._annotation_draw_mode in ("rectangle", "polygon") else Qt.NoBrush)
+        path = QPainterPath()
+        for i, (x, y) in enumerate(self._active_annotation_ring):
+            pt = self._full_to_widget_xy(x, y)
+            if i == 0:
+                path.moveTo(pt)
+            else:
+                path.lineTo(pt)
+        if self._annotation_draw_mode == "rectangle" and len(self._active_annotation_ring) >= 4:
+            path.closeSubpath()
+        painter.drawPath(path)
+        for x, y in self._active_annotation_ring:
+            pt = self._full_to_widget_xy(x, y)
+            painter.drawEllipse(pt, 3.0, 3.0)
+        painter.restore()
+
     def set_tile_overlay(self, center_xy=None, size_full: int = 1024, visible: bool = False, tile_callback=None):
         self._tile_center_full = center_xy
         self._tile_size_full = max(1, int(size_full))
@@ -2487,6 +2700,7 @@ class ZoomRegionPreviewLabel(QLabel):
     def enable_tile_mode(self, enabled: bool = True):
         self._tile_mode_enabled = bool(enabled)
         if enabled:
+            self.set_annotation_draw_mode("none")
             self.enable_rectangle_zoom(False)
         self.setCursor(Qt.CrossCursor if self._tile_mode_enabled else Qt.ArrowCursor)
         self.update()
@@ -2494,6 +2708,7 @@ class ZoomRegionPreviewLabel(QLabel):
     def enable_rectangle_zoom(self, enabled: bool = True):
         self._rect_zoom_enabled = bool(enabled)
         if enabled:
+            self.set_annotation_draw_mode("none")
             self._tile_mode_enabled = False
         self._selecting = False
         self._dragging = False
@@ -2631,6 +2846,30 @@ class ZoomRegionPreviewLabel(QLabel):
             super().mousePressEvent(event)
             return
 
+        draw_mode = getattr(self, "_annotation_draw_mode", "none")
+        if event.button() == Qt.LeftButton and draw_mode != "none":
+            if draw_mode == "polygon":
+                self._append_active_point_from_pos(event.pos(), min_dist_full=0.0)
+                event.accept()
+                return
+            if draw_mode == "freehand":
+                self._drawing_annotation = True
+                self._active_annotation_ring = []
+                self.grabMouse()
+                self._append_active_point_from_pos(event.pos(), min_dist_full=0.0)
+                event.accept()
+                return
+            if draw_mode == "rectangle":
+                self._drawing_annotation = True
+                self.grabMouse()
+                self._sel_start = self._clamp_to_display(event.pos())
+                self._sel_end = self._sel_start
+                xy = self._pos_to_full_xy(self._sel_start)
+                self._active_annotation_ring = [(float(xy[0]), float(xy[1]))] if xy else []
+                self.update()
+                event.accept()
+                return
+
         if event.button() == Qt.LeftButton:
             if self._tile_mode_enabled:
                 self._dragging = True
@@ -2665,6 +2904,32 @@ class ZoomRegionPreviewLabel(QLabel):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        draw_mode = getattr(self, "_annotation_draw_mode", "none")
+        if self._drawing_annotation and draw_mode == "freehand":
+            # Increase minimum distance slightly with zoomed-out views to avoid
+            # thousands of redundant points from a single hand stroke.
+            min_dist = 2.0
+            try:
+                if self._roi_full and self._display_rect().width() > 0:
+                    min_dist = max(2.0, float(self._roi_full[2]) / max(1.0, float(self._display_rect().width())) * 1.5)
+            except Exception:
+                pass
+            self._append_active_point_from_pos(event.pos(), min_dist_full=min_dist)
+            event.accept()
+            return
+        if self._drawing_annotation and draw_mode == "rectangle":
+            self._sel_end = self._clamp_to_display(event.pos())
+            p0 = self._pos_to_full_xy(self._sel_start)
+            p1 = self._pos_to_full_xy(self._sel_end)
+            if p0 is not None and p1 is not None:
+                x0, y0 = p0
+                x1, y1 = p1
+                x0, x1 = sorted([float(x0), float(x1)])
+                y0, y1 = sorted([float(y0), float(y1)])
+                self._active_annotation_ring = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+            self.update()
+            event.accept()
+            return
         if self._tile_mode_enabled and self._dragging and getattr(self, "_drag_button", None) == Qt.LeftButton:
             self._emit_tile_from_pos(event.pos())
             event.accept()
@@ -2681,6 +2946,18 @@ class ZoomRegionPreviewLabel(QLabel):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        draw_mode = getattr(self, "_annotation_draw_mode", "none")
+        if event.button() == Qt.LeftButton and self._drawing_annotation and draw_mode == "freehand":
+            self._append_active_point_from_pos(event.pos(), min_dist_full=0.0)
+            self._create_annotation_from_ring(self._active_annotation_ring, "freehand")
+            event.accept()
+            return
+        if event.button() == Qt.LeftButton and self._drawing_annotation and draw_mode == "rectangle":
+            self._sel_end = self._clamp_to_display(event.pos())
+            rect = QRect(self._sel_start, self._sel_end).normalized()
+            self._emit_draw_rectangle_from_widget_rect(rect)
+            event.accept()
+            return
         if event.button() == Qt.LeftButton and self._tile_mode_enabled and self._dragging:
             self._dragging = False
             self._drag_button = None
@@ -2717,6 +2994,13 @@ class ZoomRegionPreviewLabel(QLabel):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if getattr(self, "_annotation_draw_mode", "none") == "polygon" and event.button() == Qt.LeftButton:
+            self.finish_polygon_annotation()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def _draw_annotations(self, painter: QPainter):
         if not self._show_annotations or not self._annotations or not self._roi_full:
@@ -2785,6 +3069,7 @@ class ZoomRegionPreviewLabel(QLabel):
             scaled = self._pixmap_original.scaled(disp.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             painter.drawPixmap(disp.topLeft(), scaled)
             self._draw_annotations(painter)
+            self._draw_active_annotation(painter)
             self._draw_tile_overlay(painter)
         if self._rect_zoom_enabled and (self._selecting or not self._sel_start.isNull()):
             rect = QRect(self._sel_start, self._sel_end).normalized().intersected(self._display_rect())
@@ -4725,6 +5010,50 @@ class TileCapturePopup(QDialog):
         self.image_label.set_rgb(rgb)
         self.info_label.setText(info)
 
+
+# ============================================================
+# Explorer thumbnail worker
+# ============================================================
+
+class ThumbnailExplorerWorker(QThread):
+    """Build file-explorer thumbnails outside the GUI thread.
+
+    QPixmap/QIcon are created in the main thread; this worker only reads a small
+    RGB numpy preview using the same safe preview reader used elsewhere in the app.
+    """
+    item_ready = pyqtSignal(str, object, str)
+    item_failed = pyqtSignal(str, str)
+    progress = pyqtSignal(int, int)
+    finished_count = pyqtSignal(int)
+
+    def __init__(self, paths, max_side: int = 180, parent=None):
+        super().__init__(parent)
+        self.paths = [str(p) for p in paths]
+        self.max_side = int(max_side)
+        self._cancel_requested = False
+
+    def cancel(self):
+        self._cancel_requested = True
+
+    def run(self):
+        total = len(self.paths)
+        done = 0
+        for path in self.paths:
+            if self._cancel_requested:
+                break
+            try:
+                arr, axes, meta = read_preview_array_from_file(
+                    path, max_side=self.max_side, allow_full_fallback=False
+                )
+                rgb = _array_to_rgb_preview(arr, axes)
+                rgb = _downsample_for_preview(rgb, max_side=self.max_side)
+                self.item_ready.emit(path, rgb, str(meta.get("reader", "")))
+            except Exception as exc:
+                self.item_failed.emit(path, str(exc))
+            done += 1
+            self.progress.emit(done, total)
+        self.finished_count.emit(done)
+
 # ============================================================
 # Main GUI
 # ============================================================
@@ -4760,6 +5089,9 @@ class WSICropTileMergeGUI(QMainWindow):
         self.preview_annotations = []
         self.preview_annotation_color = QColor(255, 0, 0)
         self.preview_annotation_styles = {}
+        self.preview_new_annotation_color = QColor(255, 0, 0)
+        self.preview_annotation_draw_mode = "none"
+        self._preview_annotation_counter = 1
         self.preview_tile_center = None
         self.preview_tile_mode = False
         self.preview_tile_popup = None
@@ -4773,6 +5105,9 @@ class WSICropTileMergeGUI(QMainWindow):
         self.crop_center = None
         self.crop_preview_meta = {}
         self.batch_channel_paths = []
+        self.explorer_paths = []
+        self.explorer_current_folder = None
+        self.explorer_thumb_worker = None
         self.active_worker = None
         self.setFocusPolicy(Qt.StrongFocus)
         self._preview_channel_shortcuts = []
@@ -4791,7 +5126,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.mode_combo = QComboBox()
         self.mode_combo.addItems([
             "Crop", "Tiles", "Merge Tiles", "Split LIF",
-            "Downsample", "Image Preview"
+            "Downsample", "Image Preview", "Explorer"
         ])
         self.mode_combo.setMaximumWidth(180)
 
@@ -4828,6 +5163,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.stack.addWidget(self._build_lif_page())
         self.stack.addWidget(self._build_downsample_page())
         self.stack.addWidget(self._build_preview_page())
+        self.stack.addWidget(self._build_explorer_page())
         self.mode_combo.currentIndexChanged.connect(lambda: self.stack.setCurrentIndex(self.mode_combo.currentIndex()))
 
         root.addWidget(self.info_label)
@@ -5287,6 +5623,372 @@ class WSICropTileMergeGUI(QMainWindow):
 
     # ========================================================
     # Image Preview page
+
+    # ========================================================
+    # File Explorer page with thumbnails
+    # ========================================================
+
+    def _build_explorer_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        folder_box = QGroupBox("Image file explorer")
+        folder_layout = QGridLayout(folder_box)
+        browse_btn = QPushButton("Open folder")
+        browse_btn.clicked.connect(self.browse_explorer_folder)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.scan_explorer_folder)
+        self.explorer_folder_edit = QLineEdit()
+        self.explorer_folder_edit.setPlaceholderText("Folder containing image files")
+        self.explorer_folder_edit.returnPressed.connect(self.scan_explorer_folder)
+        self.explorer_thumb_size_spin = QSpinBox()
+        self.explorer_thumb_size_spin.setRange(96, 512)
+        self.explorer_thumb_size_spin.setValue(180)
+        self.explorer_thumb_size_spin.setSuffix(" px")
+        folder_layout.addWidget(browse_btn, 0, 0)
+        folder_layout.addWidget(self.explorer_folder_edit, 0, 1, 1, 4)
+        folder_layout.addWidget(refresh_btn, 0, 5)
+        folder_layout.addWidget(QLabel("Thumbnail size:"), 1, 0)
+        folder_layout.addWidget(self.explorer_thumb_size_spin, 1, 1)
+        folder_layout.addWidget(QLabel("Current folder only. Use the left folder panel to move through the hierarchy."), 1, 2, 1, 4)
+        layout.addWidget(folder_box)
+
+        action_box = QGroupBox("Use selected images")
+        action_layout = QHBoxLayout(action_box)
+        self.explorer_target_combo = QComboBox()
+        self.explorer_target_combo.addItems([
+            "Image Preview", "Crop", "Tiles", "Downsample", "Batch JPG Preview"
+        ])
+        send_btn = QPushButton("Send selected to mode")
+        send_btn.clicked.connect(self.send_explorer_selection_to_mode)
+        preview_btn = QPushButton("Open first selected in Image Preview")
+        preview_btn.clicked.connect(lambda: self.send_explorer_selection_to_mode(force_target="Image Preview"))
+        select_all_btn = QPushButton("Select all")
+        select_all_btn.clicked.connect(self.explorer_select_all)
+        clear_btn = QPushButton("Clear selection")
+        clear_btn.clicked.connect(self.explorer_clear_selection)
+        self.explorer_selection_label = QLabel("0 selected")
+        action_layout.addWidget(QLabel("Target:"))
+        action_layout.addWidget(self.explorer_target_combo)
+        action_layout.addWidget(send_btn)
+        action_layout.addWidget(preview_btn)
+        action_layout.addStretch()
+        action_layout.addWidget(select_all_btn)
+        action_layout.addWidget(clear_btn)
+        action_layout.addWidget(self.explorer_selection_label)
+        layout.addWidget(action_box)
+
+        browser_row = QHBoxLayout()
+        browser_row.setSpacing(10)
+
+        folder_nav_box = QGroupBox("Folders")
+        folder_nav_layout = QVBoxLayout(folder_nav_box)
+        self.explorer_folder_nav = QListWidget()
+        self.explorer_folder_nav.setMinimumWidth(250)
+        self.explorer_folder_nav.setMaximumWidth(360)
+        self.explorer_folder_nav.itemDoubleClicked.connect(self.navigate_explorer_folder_item)
+        self.explorer_folder_nav.itemClicked.connect(self.navigate_explorer_folder_item)
+        folder_nav_layout.addWidget(QLabel("Parents and subfolders"))
+        folder_nav_layout.addWidget(self.explorer_folder_nav, 1)
+        browser_row.addWidget(folder_nav_box, 0)
+
+        self.explorer_list = QListWidget()
+        self.explorer_list.setViewMode(QListWidget.IconMode)
+        self.explorer_list.setResizeMode(QListWidget.Adjust)
+        self.explorer_list.setMovement(QListWidget.Static)
+        self.explorer_list.setSpacing(10)
+        self.explorer_list.setIconSize(QSize(180, 140))
+        self.explorer_list.setGridSize(QSize(220, 210))
+        self.explorer_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.explorer_list.itemSelectionChanged.connect(self.update_explorer_selection_label)
+        self.explorer_list.itemDoubleClicked.connect(lambda *_: self.send_explorer_selection_to_mode(force_target="Image Preview"))
+        browser_row.addWidget(self.explorer_list, 1)
+        layout.addLayout(browser_row, 1)
+
+        self.explorer_status_label = QLabel("No folder loaded")
+        self.explorer_status_label.setStyleSheet("color: #555; padding: 4px;")
+        layout.addWidget(self.explorer_status_label)
+        return page
+
+    def browse_explorer_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select image folder")
+        if not folder:
+            return
+        self.explorer_folder_edit.setText(folder)
+        self.scan_explorer_folder()
+
+    def _stop_explorer_worker(self):
+        worker = getattr(self, "explorer_thumb_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            worker.wait(1500)
+        self.explorer_thumb_worker = None
+
+    def _populate_explorer_folder_nav(self, folder: Path):
+        if not hasattr(self, "explorer_folder_nav"):
+            return
+        self.explorer_folder_nav.clear()
+        folder = Path(folder)
+
+        def add_folder_item(label: str, path: Path, kind: str):
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, str(path))
+            item.setData(Qt.UserRole + 1, kind)
+            item.setToolTip(str(path))
+            self.explorer_folder_nav.addItem(item)
+
+        if folder.parent and folder.parent != folder:
+            add_folder_item(f"↑ Parent: {folder.parent.name or str(folder.parent)}", folder.parent, "parent")
+
+        ancestors = list(folder.parents)
+        ancestors.reverse()
+        # Keep the list readable even for very deep HPA folders.
+        if len(ancestors) > 8:
+            ancestors = ancestors[-8:]
+        for anc in ancestors:
+            if anc == folder.parent:
+                continue
+            add_folder_item(f"↰ {anc.name or str(anc)}", anc, "ancestor")
+
+        add_folder_item(f"● Current: {folder.name or str(folder)}", folder, "current")
+
+        try:
+            subfolders = sorted([p for p in folder.iterdir() if p.is_dir()], key=lambda x: x.name.lower())
+        except Exception:
+            subfolders = []
+        for sub in subfolders:
+            add_folder_item(f"📁 {sub.name}", sub, "child")
+
+    def navigate_explorer_folder_item(self, item):
+        path = item.data(Qt.UserRole) if item is not None else None
+        kind = item.data(Qt.UserRole + 1) if item is not None else None
+        if not path or kind == "current":
+            return
+        self.explorer_folder_edit.setText(str(path))
+        self.scan_explorer_folder()
+
+    def scan_explorer_folder(self):
+        folder_text = self.explorer_folder_edit.text().strip() if hasattr(self, "explorer_folder_edit") else ""
+        if not folder_text:
+            QMessageBox.warning(self, "No folder", "Choose a folder first.")
+            return
+        folder = Path(folder_text).expanduser()
+        if not folder.is_dir():
+            QMessageBox.warning(self, "Folder not found", f"This folder does not exist:\n{folder}")
+            return
+
+        self.explorer_current_folder = folder
+        self._stop_explorer_worker()
+        self._populate_explorer_folder_nav(folder)
+        try:
+            iterator = folder.iterdir()
+            self.explorer_paths = sorted([
+                p for p in iterator
+                if p.is_file() and _has_ext(p.name, SUPPORTED_EXTENSIONS)
+            ], key=lambda x: x.name.lower())
+        except Exception as exc:
+            QMessageBox.critical(self, "Explorer error", str(exc))
+            return
+        self.explorer_list.clear()
+
+        thumb_size = int(self.explorer_thumb_size_spin.value())
+        self.explorer_list.setIconSize(QSize(thumb_size, int(thumb_size * 0.78)))
+        self.explorer_list.setGridSize(QSize(max(170, thumb_size + 50), max(170, int(thumb_size * 1.15) + 70)))
+
+        loading_icon = QIcon(_numpy_rgb_to_qpixmap(_placeholder_rgb("Loading", width=thumb_size, height=max(96, int(thumb_size * 0.78)))))
+        for p in self.explorer_paths:
+            item = QListWidgetItem(loading_icon, f"{p.name}\nloading...")
+            item.setData(Qt.UserRole, str(p))
+            item.setToolTip(str(p))
+            self.explorer_list.addItem(item)
+
+        self.update_explorer_selection_label()
+        self.explorer_status_label.setText(f"Found {len(self.explorer_paths)} image file(s) in current folder. Building thumbnails...")
+        self.info_label.setText(f"Explorer loaded: {len(self.explorer_paths)} image file(s) in {folder.name or folder}.")
+
+        if not self.explorer_paths:
+            self.progress.setVisible(False)
+            self.explorer_status_label.setText("Explorer ready: no image files in this folder.")
+            return
+
+        self.progress.setVisible(True)
+        self.progress.setRange(0, len(self.explorer_paths))
+        self.progress.setValue(0)
+        self.explorer_thumb_worker = ThumbnailExplorerWorker(self.explorer_paths, max_side=thumb_size, parent=self)
+        self.explorer_thumb_worker.item_ready.connect(self._on_explorer_thumbnail_ready)
+        self.explorer_thumb_worker.item_failed.connect(self._on_explorer_thumbnail_failed)
+        self.explorer_thumb_worker.progress.connect(self._on_explorer_thumbnail_progress)
+        self.explorer_thumb_worker.finished_count.connect(self._on_explorer_thumbnail_finished)
+        self.explorer_thumb_worker.start()
+
+    def _find_explorer_item_by_path(self, path: str):
+        path = str(path)
+        for i in range(self.explorer_list.count()):
+            item = self.explorer_list.item(i)
+            if item.data(Qt.UserRole) == path:
+                return item
+        return None
+
+    def _on_explorer_thumbnail_ready(self, path: str, rgb, reader: str):
+        item = self._find_explorer_item_by_path(path)
+        if item is None:
+            return
+        thumb_size = int(self.explorer_thumb_size_spin.value())
+        pm = _numpy_rgb_to_qpixmap(_to_uint8_rgb(rgb))
+        pm = pm.scaled(QSize(thumb_size, int(thumb_size * 0.78)), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        item.setIcon(QIcon(pm))
+        item.setText(f"{Path(path).name}\n{reader}")
+        item.setData(Qt.UserRole + 1, reader)
+
+    def _on_explorer_thumbnail_failed(self, path: str, error: str):
+        item = self._find_explorer_item_by_path(path)
+        if item is None:
+            return
+        item.setText(f"{Path(path).name}\npreview failed")
+        item.setToolTip(f"{path}\n\nThumbnail error:\n{error}")
+
+    def _on_explorer_thumbnail_progress(self, done: int, total: int):
+        if hasattr(self, "progress"):
+            self.progress.setRange(0, max(1, total))
+            self.progress.setValue(done)
+        if hasattr(self, "explorer_status_label"):
+            self.explorer_status_label.setText(f"Building thumbnails: {done}/{total}")
+
+    def _on_explorer_thumbnail_finished(self, done: int):
+        self.progress.setVisible(False)
+        self.explorer_status_label.setText(f"Explorer ready: {len(self.explorer_paths)} image file(s).")
+
+    def explorer_selected_paths(self) -> List[Path]:
+        if not hasattr(self, "explorer_list"):
+            return []
+        paths = []
+        for item in self.explorer_list.selectedItems():
+            p = item.data(Qt.UserRole)
+            if p:
+                paths.append(Path(p))
+        # Preserve the visual/list order instead of the arbitrary selection order.
+        selected = set(str(p) for p in paths)
+        return [Path(self.explorer_list.item(i).data(Qt.UserRole)) for i in range(self.explorer_list.count()) if self.explorer_list.item(i).data(Qt.UserRole) in selected]
+
+    def update_explorer_selection_label(self):
+        n = len(self.explorer_selected_paths()) if hasattr(self, "explorer_list") else 0
+        if hasattr(self, "explorer_selection_label"):
+            self.explorer_selection_label.setText(f"{n} selected")
+
+    def explorer_select_all(self):
+        if hasattr(self, "explorer_list"):
+            self.explorer_list.selectAll()
+
+    def explorer_clear_selection(self):
+        if hasattr(self, "explorer_list"):
+            self.explorer_list.clearSelection()
+
+    def _load_crop_from_path(self, path: Path):
+        path = Path(path)
+        self.backend = ImageBackend().load(str(path))
+        w, h = self.backend.slide_dims
+        self.crop_file_label.setText(path.name)
+        self.x_spin.setMaximum(max(0, w - 1))
+        self.y_spin.setMaximum(max(0, h - 1))
+        self.w_spin.setMaximum(max(1, w))
+        self.h_spin.setMaximum(max(1, h))
+        self.crop_zoom = 1.0
+        self.crop_center = (w / 2.0, h / 2.0)
+        self.crop_preview_meta = {}
+        self.info_label.setText(f"Loaded from Explorer: {path.name} | Size: {w} x {h} px | Reader: {self.backend.reader}")
+        if self.crop_preview_chk.isChecked():
+            self.refresh_crop_input_preview()
+
+    def _load_preview_from_path(self, path: Path):
+        path = Path(path)
+        try:
+            if getattr(self, "preview_backend", None) is not None:
+                try:
+                    self.preview_backend.close()
+                except Exception:
+                    pass
+            self.preview_path = path
+            self.preview_backend = ImageBackend().load(str(path))
+            self.preview_zoom = 1.0
+            self.preview_arr, self.preview_axes, self.preview_meta = read_zoom_region_from_backend(
+                self.preview_backend, center_xy=None, zoom=1.0,
+                viewport_size=(max(640, self.preview_image_label.width()), max(420, self.preview_image_label.height())),
+                max_side=1200,
+            )
+            full_dims = self.preview_meta.get("full_dims")
+            if full_dims:
+                self.preview_full_dims = tuple(full_dims)
+                self.preview_center = (self.preview_full_dims[0] / 2.0, self.preview_full_dims[1] / 2.0)
+                self.preview_tile_center = self.preview_center
+            else:
+                h, w = np.asarray(self.preview_arr).shape[:2]
+                self.preview_full_dims = (w, h)
+                self.preview_center = (w / 2.0, h / 2.0)
+                self.preview_tile_center = self.preview_center
+            self.preview_file_label.setText(
+                f"{self.preview_path.name} | axes={self.preview_axes} | reader={self.preview_meta.get('reader')} | full={self.preview_full_dims[0]} × {self.preview_full_dims[1]}"
+            )
+            self.populate_channel_table()
+            self.update_channel_preview()
+            self.info_label.setText(f"Loaded from Explorer into Image Preview: {path.name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Preview load error", str(e))
+
+    def _load_downsample_from_paths(self, paths: List[Path]):
+        paths = [Path(p) for p in paths]
+        self.downsample_paths = paths
+        if len(paths) == 1:
+            path = paths[0]
+            self.downsample_preview_path = path
+            self.backend = ImageBackend().load(str(path))
+            w, h = self.backend.slide_dims
+            thumb = self.backend.input_thumbnail(max_side=900)
+            self.downsample_whole_label.set_image(
+                thumb, full_w=w, full_h=h,
+                square_size_full=self.downsample_square_spin.value(),
+                callback=self._on_downsample_square_changed,
+            )
+            self.downsample_file_label.setText(f"Preview: {path.name} | {w} × {h} px | Reader: {self.backend.reader}")
+            self.update_downsample_preview()
+        else:
+            self.downsample_preview_path = None
+            self.downsample_file_label.setText(f"Bulk downsample from Explorer: {len(paths)} file(s) selected")
+        self.info_label.setText(f"Explorer selection linked to Downsample: {len(paths)} file(s).")
+
+    def send_explorer_selection_to_mode(self, force_target: Optional[str] = None):
+        paths = self.explorer_selected_paths()
+        if not paths:
+            QMessageBox.warning(self, "No selection", "Select one or more images in the Explorer first.")
+            return
+        target = force_target or self.explorer_target_combo.currentText()
+        try:
+            if target == "Image Preview":
+                self._load_preview_from_path(paths[0])
+                self.mode_combo.setCurrentText("Image Preview")
+                if len(paths) > 1:
+                    self.info_label.setText(f"Image Preview uses one image; opened first selected: {paths[0].name}")
+            elif target == "Crop":
+                self._load_crop_from_path(paths[0])
+                self.mode_combo.setCurrentText("Crop")
+                if len(paths) > 1:
+                    self.info_label.setText(f"Crop uses one image; loaded first selected: {paths[0].name}")
+            elif target == "Tiles":
+                self.bulk_paths = paths
+                self._load_tiles_preview_image(paths[0])
+                self.mode_combo.setCurrentText("Tiles")
+            elif target == "Downsample":
+                self._load_downsample_from_paths(paths)
+                self.mode_combo.setCurrentText("Downsample")
+            elif target == "Batch JPG Preview":
+                self.batch_channel_paths = paths
+                if hasattr(self, "batch_channel_label"):
+                    self.batch_channel_label.setText(f"Selected from Explorer: {len(paths)} image file(s)")
+                self.mode_combo.setCurrentText("Image Preview")
+                self.info_label.setText("Explorer selection linked to Batch JPG Preview. Open the Batch JPG Preview section in Image Preview and run export.")
+        except Exception as e:
+            QMessageBox.critical(self, "Explorer link error", str(e))
+
     # ========================================================
 
     def _build_preview_page(self):
@@ -5358,18 +6060,21 @@ class WSICropTileMergeGUI(QMainWindow):
         update_btn.clicked.connect(self.update_channel_preview)
         left.addWidget(update_btn)
 
-        geo_box = QGroupBox("GeoJSON overlay for Image Preview")
+        geo_box = QGroupBox("GeoJSON annotations / lightweight annotator")
         geo_layout = QGridLayout(geo_box)
         load_geo_btn = QPushButton("Load GeoJSON")
         load_geo_btn.clicked.connect(self.load_preview_geojson)
+        save_geo_btn = QPushButton("Save GeoJSON")
+        save_geo_btn.clicked.connect(self.save_preview_geojson)
         clear_geo_btn = QPushButton("Clear")
         clear_geo_btn.clicked.connect(self.clear_preview_geojson)
         self.preview_show_annotations_chk = QCheckBox("Show all")
         self.preview_show_annotations_chk.setChecked(True)
         self.preview_show_annotations_chk.stateChanged.connect(self.update_preview_annotation_style)
         geo_layout.addWidget(load_geo_btn, 0, 0)
-        geo_layout.addWidget(clear_geo_btn, 0, 1)
-        geo_layout.addWidget(self.preview_show_annotations_chk, 0, 2)
+        geo_layout.addWidget(save_geo_btn, 0, 1)
+        geo_layout.addWidget(clear_geo_btn, 0, 2)
+        geo_layout.addWidget(self.preview_show_annotations_chk, 0, 3)
 
         self.annotation_table = QTableWidget()
         self.annotation_table.setColumnCount(3)
@@ -5379,12 +6084,12 @@ class WSICropTileMergeGUI(QMainWindow):
         self.annotation_table.setColumnWidth(2, 72)
         self.annotation_table.verticalHeader().setVisible(False)
         self.annotation_table.verticalHeader().setDefaultSectionSize(24)
-        self.annotation_table.setMinimumHeight(320)
-        self.annotation_table.setMaximumHeight(560)
+        self.annotation_table.setMinimumHeight(210)
+        self.annotation_table.setMaximumHeight(330)
         self.annotation_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.annotation_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.annotation_table.setAlternatingRowColors(True)
-        geo_layout.addWidget(self.annotation_table, 1, 0, 1, 3)
+        geo_layout.addWidget(self.annotation_table, 1, 0, 1, 4)
 
         self.preview_annotation_fill_chk = QCheckBox("Fill polygons")
         self.preview_annotation_fill_chk.setChecked(True)
@@ -5396,14 +6101,45 @@ class WSICropTileMergeGUI(QMainWindow):
         self.preview_annotation_opacity_slider.setValue(45)
         self.preview_annotation_opacity_slider.valueChanged.connect(self.update_preview_annotation_style)
         self.preview_annotation_opacity_value_label = QLabel("45%")
-        geo_layout.addWidget(self.preview_annotation_opacity_slider, 3, 1)
-        geo_layout.addWidget(self.preview_annotation_opacity_value_label, 3, 2)
+        geo_layout.addWidget(self.preview_annotation_opacity_slider, 3, 1, 1, 2)
+        geo_layout.addWidget(self.preview_annotation_opacity_value_label, 3, 3)
         geo_layout.addWidget(QLabel("Boundary:"), 4, 0)
         self.preview_annotation_boundary_spin = QSpinBox()
         self.preview_annotation_boundary_spin.setRange(1, 25)
         self.preview_annotation_boundary_spin.setValue(2)
         self.preview_annotation_boundary_spin.valueChanged.connect(self.update_preview_annotation_style)
         geo_layout.addWidget(self.preview_annotation_boundary_spin, 4, 1)
+
+        geo_layout.addWidget(QLabel("Draw class:"), 5, 0)
+        self.preview_draw_class_combo = QComboBox()
+        self.preview_draw_class_combo.setEditable(True)
+        self.preview_draw_class_combo.addItems(["Tissue", "Tumor", "Stroma", "Necrosis", "Immune", "Other"])
+        self.preview_draw_class_combo.setCurrentText("Tissue")
+        geo_layout.addWidget(self.preview_draw_class_combo, 5, 1, 1, 2)
+        self.preview_draw_color_btn = QPushButton(self.preview_new_annotation_color.name())
+        self.preview_draw_color_btn.setStyleSheet(f"background-color: {self.preview_new_annotation_color.name()}; color: white;")
+        self.preview_draw_color_btn.clicked.connect(self.choose_preview_draw_color)
+        geo_layout.addWidget(self.preview_draw_color_btn, 5, 3)
+
+        self.preview_draw_mode_combo = QComboBox()
+        self.preview_draw_mode_combo.addItems(["Pan / select", "Polygon", "Freehand", "Rectangle"])
+        self.preview_draw_mode_combo.currentIndexChanged.connect(self.set_preview_annotation_draw_mode)
+        geo_layout.addWidget(QLabel("Draw mode:"), 6, 0)
+        geo_layout.addWidget(self.preview_draw_mode_combo, 6, 1, 1, 3)
+
+        finish_poly_btn = QPushButton("Finish polygon")
+        finish_poly_btn.clicked.connect(self.finish_preview_polygon_annotation)
+        cancel_draw_btn = QPushButton("Cancel draw")
+        cancel_draw_btn.clicked.connect(self.cancel_preview_annotation_drawing)
+        undo_ann_btn = QPushButton("Undo last")
+        undo_ann_btn.clicked.connect(self.undo_last_preview_annotation)
+        geo_layout.addWidget(finish_poly_btn, 7, 0)
+        geo_layout.addWidget(cancel_draw_btn, 7, 1)
+        geo_layout.addWidget(undo_ann_btn, 7, 2)
+        note_draw = QLabel("Polygon: left-click points, double-click or Finish polygon. Freehand/Rectangle: left-drag. Right-drag still pans.")
+        note_draw.setWordWrap(True)
+        note_draw.setStyleSheet("color: #555;")
+        geo_layout.addWidget(note_draw, 8, 0, 1, 4)
         left.addWidget(geo_box, 1)
 
         tile_box = QGroupBox("Specific square tile capture")
@@ -5435,6 +6171,10 @@ class WSICropTileMergeGUI(QMainWindow):
         self.preview_image_label.setAlignment(Qt.AlignCenter)
         self.preview_image_label.setMinimumSize(720, 560)
         self.preview_image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview_image_label.set_annotation_draw_callbacks(
+            created_callback=self._on_preview_annotation_drawn,
+            preview_callback=self._on_preview_annotation_preview_changed,
+        )
         # No maximum size: in full-screen the preview uses all available space.
         main.addWidget(self.preview_image_label, 1)
         layout.addLayout(main, 1)
@@ -5639,6 +6379,142 @@ class WSICropTileMergeGUI(QMainWindow):
             QMessageBox.critical(self, "Save preview error", str(e))
 
 
+
+    def _current_preview_draw_class(self) -> str:
+        if hasattr(self, "preview_draw_class_combo"):
+            text = self.preview_draw_class_combo.currentText().strip()
+            if text:
+                return text
+        return "Annotation"
+
+    def choose_preview_draw_color(self):
+        current = QColor(getattr(self, "preview_new_annotation_color", QColor(255, 0, 0)))
+        color = QColorDialog.getColor(current, self, "Choose drawing annotation colour")
+        if color.isValid():
+            self.preview_new_annotation_color = QColor(color)
+            if hasattr(self, "preview_draw_color_btn"):
+                self.preview_draw_color_btn.setText(color.name())
+                self.preview_draw_color_btn.setStyleSheet(
+                    f"background-color: {color.name()}; "
+                    f"color: {'white' if color.lightness() < 140 else 'black'};"
+                )
+
+    def set_preview_annotation_draw_mode(self, *args):
+        text = self.preview_draw_mode_combo.currentText() if hasattr(self, "preview_draw_mode_combo") else "Pan / select"
+        mapping = {
+            "Pan / select": "none",
+            "Polygon": "polygon",
+            "Freehand": "freehand",
+            "Rectangle": "rectangle",
+        }
+        mode = mapping.get(text, "none")
+        self.preview_annotation_draw_mode = mode
+        if hasattr(self, "preview_image_label"):
+            self.preview_image_label.set_annotation_draw_mode(mode)
+        if mode == "none":
+            self.info_label.setText("Annotation drawing disabled. Right-drag pans; wheel zooms.")
+        elif mode == "polygon":
+            self.info_label.setText("Polygon mode: left-click points; double-click or Finish polygon to save.")
+        elif mode == "freehand":
+            self.info_label.setText("Freehand mode: left-drag to draw. Release to save annotation.")
+        elif mode == "rectangle":
+            self.info_label.setText("Rectangle annotation mode: left-drag to draw. Release to save annotation.")
+
+    def finish_preview_polygon_annotation(self):
+        if not hasattr(self, "preview_image_label"):
+            return
+        if not self.preview_image_label.finish_polygon_annotation():
+            self.info_label.setText("Polygon was not saved. Add at least 3 points first.")
+
+    def cancel_preview_annotation_drawing(self):
+        if hasattr(self, "preview_image_label"):
+            self.preview_image_label.cancel_active_annotation()
+        self.info_label.setText("Current annotation drawing cancelled.")
+
+    def _on_preview_annotation_preview_changed(self, ring):
+        # Reserved for future coordinate readout. Keeping it light avoids UI lag.
+        pass
+
+    def _on_preview_annotation_drawn(self, ring, source="manual"):
+        if self.preview_path is None:
+            return
+        class_name = self._current_preview_draw_class()
+        color = QColor(getattr(self, "preview_new_annotation_color", QColor(255, 0, 0)))
+        ann_id = f"manual_{self._preview_annotation_counter:04d}"
+        self._preview_annotation_counter += 1
+        annotation = {
+            "id": ann_id,
+            "feature_id": ann_id,
+            "class_name": class_name,
+            "rings": [list(ring)],
+            "color": QColor(color),
+            "properties": {
+                "objectType": "annotation",
+                "name": class_name,
+                "source": f"TiffCropper {source}",
+                "classification": {
+                    "name": class_name,
+                    "colorRGB": _qcolor_to_qupath_color_rgb(color),
+                },
+            },
+        }
+        self.preview_annotations.append(annotation)
+        if hasattr(self, "preview_image_label"):
+            self.preview_image_label.set_annotations(self.preview_annotations)
+        # Preserve user visibility choices for existing classes and add the new class.
+        styles = getattr(self, "preview_annotation_styles", {}) or {}
+        if class_name not in styles:
+            styles[class_name] = {"visible": True, "color": QColor(color)}
+            self.preview_annotation_styles = styles
+        self.populate_annotation_table()
+        self.update_preview_annotation_style()
+        self.info_label.setText(f"Added {source} annotation: {class_name} ({len(ring)} points).")
+
+    def undo_last_preview_annotation(self):
+        if not getattr(self, "preview_annotations", None):
+            self.info_label.setText("No annotation to undo.")
+            return
+        removed = self.preview_annotations.pop()
+        if hasattr(self, "preview_image_label"):
+            self.preview_image_label.set_annotations(self.preview_annotations)
+        self.populate_annotation_table()
+        self.update_preview_annotation_style()
+        self.info_label.setText(f"Removed last annotation: {removed.get('class_name', 'annotation')}.")
+
+    def save_preview_geojson(self):
+        if not getattr(self, "preview_annotations", None):
+            QMessageBox.warning(self, "No annotations", "There are no annotations to save.")
+            return
+        default_dir = str(self.preview_path.parent) if self.preview_path is not None else ""
+        default_name = f"{self.preview_path.stem}_annotations.geojson" if self.preview_path is not None else "annotations.geojson"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save GeoJSON annotations",
+            str(Path(default_dir) / default_name) if default_dir else default_name,
+            "GeoJSON files (*.geojson);;JSON files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            styles = self.get_preview_annotation_class_styles_from_table()
+            annotations_to_save = []
+            for ann in self.preview_annotations:
+                ann_copy = dict(ann)
+                cls = str(ann_copy.get("class_name", "annotation") or "annotation")
+                if cls in styles and styles[cls].get("color") is not None:
+                    ann_copy["color"] = QColor(styles[cls].get("color"))
+                    props = dict(ann_copy.get("properties", {}) or {})
+                    props["classification"] = {
+                        "name": cls,
+                        "colorRGB": _qcolor_to_qupath_color_rgb(ann_copy["color"]),
+                    }
+                    ann_copy["properties"] = props
+                annotations_to_save.append(ann_copy)
+            n = save_geojson_annotations(path, annotations_to_save, image_path=str(self.preview_path) if self.preview_path else None)
+            QMessageBox.information(self, "Saved", f"Saved {n} annotation object(s):\n{path}")
+            self.info_label.setText(f"Saved GeoJSON annotations: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save GeoJSON error", str(e))
 
     def _annotation_default_color_for_class(self, class_name: str) -> QColor:
         for ann in getattr(self, "preview_annotations", []) or []:
