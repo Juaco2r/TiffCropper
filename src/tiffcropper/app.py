@@ -798,6 +798,30 @@ def read_preview_array_from_file(path: str, max_side: int = 1200, allow_full_fal
             except Exception:
                 pass
 
+            # Fast thumbnail path: try available overview/secondary pyramid levels
+            # before touching full-resolution zarr. This keeps initial thumbnails
+            # responsive for large compressed OME-TIFF files.
+            try:
+                if axes and len(axes) == len(shape) and "Y" in axes and "X" in axes:
+                    full_h0 = int(shape[axes.index("Y")]); full_w0 = int(shape[axes.index("X")])
+                elif len(shape) >= 2:
+                    full_h0, full_w0 = int(shape[-2]), int(shape[-1])
+                else:
+                    full_w0 = full_h0 = 0
+                if full_w0 > 0 and full_h0 > 0:
+                    overview = _read_best_tiff_overview_region(
+                        s, tif, full_w0, full_h0, (0, 0, full_w0, full_h0),
+                        target_ds=max(1.0, max(full_w0, full_h0) / float(max(1, max_side))),
+                        max_side=max_side,
+                        primary_axes=axes,
+                        prefer_second_level=True,
+                    )
+                    if overview is not None:
+                        arr, axes2, ometa = overview
+                        return arr, axes2, {**meta, **ometa, "shape": shape, "axes": axes, "fast_overview_first": True}
+            except Exception as overview_error:
+                last_error = overview_error
+
             # Preferred path for tiled/compressed OME-TIFF: zarr region stepping.
             try:
                 z = s.aszarr()
@@ -3530,55 +3554,25 @@ def read_zoom_region_from_backend(backend, center_xy=None, zoom: float = 1.0,
         return arr, "YXS", {**meta, "reader": "openslide-cached-region", "level": int(level), "step": ds}
 
     if backend.reader == "tifffile":
-        za, series, axes, zarr_error = backend._get_tiff_zarr()
-        axes = axes or getattr(series, "axes", "") or ""
+        # Fast preview path for OME-TIFF/TIFF: open the TIFF directory only,
+        # then try pyramid/overview levels BEFORE constructing a full-resolution
+        # zarr view.  Some compressed OME-TIFF files are slow when aszarr() is
+        # called on the full-resolution level, while level 1/2/overview pages are
+        # immediately usable for thumbnails and low-zoom previews.
+        if getattr(backend, "_tif_obj", None) is None:
+            backend._tif_obj = tifffile.TiffFile(backend.path)
+            backend._tif_series = backend._tif_obj.series[0]
+            backend._tif_axes = getattr(backend._tif_series, "axes", "") or ""
+            backend._zarr_array = None
+            backend._zarr_error = None
+        series = backend._tif_series
+        axes = backend._tif_axes or getattr(series, "axes", "") or ""
         shape = tuple(getattr(series, "shape", ()) or ())
+        zarr_error = getattr(backend, "_zarr_error", None)
 
-        # Prefer pyramid levels for pyramidal TIFF/OME-TIFF when available.
-        # This reduces decompression and RAM use when zoomed out.
-        try:
-            levels = list(getattr(series, "levels", []) or [])
-            if len(levels) > 1:
-                best_level = levels[0]
-                best_ds = 1.0
-                best_score = float("inf")
-                for lv in levels:
-                    lv_axes = getattr(lv, "axes", axes) or axes
-                    lv_shape = tuple(getattr(lv, "shape", ()) or ())
-                    if not lv_shape:
-                        continue
-                    if lv_axes and len(lv_axes) == len(lv_shape) and "Y" in lv_axes and "X" in lv_axes:
-                        lv_w = int(lv_shape[lv_axes.index("X")])
-                        lv_h = int(lv_shape[lv_axes.index("Y")])
-                    elif len(lv_shape) >= 2:
-                        lv_h, lv_w = int(lv_shape[-2]), int(lv_shape[-1])
-                    else:
-                        continue
-                    ds_x = float(full_w) / max(1.0, float(lv_w))
-                    ds_y = float(full_h) / max(1.0, float(lv_h))
-                    ds = max(1.0, (ds_x + ds_y) / 2.0)
-                    score = abs(math.log(ds / target_ds)) if target_ds > 0 else ds
-                    if score < best_score:
-                        best_score = score
-                        best_level = lv
-                        best_ds = ds
-                if best_level is not series and best_ds > 1.01:
-                    import zarr
-                    z = best_level.aszarr()
-                    lza = zarr.open(z, mode="r")
-                    lax = getattr(best_level, "axes", axes) or axes
-                    lxw = max(1, int(round(float(w) / best_ds)))
-                    lxh = max(1, int(round(float(h) / best_ds)))
-                    step = max(1, int(math.ceil(max(lxw, lxh) / float(max_side))))
-                    arr, out_axes = _slice_preview_zarr_region(lza, lax, roi, step=step, level_downsample=best_ds)
-                    return arr, out_axes, {**meta, "reader": "tifffile-pyramid-zarr-cached-region", "shape": shape, "axes": axes, "level_downsample": best_ds, "step": step}
-        except Exception as level_error:
-            # Pyramid levels are optional; fall through to highest-resolution zarr/memmap region access.
-            meta["level_error"] = str(level_error)
-
-        # Robust overview fallback: some pyramidal TIFFs expose low-resolution
-        # levels but those levels do not support aszarr(). In that case, read
-        # the selected overview level safely instead of showing a placeholder.
+        # 1) Prefer a real pyramid/overview level for low zoom or whole-slide previews.
+        # This is the equivalent of asking for "level 2" when available, but it
+        # chooses the closest available downsample to the current viewport.
         try:
             overview = _read_best_tiff_overview_region(
                 series, getattr(backend, "_tif_obj", None), full_w, full_h, roi,
@@ -3587,16 +3581,25 @@ def read_zoom_region_from_backend(backend, center_xy=None, zoom: float = 1.0,
             )
             if overview is not None:
                 arr, out_axes, ometa = overview
-                return arr, out_axes, {**meta, **ometa, "shape": shape, "axes": axes}
+                return arr, out_axes, {**meta, **ometa, "shape": shape, "axes": axes, "fast_overview_first": True}
         except Exception as overview_error:
             meta["overview_error"] = str(overview_error)
+
+        # 2) Only if no overview exists, try full-resolution zarr region access.
+        try:
+            za, series, axes, zarr_error = backend._get_tiff_zarr()
+            axes = axes or getattr(series, "axes", "") or ""
+            shape = tuple(getattr(series, "shape", ()) or ())
+        except Exception as e:
+            za = None
+            zarr_error = e
 
         step = max(1, int(math.ceil(max(float(w), float(h)) / float(max_side))))
         if za is not None:
             arr, out_axes = _slice_preview_zarr_region(za, axes, roi, step=step, level_downsample=1.0)
             return arr, out_axes, {**meta, "reader": "tifffile-zarr-cached-region", "shape": shape, "axes": axes, "step": step}
 
-        # Try memory mapping for uncompressed/non-tiled TIFFs without reading the full image.
+        # 3) Try memory mapping for uncompressed/non-tiled TIFFs without reading the full image.
         try:
             mm = tifffile.memmap(backend.path, series=0)
             mm_axes = axes if axes and len(axes) == mm.ndim else _guess_axes_for_array(mm, axes)
@@ -3605,7 +3608,7 @@ def read_zoom_region_from_backend(backend, center_xy=None, zoom: float = 1.0,
         except Exception as mmap_error:
             pass
 
-        # Last safe fallback only for genuinely small images.
+        # 4) Last safe fallback only for genuinely small images.
         spatial_pixels = int(full_w) * int(full_h)
         if spatial_pixels <= 25_000_000:
             arr = series.asarray()
@@ -3615,7 +3618,7 @@ def read_zoom_region_from_backend(backend, center_xy=None, zoom: float = 1.0,
         msg = (
             "Zoom preview skipped to keep GUI responsive.\n"
             f"File: {Path(backend.path).name}\nShape: {shape} axes={axes}\n"
-            "This TIFF could not expose pyramid, zarr, or memmap region access.\n"
+            "No fast pyramid/overview, zarr, or memmap region access was available.\n"
             "Convert to a tiled/pyramidal OME-TIFF for fast interactive viewing."
         )
         return _placeholder_rgb(msg, width=max(600, int(vw)), height=max(400, int(vh))), "YXS", {**meta, "reader": "safe-placeholder-cached-region", "shape": shape, "axes": axes, "error": str(zarr_error)}
@@ -7016,8 +7019,8 @@ class WSICropTileMergeGUI(QMainWindow):
         main.setSpacing(10)
 
         left_panel = QWidget()
-        left_panel.setMinimumWidth(360)
-        left_panel.setMaximumWidth(430)
+        left_panel.setMinimumWidth(300)
+        left_panel.setMaximumWidth(380)
         left_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         left = QVBoxLayout(left_panel)
         left.setContentsMargins(0, 0, 0, 0)
@@ -7026,11 +7029,11 @@ class WSICropTileMergeGUI(QMainWindow):
         self.if_channel_table.setColumnCount(3)
         self.if_channel_table.setHorizontalHeaderLabels(["On", "Channel", "Color"])
         self.if_channel_table.setColumnWidth(0, 45)
-        self.if_channel_table.setColumnWidth(1, 90)
-        self.if_channel_table.setColumnWidth(2, 140)
+        self.if_channel_table.setColumnWidth(1, 75)
+        self.if_channel_table.setColumnWidth(2, 115)
         self.if_channel_table.verticalHeader().setVisible(False)
         self.if_channel_table.verticalHeader().setDefaultSectionSize(24)
-        self.if_channel_table.setMaximumHeight(190)
+        self.if_channel_table.setMaximumHeight(150)
         left.addWidget(QLabel("IF display channels"))
         left.addWidget(self.if_channel_table)
 
@@ -7147,7 +7150,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.if_preview_label = ZoomRegionPreviewLabel()
         self.if_preview_label.setText("IF Threshold Explorer")
         self.if_preview_label.setAlignment(Qt.AlignCenter)
-        self.if_preview_label.setMinimumSize(720, 560)
+        self.if_preview_label.setMinimumSize(500, 360)
         self.if_preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         main.addWidget(self.if_preview_label, 1)
         layout.addLayout(main, 1)
@@ -7174,7 +7177,7 @@ class WSICropTileMergeGUI(QMainWindow):
                 center_xy=None,
                 zoom=1.0,
                 viewport_size=(max(640, self.if_preview_label.width()), max(420, self.if_preview_label.height())) if hasattr(self, "if_preview_label") else (900, 600),
-                max_side=1200,
+                max_side=900,
             )
             self.if_arr, self.if_axes, self.if_meta = arr, axes, meta
             if meta.get("full_dims"):
@@ -7630,7 +7633,7 @@ class WSICropTileMergeGUI(QMainWindow):
         super().__init__()
         self.setWindowIcon(QIcon(resource_path(APP_ICON_PATH)))
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Preview / Tile / Merge")
-        self.setGeometry(100, 80, 1180, 820)
+        self.setGeometry(80, 60, 1040, 720)
         self.setStyleSheet("background-color: #f0f0f0;")
 
         self.backend = ImageBackend()
@@ -8515,7 +8518,7 @@ class WSICropTileMergeGUI(QMainWindow):
             self.preview_arr, self.preview_axes, self.preview_meta = read_zoom_region_from_backend(
                 self.preview_backend, center_xy=None, zoom=1.0,
                 viewport_size=(max(640, self.preview_image_label.width()), max(420, self.preview_image_label.height())),
-                max_side=1200,
+                max_side=900,
             )
             full_dims = self.preview_meta.get("full_dims")
             if full_dims:
@@ -8775,7 +8778,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.preview_image_label = ZoomRegionPreviewLabel()
         self.preview_image_label.setText("Preview")
         self.preview_image_label.setAlignment(Qt.AlignCenter)
-        self.preview_image_label.setMinimumSize(720, 560)
+        self.preview_image_label.setMinimumSize(500, 360)
         self.preview_image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview_image_label.set_annotation_draw_callbacks(
             created_callback=self._on_preview_annotation_drawn,
@@ -8803,7 +8806,7 @@ class WSICropTileMergeGUI(QMainWindow):
             self.preview_arr, self.preview_axes, self.preview_meta = read_zoom_region_from_backend(
                 self.preview_backend, center_xy=None, zoom=1.0,
                 viewport_size=(max(640, self.preview_image_label.width()), max(420, self.preview_image_label.height())),
-                max_side=1200,
+                max_side=900,
             )
             full_dims = self.preview_meta.get("full_dims")
             if full_dims:
