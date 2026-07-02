@@ -831,6 +831,30 @@ def read_preview_array_from_file(path: str, max_side: int = 1200, allow_full_fal
             except Exception as mmap_error:
                 last_error = mmap_error
 
+            # If full-res zarr/memmap is unavailable, try a reduced-resolution
+            # TIFF/OME-TIFF pyramid level or secondary overview series before
+            # giving up. This is especially useful for the Crop preview.
+            try:
+                if axes and len(axes) == len(shape) and "Y" in axes and "X" in axes:
+                    full_h0 = int(shape[axes.index("Y")]); full_w0 = int(shape[axes.index("X")])
+                elif len(shape) >= 2:
+                    full_h0, full_w0 = int(shape[-2]), int(shape[-1])
+                else:
+                    full_w0 = full_h0 = 0
+                if full_w0 > 0 and full_h0 > 0:
+                    overview = _read_best_tiff_overview_region(
+                        s, tif, full_w0, full_h0, (0, 0, full_w0, full_h0),
+                        target_ds=max(1.0, max(full_w0, full_h0) / float(max(1, max_side))),
+                        max_side=max_side,
+                        primary_axes=axes,
+                        prefer_second_level=True,
+                    )
+                    if overview is not None:
+                        arr, axes2, ometa = overview
+                        return arr, axes2, {**meta, **ometa, "shape": shape, "axes": axes}
+            except Exception as overview_error:
+                last_error = overview_error
+
             # Only small files are allowed to fall back to full read.
             spatial_pixels = 0
             try:
@@ -3142,6 +3166,7 @@ def read_zoom_region_from_file(path: str, center_xy=None, zoom: float = 1.0,
                 full_h, full_w = int(shape[0]), int(shape[1])
             roi = _compute_zoom_roi(full_w, full_h, center_xy, zoom, vw, vh)
             x, y, w, h = roi
+            target_ds = max(1.0, max(float(w), float(h)) / float(max(1, max_side)))
             step = max(1, int(math.ceil(max(w, h) / float(max_side))))
             try:
                 z = s0.aszarr()
@@ -3184,6 +3209,23 @@ def read_zoom_region_from_file(path: str, center_xy=None, zoom: float = 1.0,
                     return arr, "".join(kept), {**meta, "reader": "tifffile-memmap-region", "shape": shape, "axes": mm_axes, "roi": roi, "step": step, "full_dims": (full_w, full_h)}
             except Exception as mmap_error:
                 last_error = mmap_error
+
+            # If direct full-resolution region access is unavailable, try a
+            # reduced-resolution TIFF pyramid/overview level. This avoids the
+            # placeholder in crop thumbnails for pyramidal TIFF/OME-TIFF files.
+            try:
+                overview = _read_best_tiff_overview_region(
+                    s0, tif, full_w, full_h, roi,
+                    target_ds=target_ds,
+                    max_side=max_side,
+                    primary_axes=axes,
+                    prefer_second_level=True,
+                )
+                if overview is not None:
+                    arr, out_axes, ometa = overview
+                    return arr, out_axes, {**meta, **ometa, "shape": shape, "axes": axes, "roi": roi, "full_dims": (full_w, full_h)}
+            except Exception as overview_error:
+                last_error = overview_error
 
             # Avoid full reading huge files in the GUI thread.
             spatial_pixels = int(full_w) * int(full_h)
@@ -3236,6 +3278,169 @@ def read_zoom_region_from_file(path: str, center_xy=None, zoom: float = 1.0,
         b.close()
 
 
+
+
+
+def _tiff_level_yx_shape(level, fallback_axes: str = ""):
+    """Return (width, height, axes, shape) for a tifffile series/level-like object."""
+    try:
+        shape = tuple(getattr(level, "shape", ()) or ())
+        axes = (getattr(level, "axes", "") or fallback_axes or "").strip()
+        if shape and axes and len(axes) == len(shape) and "Y" in axes and "X" in axes:
+            return int(shape[axes.index("X")]), int(shape[axes.index("Y")]), axes, shape
+        if len(shape) >= 2:
+            # Conservative fallback: most tifffile arrays put spatial Y/X in the last two axes.
+            return int(shape[-1]), int(shape[-2]), axes, shape
+    except Exception:
+        pass
+    return None
+
+
+def _tiff_collect_overview_levels(primary_series, tif_obj=None, full_w: int = None, full_h: int = None,
+                                  primary_axes: str = ""):
+    """Collect possible TIFF pyramid/overview levels from series.levels and fallback series.
+
+    Some TIFF/OME-TIFF files expose reduced-resolution images as ``series.levels``.
+    Others expose them as additional ``tif.series`` entries. This helper supports
+    both, so the GUI can use a lower-resolution page instead of showing the
+    "Zoom preview skipped" placeholder when the full-resolution image is too
+    large to read directly.
+    """
+    candidates = []
+    seen = set()
+
+    def add(level, source_label):
+        info = _tiff_level_yx_shape(level, fallback_axes=primary_axes)
+        if info is None:
+            return
+        lw, lh, lax, lshape = info
+        if lw <= 0 or lh <= 0:
+            return
+        key = (id(level), tuple(lshape), lax)
+        if key in seen:
+            return
+        seen.add(key)
+        if full_w and full_h:
+            ds_x = float(full_w) / max(1.0, float(lw))
+            ds_y = float(full_h) / max(1.0, float(lh))
+            ds = max(1.0, (ds_x + ds_y) / 2.0)
+        else:
+            ds = 1.0
+        # Skip the full-resolution level here. The normal zarr/memmap path handles it.
+        if ds <= 1.01:
+            return
+        candidates.append({
+            "level": level,
+            "axes": lax,
+            "shape": tuple(lshape),
+            "w": int(lw),
+            "h": int(lh),
+            "downsample": float(ds),
+            "source": str(source_label),
+        })
+
+    try:
+        for i, lv in enumerate(list(getattr(primary_series, "levels", []) or [])):
+            add(lv, f"series.levels[{i}]")
+    except Exception:
+        pass
+
+    try:
+        if tif_obj is not None:
+            for i, s in enumerate(list(getattr(tif_obj, "series", []) or [])[1:], start=1):
+                add(s, f"tif.series[{i}]")
+    except Exception:
+        pass
+
+    # Prefer lowest memory / highest downsample for very zoomed-out views, but the
+    # final selection is done by target downsample score.
+    candidates.sort(key=lambda c: (c["downsample"], c["w"] * c["h"]))
+    return candidates
+
+
+def _read_tiff_level_region_any(level, level_axes: str, roi, full_w: int, full_h: int,
+                                level_downsample: float, max_side: int = 1800,
+                                max_full_level_elements: int = 120_000_000):
+    """Read a visible region from a TIFF overview level.
+
+    First tries zarr region access. If that is not available, it safely reads the
+    whole overview level only when that level is small enough. This is the key
+    fallback for compressed pyramidal TIFFs where full-res zarr/memmap access is
+    unavailable but a low-res pyramid page can still be used for preview.
+    """
+    level_downsample = max(1.0, float(level_downsample or 1.0))
+    x, y, w, h = [int(v) for v in roi]
+    lxw = max(1, int(round(float(w) / level_downsample)))
+    lxh = max(1, int(round(float(h) / level_downsample)))
+    step = max(1, int(math.ceil(max(float(lxw), float(lxh)) / float(max(1, max_side)))))
+
+    # Fast path: if the overview can expose zarr chunks, read only the visible part.
+    try:
+        import zarr
+        lza = zarr.open(level.aszarr(), mode="r")
+        arr, out_axes = _slice_preview_zarr_region(
+            lza, level_axes, roi, step=step, level_downsample=level_downsample
+        )
+        return arr, out_axes, {"method": "zarr", "step": step}
+    except Exception as zarr_error:
+        last_error = zarr_error
+
+    # Fallback path: read the entire overview level only if it is reasonably small.
+    try:
+        shape = tuple(getattr(level, "shape", ()) or ())
+        n_elem = int(np.prod(shape, dtype=np.int64)) if shape else 0
+        if n_elem <= 0 or n_elem > int(max_full_level_elements):
+            raise RuntimeError(
+                f"Overview level is too large for safe full read: shape={shape}, elements={n_elem}. "
+                f"zarr error: {last_error}"
+            )
+        arr_full = np.asarray(level.asarray())
+        axes = level_axes if level_axes and len(level_axes) == arr_full.ndim else _guess_axes_for_array(arr_full, level_axes)
+        arr, out_axes = _slice_preview_zarr_region(
+            arr_full, axes, roi, step=step, level_downsample=level_downsample
+        )
+        return arr, out_axes, {"method": "asarray-overview", "step": step, "overview_shape": shape}
+    except Exception as full_error:
+        raise RuntimeError(f"Could not read TIFF overview level. zarr={last_error}; full={full_error}")
+
+
+def _read_best_tiff_overview_region(primary_series, tif_obj, full_w: int, full_h: int, roi,
+                                    target_ds: float, max_side: int, primary_axes: str = "",
+                                    prefer_second_level: bool = False):
+    """Try to read the ROI from the best available reduced-resolution TIFF level.
+
+    Returns ``(arr, axes, meta)`` or ``None``.  ``prefer_second_level`` is useful
+    for the crop tab: when several levels are available and the target is very
+    zoomed out, the function may choose the second/overview level rather than
+    failing or attempting full-res access.
+    """
+    candidates = _tiff_collect_overview_levels(
+        primary_series, tif_obj=tif_obj, full_w=full_w, full_h=full_h, primary_axes=primary_axes
+    )
+    if not candidates:
+        return None
+
+    target_ds = max(1.0, float(target_ds or 1.0))
+    if prefer_second_level and len(candidates) >= 1 and target_ds <= 1.5:
+        # At low zoom, still prefer the first overview level for responsiveness.
+        selected = candidates[0]
+    else:
+        selected = min(
+            candidates,
+            key=lambda c: abs(math.log(max(c["downsample"], 1.0001) / max(target_ds, 1.0001)))
+        )
+    arr, out_axes, read_meta = _read_tiff_level_region_any(
+        selected["level"], selected["axes"], roi, full_w, full_h,
+        selected["downsample"], max_side=max_side
+    )
+    meta = {
+        "reader": f"tifffile-overview-{read_meta.get('method', 'unknown')}",
+        "overview_source": selected["source"],
+        "overview_shape": selected["shape"],
+        "level_downsample": selected["downsample"],
+        "step": read_meta.get("step", 1),
+    }
+    return arr, out_axes, meta
 
 def _slice_preview_zarr_region(za, axes: str, roi, step: int = 1, level_downsample: float = 1.0):
     """Return a Y/X(/C/S) preview slice from a zarr/memmap-like TIFF array."""
@@ -3351,6 +3556,21 @@ def read_zoom_region_from_backend(backend, center_xy=None, zoom: float = 1.0,
             # Pyramid levels are optional; fall through to highest-resolution zarr/memmap region access.
             meta["level_error"] = str(level_error)
 
+        # Robust overview fallback: some pyramidal TIFFs expose low-resolution
+        # levels but those levels do not support aszarr(). In that case, read
+        # the selected overview level safely instead of showing a placeholder.
+        try:
+            overview = _read_best_tiff_overview_region(
+                series, getattr(backend, "_tif_obj", None), full_w, full_h, roi,
+                target_ds=target_ds, max_side=max_side, primary_axes=axes,
+                prefer_second_level=True,
+            )
+            if overview is not None:
+                arr, out_axes, ometa = overview
+                return arr, out_axes, {**meta, **ometa, "shape": shape, "axes": axes}
+        except Exception as overview_error:
+            meta["overview_error"] = str(overview_error)
+
         step = max(1, int(math.ceil(max(float(w), float(h)) / float(max_side))))
         if za is not None:
             arr, out_axes = _slice_preview_zarr_region(za, axes, roi, step=step, level_downsample=1.0)
@@ -3461,6 +3681,18 @@ def read_roi_region_from_backend(backend, roi_full: Tuple[int, int, int, int], m
                     return arr, out_axes, {**meta, "reader": "tifffile-pyramid-zarr-cached-roi-preview", "shape": shape, "axes": axes, "level_downsample": best_ds, "step": step}
         except Exception as level_error:
             meta["level_error"] = str(level_error)
+
+        try:
+            overview = _read_best_tiff_overview_region(
+                series, getattr(backend, "_tif_obj", None), full_w, full_h, roi,
+                target_ds=target_ds, max_side=max_side, primary_axes=axes,
+                prefer_second_level=True,
+            )
+            if overview is not None:
+                arr, out_axes, ometa = overview
+                return arr, out_axes, {**meta, **ometa, "shape": shape, "axes": axes}
+        except Exception as overview_error:
+            meta["overview_error"] = str(overview_error)
 
         step = max(1, int(math.ceil(max(float(w), float(h)) / float(max_side))))
         if za is not None:
@@ -4875,6 +5107,1603 @@ def _lif_export_job(cancel_event, progress_cb, message_cb, lif_paths, scene_indi
 
 
 
+
+# ============================================================
+# IF Cell Threshold Explorer helpers
+# ============================================================
+
+IF_MAX_CHANNELS = 8
+IF_DEFAULT_THRESHOLDS = [0.0, 2005.0, 610.0, 465.0, 0.0, 0.0, 0.0, 0.0]
+# Very large polygons in QuPath exports are usually tissue/annotation ROIs, not single cells.
+# Keep them out of the threshold overlay by default because filled overlays can hide the IF image.
+IF_DEFAULT_MAX_CELL_AREA_PX = 50000.0
+IF_STATUS_COLORS = {
+    "C1+": QColor(0, 90, 255),
+    "C2+": QColor(0, 180, 80),
+    "C3+": QColor(230, 40, 40),
+    "C4+": QColor(220, 40, 220),
+    "C5+": QColor(255, 180, 0),
+    "C6+": QColor(0, 210, 210),
+    "C7+": QColor(255, 120, 0),
+    "C8+": QColor(190, 190, 190),
+    "Multi+": QColor(255, 220, 0),
+    "Negative": QColor(150, 150, 150),
+}
+
+
+def _if_default_cache_path(image_path: Optional[str], geojson_path: Optional[str]) -> Path:
+    """Return the default SQLite cache path for one image + GeoJSON pair."""
+    if geojson_path:
+        g = Path(geojson_path)
+        return g.with_name(f"{g.stem}_IF_cells_cache.sqlite")
+    if image_path:
+        im = Path(image_path)
+        return im.with_name(f"{im.stem}_IF_cells_cache.sqlite")
+    return Path.cwd() / "IF_cells_cache.sqlite"
+
+
+def _if_json_dumps_compact(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _iter_geojson_features_stream(path: str, chunk_size: int = 1024 * 1024):
+    """Yield GeoJSON features without loading the whole file into memory.
+
+    The common QuPath export is a FeatureCollection with a large features array.
+    This parser finds the features array and decodes one feature object at a time.
+    It intentionally avoids ijson so the executable does not need an extra dependency.
+    """
+    path = str(path)
+    decoder = json.JSONDecoder()
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        buf = ""
+        found_features = False
+        # Find FeatureCollection.features array.
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            buf += chunk
+            m = re.search(r'"features"\s*:\s*\[', buf)
+            if m:
+                buf = buf[m.end():]
+                found_features = True
+                break
+            # Keep a tail in case the pattern is split across chunks.
+            if len(buf) > 200_000:
+                buf = buf[-200_000:]
+
+        if not found_features:
+            # Fallback for smaller/simpler GeoJSON files. This is not intended
+            # for 900 MB files, but keeps compatibility with single Feature or list files.
+            f.seek(0)
+            data = json.load(f)
+            if isinstance(data, dict) and data.get("type") == "Feature":
+                yield data
+            elif isinstance(data, dict) and "geometry" in data:
+                yield {"type": "Feature", "geometry": data.get("geometry"), "properties": data.get("properties", {})}
+            elif isinstance(data, list):
+                for obj in data:
+                    if isinstance(obj, dict):
+                        yield obj
+            return
+
+        while True:
+            # Ensure we have a non-empty buffer unless EOF.
+            while not buf:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    return
+                buf += chunk
+
+            # Skip whitespace and comma separators.
+            stripped = buf.lstrip()
+            if len(stripped) != len(buf):
+                buf = stripped
+            while buf.startswith(','):
+                buf = buf[1:].lstrip()
+
+            if buf.startswith(']'):
+                return
+
+            # Decode one full feature. If incomplete, read more chunks.
+            while True:
+                try:
+                    feature, idx = decoder.raw_decode(buf)
+                    buf = buf[idx:]
+                    if isinstance(feature, dict):
+                        yield feature
+                    break
+                except json.JSONDecodeError:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        raise
+                    buf += chunk
+
+
+def _if_measurement_pairs_from_props(props: Any):
+    """Yield (name, value) numeric measurement pairs from QuPath/generic properties."""
+    if props is None:
+        return
+    if isinstance(props, dict):
+        # QuPath commonly exports measurements as a list of {name, value}.
+        measurements = props.get("measurements") or props.get("Measurements")
+        if isinstance(measurements, list):
+            for m in measurements:
+                if isinstance(m, dict):
+                    name = m.get("name") or m.get("Name") or m.get("key") or m.get("measurement")
+                    value = m.get("value") if "value" in m else m.get("Value")
+                    if name is not None:
+                        try:
+                            yield str(name), float(value)
+                        except Exception:
+                            pass
+        # Direct numeric properties, including keys like Cell: FAP (C2): Mean.
+        for k, v in props.items():
+            if k in ("geometry", "classification", "measurements", "Measurements"):
+                continue
+            if isinstance(v, (int, float, np.integer, np.floating)):
+                try:
+                    yield str(k), float(v)
+                except Exception:
+                    pass
+            elif isinstance(v, dict):
+                for kk, vv in _if_measurement_pairs_from_props(v):
+                    yield f"{k}.{kk}", vv
+    elif isinstance(props, list):
+        for item in props:
+            for kk, vv in _if_measurement_pairs_from_props(item):
+                yield kk, vv
+
+
+def _if_extract_channel_means(properties: Dict[str, Any], max_channels: int = IF_MAX_CHANNELS) -> List[Optional[float]]:
+    """Extract channel mean values from QuPath cell GeoJSON properties.
+
+    It detects names such as:
+        Cell: FAP (C2): Mean
+        Cell: aSMA (C3): Mean
+        C4 Mean
+    and stores them as zero-based C0..C7.
+    """
+    values: List[Optional[float]] = [None] * int(max_channels)
+    for name, value in _if_measurement_pairs_from_props(properties or {}):
+        lname = str(name).lower()
+        if "mean" not in lname:
+            continue
+        m = re.search(r"\(\s*c\s*(\d+)\s*\)", str(name), flags=re.I)
+        if not m:
+            m = re.search(r"\bc\s*(\d+)\b", str(name), flags=re.I)
+        if not m:
+            continue
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < max_channels:
+            values[idx] = float(value)
+    return values
+
+
+
+
+def _if_raw_crop_to_yxc(arr: np.ndarray, axes: str = None) -> Tuple[np.ndarray, str]:
+    """Return a raw crop in YX or YXC form without intensity normalization.
+
+    This is different from display helpers: it preserves the original numeric
+    values so threshold exploration uses scientific IF intensities.
+    For Z/T stacks, the first Z/T plane is used. Channels are preserved.
+    """
+    arr = np.asarray(arr)
+    axes = (axes or "").strip()
+
+    if axes and len(axes) == arr.ndim and "Y" in axes and "X" in axes:
+        slicer = []
+        kept = []
+        for ax in axes:
+            if ax in ("Y", "X", "C", "S"):
+                slicer.append(slice(None))
+                kept.append(ax)
+            else:
+                slicer.append(0)
+        arr = np.asarray(arr[tuple(slicer)])
+        axes2 = "".join(kept)
+        order = [axes2.index("Y"), axes2.index("X")]
+        out_axes = "YX"
+        if "C" in axes2:
+            order.append(axes2.index("C"))
+            out_axes += "C"
+        elif "S" in axes2:
+            order.append(axes2.index("S"))
+            out_axes += "C"
+        arr = np.transpose(arr, order)
+        return np.asarray(arr), out_axes
+
+    arr = np.squeeze(arr)
+    if arr.ndim == 2:
+        return arr, "YX"
+    if arr.ndim == 3:
+        # Common scientific layouts: CYX or YXC.
+        if arr.shape[-1] <= IF_MAX_CHANNELS:
+            return arr, "YXC"
+        if arr.shape[0] <= IF_MAX_CHANNELS:
+            return np.moveaxis(arr, 0, -1), "YXC"
+    raise ValueError(f"Unsupported raw IF crop shape for measurement: shape={arr.shape}, axes={axes}")
+
+
+def _if_mask_from_rings(rings: List[List[Tuple[float, float]]], x0: int, y0: int, w: int, h: int) -> np.ndarray:
+    """Rasterize cell rings into a boolean mask in local crop coordinates."""
+    from PIL import Image, ImageDraw
+    w = int(w); h = int(h)
+    if w <= 0 or h <= 0:
+        return np.zeros((0, 0), dtype=bool)
+    im = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(im)
+    for ring in rings or []:
+        pts = []
+        for pt in ring or []:
+            try:
+                x, y = float(pt[0]) - float(x0), float(pt[1]) - float(y0)
+                if np.isfinite(x) and np.isfinite(y):
+                    pts.append((x, y))
+            except Exception:
+                continue
+        if len(pts) >= 3:
+            draw.polygon(pts, outline=1, fill=1)
+    return np.asarray(im, dtype=np.uint8) > 0
+
+
+
+def _if_load_measurement_backend(image_path: str) -> "ImageBackend":
+    """Load image backend for IF measurement, preferring tifffile for OME-TIFF.
+
+    OpenSlide is excellent for RGB WSI viewing, but IF OME-TIFF measurement needs
+    raw channel arrays. Therefore TIFF/OME-TIFF files are opened with tifffile
+    first whenever possible.
+    """
+    path = str(image_path)
+    b = ImageBackend()
+    lower_name = Path(path).name.lower()
+    if _has_ext(lower_name, TIFF_EXTENSIONS):
+        try:
+            w, h, res, mpp = b._probe_tifffile(path)
+            b.path = path
+            b.path_obj = Path(path)
+            b.reader = "tifffile"
+            b.file_kind = "tiff"
+            b.slide_dims = (int(w), int(h))
+            b.source_resolution = res
+            b.source_mpp = mpp
+            b.openslide_props = {}
+            return b
+        except Exception:
+            b.close()
+    return b.load(path)
+
+
+def _if_measure_cell_channel_means(backend: "ImageBackend", rings: List[List[Tuple[float, float]]],
+                                   bbox: Tuple[float, float, float, float],
+                                   max_channels: int = IF_MAX_CHANNELS) -> List[Optional[float]]:
+    """Measure mean intensity inside one cell polygon for each IF channel.
+
+    Only the cell bounding box is read from the source image. No RGB conversion
+    or display normalization is applied. Values therefore correspond to the
+    raw mean intensity inside the cell mask.
+    """
+    values: List[Optional[float]] = [None] * int(max_channels)
+    if backend is None or not getattr(backend, "slide_dims", None):
+        return values
+    minx, miny, maxx, maxy = [float(v) for v in bbox]
+    full_w, full_h = backend.slide_dims
+    x0 = max(0, int(math.floor(minx)))
+    y0 = max(0, int(math.floor(miny)))
+    x1 = min(int(full_w), int(math.ceil(maxx)) + 1)
+    y1 = min(int(full_h), int(math.ceil(maxy)) + 1)
+    w = max(1, int(x1 - x0))
+    h = max(1, int(y1 - y0))
+    if w <= 1 or h <= 1:
+        return values
+
+    raw, axes, _info = backend.crop_raw(x0, y0, w, h)
+    arr, arr_axes = _if_raw_crop_to_yxc(raw, axes)
+    mask = _if_mask_from_rings(rings, x0, y0, arr.shape[1], arr.shape[0])
+    if mask.size == 0 or not np.any(mask):
+        return values
+
+    if arr.ndim == 2:
+        vals = np.asarray(arr)[mask]
+        if vals.size:
+            values[0] = float(np.mean(vals, dtype=np.float64))
+        return values
+
+    if arr.ndim == 3:
+        n_channels = min(int(arr.shape[-1]), int(max_channels))
+        for c in range(n_channels):
+            vals = np.asarray(arr[:, :, c])[mask]
+            if vals.size:
+                values[c] = float(np.mean(vals, dtype=np.float64))
+        return values
+
+    return values
+
+
+def _if_ring_bbox(rings: List[List[Tuple[float, float]]]):
+    xs, ys = [], []
+    for ring in rings or []:
+        for x, y in ring or []:
+            xs.append(float(x)); ys.append(float(y))
+    if not xs or not ys:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+
+def _if_scale_rings(rings: List[List[Tuple[float, float]]], scale_x: float = 1.0, scale_y: float = 1.0) -> List[List[Tuple[float, float]]]:
+    """Scale GeoJSON coordinates into the loaded image coordinate system.
+
+    QuPath/OME workflows sometimes export cell GeoJSON at a different pyramid
+    level than the image opened in the viewer. The cache must store and measure
+    cells in the same coordinate system as the loaded IF image. Scaling is
+    applied directly around image origin (0, 0); no min-coordinate shift is used.
+    """
+    try:
+        sx = float(scale_x)
+        sy = float(scale_y)
+    except Exception:
+        sx = sy = 1.0
+    if not np.isfinite(sx) or sx <= 0:
+        sx = 1.0
+    if not np.isfinite(sy) or sy <= 0:
+        sy = 1.0
+    if abs(sx - 1.0) < 1e-12 and abs(sy - 1.0) < 1e-12:
+        return rings
+    out = []
+    for ring in rings or []:
+        rr = []
+        for pt in ring or []:
+            try:
+                x, y = float(pt[0]), float(pt[1])
+                if np.isfinite(x) and np.isfinite(y):
+                    rr.append((x * sx, y * sy))
+            except Exception:
+                continue
+        if len(rr) >= 2:
+            out.append(rr)
+    return out
+
+
+def _if_probe_geojson_extent(geojson_path: str, cancel_event=None, progress_cb=None, message_cb=None) -> Dict[str, Any]:
+    """Stream the GeoJSON once to estimate its coordinate extent without storing geometries."""
+    minx = miny = float("inf")
+    maxx = maxy = float("-inf")
+    count = 0
+    skipped = 0
+    for feature in _iter_geojson_features_stream(geojson_path):
+        _check_cancel(cancel_event)
+        if not isinstance(feature, dict):
+            skipped += 1
+            continue
+        geom = feature.get("geometry") if "geometry" in feature else feature
+        rings = _geojson_geometry_to_rings(geom)
+        bbox = _if_ring_bbox(rings)
+        if bbox is None:
+            skipped += 1
+            continue
+        bx0, by0, bx1, by1 = bbox
+        minx = min(minx, float(bx0))
+        miny = min(miny, float(by0))
+        maxx = max(maxx, float(bx1))
+        maxy = max(maxy, float(by1))
+        count += 1
+        if count % 5000 == 0:
+            if message_cb is not None:
+                message_cb(f"Scanning GeoJSON extent: {count:,} cells")
+            if progress_cb is not None:
+                progress_cb(0, 0)
+    if count <= 0 or not np.isfinite(minx) or not np.isfinite(maxx):
+        return {"cell_count_probe": count, "skipped_probe": skipped, "valid": False}
+    return {
+        "cell_count_probe": count,
+        "skipped_probe": skipped,
+        "valid": True,
+        "minx": float(minx), "miny": float(miny), "maxx": float(maxx), "maxy": float(maxy),
+        "width": float(maxx - minx), "height": float(maxy - miny),
+    }
+
+
+def _if_auto_coordinate_scale(image_dims: Tuple[int, int], geo_extent: Dict[str, Any]) -> Dict[str, Any]:
+    """Conservatively detect common GeoJSON-to-image pyramid scale mismatches.
+
+    Automatic scaling is applied only when GeoJSON coordinates are clearly larger
+    than the image and close to a common factor such as 2x, 4x, 8x, etc. If the
+    GeoJSON extent is smaller than the image, no automatic upscaling is applied
+    because this may simply mean the cells occupy only part of the image.
+    """
+    full_w, full_h = [float(v) for v in image_dims]
+    if not geo_extent or not geo_extent.get("valid") or full_w <= 0 or full_h <= 0:
+        return {"scale_x": 1.0, "scale_y": 1.0, "ratio_x": 1.0, "ratio_y": 1.0, "mode": "no_extent"}
+
+    maxx = max(abs(float(geo_extent.get("maxx", 0.0))), abs(float(geo_extent.get("minx", 0.0))))
+    maxy = max(abs(float(geo_extent.get("maxy", 0.0))), abs(float(geo_extent.get("miny", 0.0))))
+    rx = maxx / full_w if full_w else 1.0
+    ry = maxy / full_h if full_h else 1.0
+    candidates = [2.0, 4.0, 8.0, 16.0, 32.0]
+
+    def choose_scale(ratio: float) -> Tuple[float, str]:
+        try:
+            ratio = float(ratio)
+        except Exception:
+            return 1.0, "invalid"
+        if not np.isfinite(ratio) or ratio <= 0:
+            return 1.0, "invalid"
+        if ratio <= 1.15:
+            return 1.0, "same_or_partial_extent"
+        best = min(candidates, key=lambda c: abs(c - ratio) / c)
+        rel_err = abs(best - ratio) / best
+        if rel_err <= 0.30:
+            return 1.0 / best, f"common_downsample_{best:g}x"
+        return 1.0, f"uncertain_ratio_{ratio:.3g}"
+
+    sx, mode_x = choose_scale(rx)
+    sy, mode_y = choose_scale(ry)
+
+    # If only one axis was confidently detected but both ratios are close,
+    # use the same scale for both axes to avoid small anisotropic artifacts.
+    if sx != 1.0 and sy == 1.0 and abs(rx - ry) / max(rx, ry, 1.0) <= 0.20:
+        sy = sx
+        mode_y = mode_x + "_matched"
+    if sy != 1.0 and sx == 1.0 and abs(rx - ry) / max(rx, ry, 1.0) <= 0.20:
+        sx = sy
+        mode_x = mode_y + "_matched"
+
+    mode = "scaled" if (abs(sx - 1.0) > 1e-9 or abs(sy - 1.0) > 1e-9) else "unscaled"
+    return {
+        "scale_x": float(sx), "scale_y": float(sy),
+        "ratio_x": float(rx), "ratio_y": float(ry),
+        "mode": mode, "mode_x": mode_x, "mode_y": mode_y,
+    }
+
+
+def _if_polygon_area_centroid(ring: List[Tuple[float, float]]):
+    """Return signed area and centroid for one ring."""
+    if not ring or len(ring) < 3:
+        return 0.0, None
+    pts = list(ring)
+    if pts[0] != pts[-1]:
+        pts.append(pts[0])
+    a2 = 0.0
+    cx = 0.0
+    cy = 0.0
+    for (x0, y0), (x1, y1) in zip(pts[:-1], pts[1:]):
+        cross = float(x0) * float(y1) - float(x1) * float(y0)
+        a2 += cross
+        cx += (float(x0) + float(x1)) * cross
+        cy += (float(y0) + float(y1)) * cross
+    if abs(a2) < 1e-9:
+        return 0.0, None
+    area = a2 / 2.0
+    return area, (cx / (3.0 * a2), cy / (3.0 * a2))
+
+
+def _if_rings_area_centroid(rings: List[List[Tuple[float, float]]]):
+    total_area = 0.0
+    sx = 0.0
+    sy = 0.0
+    for ring in rings or []:
+        area, cen = _if_polygon_area_centroid(ring)
+        if cen is None:
+            continue
+        weight = abs(float(area))
+        total_area += weight
+        sx += cen[0] * weight
+        sy += cen[1] * weight
+    bbox = _if_ring_bbox(rings)
+    if total_area > 0:
+        return total_area, sx / total_area, sy / total_area
+    if bbox is not None:
+        minx, miny, maxx, maxy = bbox
+        return 0.0, (minx + maxx) / 2.0, (miny + maxy) / 2.0
+    return 0.0, 0.0, 0.0
+
+
+def _if_connect_cache(cache_path: str):
+    import sqlite3
+    # timeout avoids transient OneDrive / antivirus / previous-reader locks.
+    con = sqlite3.connect(str(cache_path), timeout=30)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _if_initialize_cache_schema(con):
+    channel_cols = ",\n            ".join([f"c{i}_mean REAL" for i in range(IF_MAX_CHANNELS)])
+    con.executescript(f"""
+        -- DELETE journal avoids persistent -wal/-shm files, which are often locked by
+        -- OneDrive/antivirus on Windows while rebuilding the cache.
+        PRAGMA journal_mode=DELETE;
+        PRAGMA synchronous=NORMAL;
+        CREATE TABLE IF NOT EXISTS cells (
+            id INTEGER PRIMARY KEY,
+            source_id TEXT,
+            class_name TEXT,
+            minx REAL, miny REAL, maxx REAL, maxy REAL,
+            cx REAL, cy REAL,
+            area REAL,
+            {channel_cols},
+            geom_z BLOB
+        );
+        CREATE INDEX IF NOT EXISTS idx_cells_bbox ON cells(minx, maxx, miny, maxy);
+        CREATE INDEX IF NOT EXISTS idx_cells_centroid ON cells(cx, cy);
+        CREATE TABLE IF NOT EXISTS large_rois (
+            id INTEGER PRIMARY KEY,
+            source_id TEXT,
+            class_name TEXT,
+            minx REAL, miny REAL, maxx REAL, maxy REAL,
+            cx REAL, cy REAL,
+            area REAL,
+            geom_z BLOB
+        );
+        CREATE INDEX IF NOT EXISTS idx_large_rois_bbox ON large_rois(minx, maxx, miny, maxy);
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+    """)
+    con.commit()
+
+
+def _if_build_cell_cache(image_path: str, geojson_path: str, cache_path: str,
+                         cancel_event=None, progress_cb=None, message_cb=None,
+                         max_cell_area_px: float = IF_DEFAULT_MAX_CELL_AREA_PX) -> Dict[str, Any]:
+    """Build a measured SQLite cache from a huge cell GeoJSON + IF image.
+
+    The GeoJSON is streamed feature-by-feature, so the full 900 MB file is never
+    loaded into RAM. For each cell, the code reads only the cell bounding box
+    from the raw multichannel image, rasterizes the polygon as a mask, and saves
+    mean_C1..mean_C8 in SQLite. Later threshold changes only compare cached
+    means against slider values.
+    """
+    import sqlite3
+    import zlib
+    image_path = str(image_path or "")
+    geojson_path = str(geojson_path or "")
+    cache_path = str(cache_path or _if_default_cache_path(image_path, geojson_path))
+    try:
+        max_cell_area_px = float(max_cell_area_px)
+    except Exception:
+        max_cell_area_px = float(IF_DEFAULT_MAX_CELL_AREA_PX)
+    if max_cell_area_px <= 0:
+        max_cell_area_px = float('inf')
+
+    if not image_path or not Path(image_path).exists():
+        raise FileNotFoundError("Select a valid IF image before building the measured cache.")
+    if not geojson_path or not Path(geojson_path).exists():
+        raise FileNotFoundError("Select a valid cell GeoJSON before building the measured cache.")
+
+    requested_cache_path = Path(cache_path)
+    requested_cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Always build into a NEW timestamped SQLite file and only switch the GUI to
+    # that file after the job finishes. This avoids two common Windows problems:
+    #   1) deleting/overwriting a cache that is still locked by OneDrive/AV/SQLite;
+    #   2) the GUI reading a partially-built cache and reporting only the cells
+    #      inserted so far (for example "ROI cells: 7,000" while the job is still running).
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    build_cache_path = requested_cache_path.with_name(
+        f"{requested_cache_path.stem}_measured_{stamp}{requested_cache_path.suffix}"
+    )
+    cache_note = f"Building new measured cache: {build_cache_path.name}"
+    cache_path = str(build_cache_path)
+
+    if message_cb is not None:
+        message_cb(cache_note)
+
+    backend = _if_load_measurement_backend(image_path)
+
+    if message_cb is not None:
+        message_cb("Scanning GeoJSON coordinate extent for image/GeoJSON scale check...")
+    geo_extent = _if_probe_geojson_extent(
+        geojson_path, cancel_event=cancel_event, progress_cb=progress_cb, message_cb=message_cb
+    )
+    scale_info = _if_auto_coordinate_scale(getattr(backend, "slide_dims", (1, 1)), geo_extent)
+    geo_scale_x = float(scale_info.get("scale_x", 1.0))
+    geo_scale_y = float(scale_info.get("scale_y", 1.0))
+    total_expected = int(geo_extent.get("cell_count_probe", 0) or 0)
+    if message_cb is not None:
+        message_cb(
+            "GeoJSON scale check: "
+            f"image={getattr(backend, 'slide_dims', None)} | "
+            f"geo max=({geo_extent.get('maxx', '?')}, {geo_extent.get('maxy', '?')}) | "
+            f"ratio=({float(scale_info.get('ratio_x', 1)):.3g}, {float(scale_info.get('ratio_y', 1)):.3g}) | "
+            f"scale=({geo_scale_x:.6g}, {geo_scale_y:.6g}) | {scale_info.get('mode')} | "
+            f"valid cells to measure≈{total_expected:,}"
+        )
+
+    con = sqlite3.connect(cache_path)
+    try:
+        _if_initialize_cache_schema(con)
+        con.execute("DELETE FROM cells")
+        con.execute("DELETE FROM meta")
+        con.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", [
+            ("image_path", image_path),
+            ("geojson_path", geojson_path),
+            ("created", datetime.now().isoformat(timespec="seconds")),
+            ("software", f"{APP_NAME} v{APP_VERSION}"),
+            ("format", "IF Cell Threshold Explorer measured cache v3"),
+            ("build_complete", "0"),
+            ("requested_cache_path", str(requested_cache_path)),
+            ("actual_cache_path", str(build_cache_path)),
+            ("cache_note", cache_note),
+            ("measurement", "mean intensity measured from raw image pixels inside each GeoJSON cell polygon"),
+            ("max_cell_area_px", str(max_cell_area_px)),
+            ("large_area_filter", "features with area_px > max_cell_area_px are treated as large annotations/ROIs and skipped"),
+            ("image_reader", str(getattr(backend, "reader", "unknown"))),
+            ("image_dims", "x".join(str(v) for v in (getattr(backend, "slide_dims", None) or ()))),
+            ("geojson_extent_minx", str(geo_extent.get("minx", ""))),
+            ("geojson_extent_miny", str(geo_extent.get("miny", ""))),
+            ("geojson_extent_maxx", str(geo_extent.get("maxx", ""))),
+            ("geojson_extent_maxy", str(geo_extent.get("maxy", ""))),
+            ("geojson_coord_ratio_x", str(scale_info.get("ratio_x", ""))),
+            ("geojson_coord_ratio_y", str(scale_info.get("ratio_y", ""))),
+            ("geojson_to_image_scale_x", str(geo_scale_x)),
+            ("geojson_to_image_scale_y", str(geo_scale_y)),
+            ("geojson_scale_mode", str(scale_info.get("mode", ""))),
+            ("geojson_scale_mode_x", str(scale_info.get("mode_x", ""))),
+            ("geojson_scale_mode_y", str(scale_info.get("mode_y", ""))),
+        ])
+
+        insert_sql = """
+            INSERT INTO cells(
+                source_id, class_name, minx, miny, maxx, maxy, cx, cy, area,
+                c0_mean, c1_mean, c2_mean, c3_mean, c4_mean, c5_mean, c6_mean, c7_mean, geom_z
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        large_roi_sql = """
+            INSERT INTO large_rois(source_id, class_name, minx, miny, maxx, maxy, cx, cy, area, geom_z)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        batch = []
+        count = 0
+        skipped = 0
+        measured = 0
+        measurement_failed = 0
+        skipped_large_area = 0
+        last_message_t = datetime.now()
+
+        if message_cb is not None:
+            message_cb(f"Starting raw IF measurement for approximately {total_expected:,} cells...")
+        if progress_cb is not None:
+            progress_cb(0, total_expected if total_expected > 0 else 0)
+
+        for feature in _iter_geojson_features_stream(geojson_path):
+            _check_cancel(cancel_event)
+            if not isinstance(feature, dict):
+                skipped += 1
+                continue
+            props = feature.get("properties", {}) or {}
+            geom = feature.get("geometry") if "geometry" in feature else feature
+            rings = _geojson_geometry_to_rings(geom)
+            if not rings:
+                skipped += 1
+                continue
+            # Store and measure in the loaded image coordinate system.
+            rings = _if_scale_rings(rings, geo_scale_x, geo_scale_y)
+            bbox = _if_ring_bbox(rings)
+            if bbox is None:
+                skipped += 1
+                continue
+            minx, miny, maxx, maxy = bbox
+            area, cx, cy = _if_rings_area_centroid(rings)
+
+            # Large polygons are usually tissue/annotation ROIs, not individual cells.
+            # Store them separately so tissue-level pixel thresholding can be limited
+            # inside the general tissue annotation without treating it as a cell.
+            try:
+                if float(area) > float(max_cell_area_px):
+                    skipped_large_area += 1
+                    skipped += 1
+                    cls_large = _geojson_feature_class_name(feature, props)
+                    source_id_large = str(feature.get("id", props.get("id", props.get("object_id", f"large_roi_{skipped_large_area}"))))
+                    geom_z_large = sqlite3.Binary(zlib.compress(_if_json_dumps_compact(rings).encode("utf-8"), level=1))
+                    con.execute(large_roi_sql, (source_id_large, cls_large, minx, miny, maxx, maxy, cx, cy, area, geom_z_large))
+                    if skipped_large_area % 10 == 0:
+                        con.commit()
+                    continue
+            except Exception:
+                pass
+
+            # Primary path: calculate means directly from the raw IF image.
+            # Fallback only supports GeoJSONs that already contain measurements.
+            try:
+                means = _if_measure_cell_channel_means(backend, rings, bbox, IF_MAX_CHANNELS)
+                if any(v is not None for v in means):
+                    measured += 1
+                else:
+                    props_means = _if_extract_channel_means(props, IF_MAX_CHANNELS)
+                    if any(v is not None for v in props_means):
+                        means = props_means
+                    else:
+                        measurement_failed += 1
+            except Exception:
+                props_means = _if_extract_channel_means(props, IF_MAX_CHANNELS)
+                means = props_means
+                measurement_failed += 1
+
+            cls = _geojson_feature_class_name(feature, props)
+            source_id = str(feature.get("id", props.get("id", props.get("object_id", count + 1))))
+            geom_z = sqlite3.Binary(zlib.compress(_if_json_dumps_compact(rings).encode("utf-8"), level=1))
+            row = [source_id, cls, minx, miny, maxx, maxy, cx, cy, area] + means + [geom_z]
+            batch.append(row)
+            count += 1
+
+            # Lightweight heartbeat: calculating means from raw IF pixels can be
+            # slow, especially when each cell requires a compressed OME-TIFF
+            # region read. Emit progress more often than SQLite commits so the
+            # user can see the job is alive.
+            if count % 50 == 0:
+                if message_cb is not None:
+                    message_cb(
+                        f"Measuring IF cells: {count:,}/{total_expected:,} processed | "
+                        f"measured {measured:,} | failed/no mask {measurement_failed:,} | skipped {skipped:,} | large ROIs skipped {skipped_large_area:,}"
+                    )
+                if progress_cb is not None:
+                    progress_cb(count, total_expected if total_expected > 0 else 0)
+
+            if len(batch) >= 500:
+                con.executemany(insert_sql, batch)
+                con.commit()
+                batch.clear()
+                if message_cb is not None:
+                    message_cb(
+                        f"Measuring IF cells: {count:,} cached | measured {measured:,} | "
+                        f"failed/no mask {measurement_failed:,} | skipped {skipped:,} | large ROIs skipped {skipped_large_area:,}"
+                    )
+                if progress_cb is not None:
+                    progress_cb(count, total_expected if total_expected > 0 else 0)
+
+        if batch:
+            con.executemany(insert_sql, batch)
+            con.commit()
+        con.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", [
+            ("cell_count", str(count)),
+            ("skipped_count", str(skipped)),
+            ("measured_count", str(measured)),
+            ("measurement_failed_count", str(measurement_failed)),
+            ("skipped_large_area_count", str(skipped_large_area)),
+            ("large_roi_count", str(skipped_large_area)),
+            ("build_complete", "1"),
+            ("completed", datetime.now().isoformat(timespec="seconds")),
+        ])
+        con.commit()
+        try:
+            con.execute("ANALYZE")
+            con.commit()
+        except Exception:
+            pass
+        if progress_cb is not None:
+            progress_cb(count, total_expected if total_expected > 0 else count)
+        return {
+            "cache_path": cache_path,
+            "cell_count": count,
+            "skipped_count": skipped,
+            "measured_count": measured,
+            "measurement_failed_count": measurement_failed,
+            "skipped_large_area_count": skipped_large_area,
+            "large_roi_count": skipped_large_area,
+            "max_cell_area_px": max_cell_area_px,
+            "geo_scale_x": geo_scale_x,
+            "geo_scale_y": geo_scale_y,
+            "geo_ratio_x": scale_info.get("ratio_x", 1.0),
+            "geo_ratio_y": scale_info.get("ratio_y", 1.0),
+            "geo_scale_mode": scale_info.get("mode", ""),
+            "task": "if_cache",
+        }
+    finally:
+        try:
+            backend.close()
+        except Exception:
+            pass
+        con.close()
+
+
+
+# ============================================================
+# Fast CSV-backed IF cache builder
+# ============================================================
+
+def _if_norm_text_id(value: Any) -> str:
+    """Normalize object identifiers for robust GeoJSON/CSV matching."""
+    if value is None:
+        return ""
+    return str(value).strip().strip('"').strip().lower()
+
+
+def _if_safe_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if text == "" or text.lower() in {"nan", "none", "null"}:
+            return None
+        if "," in text and "." not in text:
+            text = text.replace(",", ".")
+        v = float(text)
+        return v if np.isfinite(v) else None
+    except Exception:
+        return None
+
+
+def _if_csv_column(fieldnames: Sequence[str], exact_names: Sequence[str] = (), regexes: Sequence[str] = ()) -> Optional[str]:
+    fields = list(fieldnames or [])
+    low_map = {str(c).strip().lower(): c for c in fields}
+    for name in exact_names or []:
+        key = str(name).strip().lower()
+        if key in low_map:
+            return low_map[key]
+    for pattern in regexes or []:
+        rx = re.compile(pattern, flags=re.I)
+        for c in fields:
+            if rx.search(str(c)):
+                return c
+    return None
+
+
+def _if_extract_csv_cell_means(row: Dict[str, Any], max_channels: int = IF_MAX_CHANNELS) -> List[Optional[float]]:
+    """Extract whole-cell channel means from a QuPath measurement CSV row."""
+    values: List[Optional[float]] = [None] * int(max_channels)
+    fallback: List[Optional[float]] = [None] * int(max_channels)
+    for key, value in (row or {}).items():
+        name = str(key or "")
+        lname = name.lower()
+        if "mean" not in lname:
+            continue
+        m = re.search(r"\(\s*c\s*(\d+)\s*\)", name, flags=re.I)
+        if not m:
+            m = re.search(r"\bc\s*(\d+)\b", name, flags=re.I)
+        if not m:
+            continue
+        idx = int(m.group(1)) - 1
+        if not (0 <= idx < max_channels):
+            continue
+        v = _if_safe_float(value)
+        if v is None:
+            continue
+        # Use whole-cell measurements only. Do not use Nucleus/Cytoplasm/Membrane for thresholding.
+        if re.search(r"(^|[^a-z])cell\s*:", lname, flags=re.I):
+            values[idx] = float(v)
+        elif not any(comp in lname for comp in ("nucleus", "cytoplasm", "membrane")):
+            fallback[idx] = float(v)
+    for i in range(int(max_channels)):
+        if values[i] is None and fallback[i] is not None:
+            values[i] = fallback[i]
+    return values
+
+
+class _IFCsvMeasurementIndex:
+    def __init__(self, rows: List[Dict[str, Any]], by_id: Dict[str, int], grid: Dict[Tuple[int, int], List[int]], grid_size: float = 25.0):
+        self.rows = rows
+        self.by_id = by_id
+        self.grid = grid
+        self.grid_size = float(grid_size)
+        self.used = set()
+        self.id_matches = 0
+        self.centroid_matches = 0
+        self.order_matches = 0
+        self.unmatched = 0
+
+    def _grid_key(self, x: float, y: float) -> Tuple[int, int]:
+        gs = max(1.0, self.grid_size)
+        return int(math.floor(float(x) / gs)), int(math.floor(float(y) / gs))
+
+    def match(self, source_id: str, cx: float, cy: float, order_index: int, max_dist_px: float = 35.0) -> Optional[Dict[str, Any]]:
+        sid = _if_norm_text_id(source_id)
+        if sid and sid in self.by_id:
+            idx = self.by_id[sid]
+            if idx not in self.used:
+                self.used.add(idx)
+                self.id_matches += 1
+                return self.rows[idx]
+        best_idx = None
+        best_d2 = None
+        try:
+            gx, gy = self._grid_key(float(cx), float(cy))
+            search_r = max(1, int(math.ceil(float(max_dist_px) / max(1.0, self.grid_size))) + 1)
+            for yy in range(gy - search_r, gy + search_r + 1):
+                for xx in range(gx - search_r, gx + search_r + 1):
+                    for idx in self.grid.get((xx, yy), []):
+                        if idx in self.used:
+                            continue
+                        item = self.rows[idx]
+                        for xcol, ycol in (("cx_px", "cy_px"), ("cx_raw", "cy_raw")):
+                            xval = item.get(xcol)
+                            yval = item.get(ycol)
+                            if xval is None or yval is None:
+                                continue
+                            dx = float(xval) - float(cx)
+                            dy = float(yval) - float(cy)
+                            d2 = dx * dx + dy * dy
+                            if best_d2 is None or d2 < best_d2:
+                                best_d2 = d2
+                                best_idx = idx
+            if best_idx is not None and best_d2 is not None and best_d2 <= float(max_dist_px) ** 2:
+                self.used.add(best_idx)
+                self.centroid_matches += 1
+                return self.rows[best_idx]
+        except Exception:
+            pass
+        try:
+            idx = int(order_index)
+            if 0 <= idx < len(self.rows) and idx not in self.used:
+                self.used.add(idx)
+                self.order_matches += 1
+                return self.rows[idx]
+        except Exception:
+            pass
+        self.unmatched += 1
+        return None
+
+
+def _if_load_csv_measurement_index(csv_path: str, backend: Optional["ImageBackend"] = None, message_cb=None) -> _IFCsvMeasurementIndex:
+    csv_path = str(csv_path or "")
+    if not csv_path or not Path(csv_path).exists():
+        raise FileNotFoundError("Select a valid QuPath measurements CSV.")
+    mpp_x = mpp_y = None
+    try:
+        if backend is not None and getattr(backend, "source_mpp", None):
+            mpp_x, mpp_y = backend.source_mpp
+            mpp_x = float(mpp_x) if mpp_x else None
+            mpp_y = float(mpp_y) if mpp_y else None
+    except Exception:
+        mpp_x = mpp_y = None
+    rows: List[Dict[str, Any]] = []
+    by_id: Dict[str, int] = {}
+    grid: Dict[Tuple[int, int], List[int]] = {}
+    grid_size = 25.0
+    with open(csv_path, "r", newline="", encoding="utf-8-sig", errors="replace") as f:
+        sample = f.read(20000)
+        f.seek(0)
+        delimiter = "\t" if sample.count("\t") > sample.count(",") * 2 else ","
+        reader = csv.DictReader(f, delimiter=delimiter)
+        fieldnames = reader.fieldnames or []
+        id_col = _if_csv_column(fieldnames, exact_names=("Object ID", "object_id", "ID", "id"), regexes=(r"object\s*id",))
+        class_col = _if_csv_column(fieldnames, exact_names=("Classification", "Class", "class"), regexes=(r"classification",))
+        name_col = _if_csv_column(fieldnames, exact_names=("Name", "name"), regexes=(r"^name$",))
+        x_col = _if_csv_column(fieldnames, exact_names=("Centroid X µm", "Centroid X um", "Centroid X", "Centroid X px"), regexes=(r"centroid\s*x",))
+        y_col = _if_csv_column(fieldnames, exact_names=("Centroid Y µm", "Centroid Y um", "Centroid Y", "Centroid Y px"), regexes=(r"centroid\s*y",))
+        if message_cb is not None:
+            message_cb(f"Loading QuPath measurements CSV: id_col={id_col or 'none'}, x_col={x_col or 'none'}, y_col={y_col or 'none'}, mpp=({mpp_x or 'unknown'}, {mpp_y or 'unknown'})")
+        for row in reader:
+            means = _if_extract_csv_cell_means(row, IF_MAX_CHANNELS)
+            oid = row.get(id_col, "") if id_col else ""
+            cx_raw = _if_safe_float(row.get(x_col)) if x_col else None
+            cy_raw = _if_safe_float(row.get(y_col)) if y_col else None
+            cx_px = cy_px = None
+            if cx_raw is not None and cy_raw is not None and mpp_x and mpp_y and mpp_x > 0 and mpp_y > 0:
+                cx_px = float(cx_raw) / float(mpp_x)
+                cy_px = float(cy_raw) / float(mpp_y)
+            elif cx_raw is not None and cy_raw is not None:
+                cx_px = float(cx_raw)
+                cy_px = float(cy_raw)
+            cls = ""
+            if class_col and row.get(class_col):
+                cls = str(row.get(class_col))
+            elif name_col and row.get(name_col):
+                cls = str(row.get(name_col))
+            idx = len(rows)
+            item = {"object_id": str(oid or ""), "class_name": cls, "cx_raw": cx_raw, "cy_raw": cy_raw, "cx_px": cx_px, "cy_px": cy_px, "means": means}
+            rows.append(item)
+            nid = _if_norm_text_id(oid)
+            if nid and nid not in by_id:
+                by_id[nid] = idx
+            for xv, yv in ((cx_px, cy_px), (cx_raw, cy_raw)):
+                if xv is None or yv is None:
+                    continue
+                key = (int(math.floor(float(xv) / grid_size)), int(math.floor(float(yv) / grid_size)))
+                grid.setdefault(key, []).append(idx)
+            if message_cb is not None and idx > 0 and idx % 50000 == 0:
+                message_cb(f"Loaded {idx:,} measurement rows from CSV...")
+    if message_cb is not None:
+        n_means = sum(1 for item in rows if any(v is not None for v in item.get("means", [])))
+        message_cb(f"CSV measurement index ready: {len(rows):,} rows | rows with Cell mean C#={n_means:,} | object IDs={len(by_id):,}")
+    return _IFCsvMeasurementIndex(rows, by_id, grid, grid_size=grid_size)
+
+
+def _if_build_cell_cache_from_csv(image_path: str, geojson_path: str, csv_path: str, cache_path: str,
+                                  cancel_event=None, progress_cb=None, message_cb=None,
+                                  max_cell_area_px: float = IF_DEFAULT_MAX_CELL_AREA_PX) -> Dict[str, Any]:
+    import sqlite3
+    import zlib
+    image_path = str(image_path or "")
+    geojson_path = str(geojson_path or "")
+    csv_path = str(csv_path or "")
+    cache_path = str(cache_path or _if_default_cache_path(image_path, geojson_path))
+    try:
+        max_cell_area_px = float(max_cell_area_px)
+    except Exception:
+        max_cell_area_px = float(IF_DEFAULT_MAX_CELL_AREA_PX)
+    if max_cell_area_px <= 0:
+        max_cell_area_px = float('inf')
+    if not image_path or not Path(image_path).exists():
+        raise FileNotFoundError("Select a valid IF image before building the cache.")
+    if not geojson_path or not Path(geojson_path).exists():
+        raise FileNotFoundError("Select a valid cell GeoJSON before building the cache.")
+    if not csv_path or not Path(csv_path).exists():
+        raise FileNotFoundError("Select a valid QuPath measurements CSV.")
+    requested_cache_path = Path(cache_path)
+    requested_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    build_cache_path = requested_cache_path.with_name(f"{requested_cache_path.stem}_CSVfast_{stamp}{requested_cache_path.suffix}")
+    cache_path = str(build_cache_path)
+    if message_cb is not None:
+        message_cb(f"Building fast CSV-backed cache: {build_cache_path.name}")
+    backend = _if_load_measurement_backend(image_path)
+    try:
+        if message_cb is not None:
+            message_cb("Scanning GeoJSON coordinate extent for image/GeoJSON scale check...")
+        geo_extent = _if_probe_geojson_extent(geojson_path, cancel_event=cancel_event, progress_cb=progress_cb, message_cb=message_cb)
+        scale_info = _if_auto_coordinate_scale(getattr(backend, "slide_dims", (1, 1)), geo_extent)
+        geo_scale_x = float(scale_info.get("scale_x", 1.0))
+        geo_scale_y = float(scale_info.get("scale_y", 1.0))
+        total_expected = int(geo_extent.get("cell_count_probe", 0) or 0)
+        if message_cb is not None:
+            message_cb(f"GeoJSON scale check: image={getattr(backend, 'slide_dims', None)} | ratio=({float(scale_info.get('ratio_x', 1)):.3g}, {float(scale_info.get('ratio_y', 1)):.3g}) | scale=({geo_scale_x:.6g}, {geo_scale_y:.6g}) | valid objects≈{total_expected:,}")
+        csv_index = _if_load_csv_measurement_index(csv_path, backend=backend, message_cb=message_cb)
+        con = sqlite3.connect(cache_path)
+        try:
+            _if_initialize_cache_schema(con)
+            con.execute("DELETE FROM cells")
+            con.execute("DELETE FROM large_rois")
+            con.execute("DELETE FROM meta")
+            con.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", [
+                ("image_path", image_path), ("geojson_path", geojson_path), ("csv_path", csv_path),
+                ("created", datetime.now().isoformat(timespec="seconds")), ("software", f"{APP_NAME} v{APP_VERSION}"),
+                ("format", "IF Cell Threshold Explorer CSV-backed cache v1"), ("build_complete", "0"),
+                ("requested_cache_path", str(requested_cache_path)), ("actual_cache_path", str(build_cache_path)),
+                ("measurement", "mean intensity imported from QuPath measurements CSV Cell: ... (C#): Mean columns"),
+                ("measurement_source", "csv"), ("max_cell_area_px", str(max_cell_area_px)),
+                ("large_area_filter", "features with area_px > max_cell_area_px are treated as large annotations/ROIs and skipped"),
+                ("image_reader", str(getattr(backend, "reader", "unknown"))),
+                ("image_dims", "x".join(str(v) for v in (getattr(backend, "slide_dims", None) or ()))),
+                ("image_mpp", "x".join(str(v) for v in (getattr(backend, "source_mpp", None) or ()))),
+                ("geojson_coord_ratio_x", str(scale_info.get("ratio_x", ""))),
+                ("geojson_coord_ratio_y", str(scale_info.get("ratio_y", ""))),
+                ("geojson_to_image_scale_x", str(geo_scale_x)), ("geojson_to_image_scale_y", str(geo_scale_y)),
+                ("geojson_scale_mode", str(scale_info.get("mode", ""))),
+            ])
+            insert_sql = """
+                INSERT INTO cells(
+                    source_id, class_name, minx, miny, maxx, maxy, cx, cy, area,
+                    c0_mean, c1_mean, c2_mean, c3_mean, c4_mean, c5_mean, c6_mean, c7_mean, geom_z
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            large_roi_sql = """
+                INSERT INTO large_rois(source_id, class_name, minx, miny, maxx, maxy, cx, cy, area, geom_z)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            batch = []
+            count = 0
+            feature_index = 0
+            skipped = 0
+            skipped_large_area = 0
+            csv_matched = 0
+            csv_with_means = 0
+            csv_missing = 0
+            if message_cb is not None:
+                message_cb(f"Building cache from CSV measurements for approximately {total_expected:,} GeoJSON objects...")
+            if progress_cb is not None:
+                progress_cb(0, total_expected if total_expected > 0 else 0)
+            for feature in _iter_geojson_features_stream(geojson_path):
+                _check_cancel(cancel_event)
+                if not isinstance(feature, dict):
+                    skipped += 1; feature_index += 1; continue
+                props = feature.get("properties", {}) or {}
+                geom = feature.get("geometry") if "geometry" in feature else feature
+                rings = _geojson_geometry_to_rings(geom)
+                if not rings:
+                    skipped += 1; feature_index += 1; continue
+                rings = _if_scale_rings(rings, geo_scale_x, geo_scale_y)
+                bbox = _if_ring_bbox(rings)
+                if bbox is None:
+                    skipped += 1; feature_index += 1; continue
+                minx, miny, maxx, maxy = bbox
+                area, cx, cy = _if_rings_area_centroid(rings)
+                try:
+                    if float(area) > float(max_cell_area_px):
+                        skipped_large_area += 1; skipped += 1
+                        cls_large = _geojson_feature_class_name(feature, props)
+                        source_id_large = str(feature.get("id", props.get("id", props.get("object_id", f"large_roi_{skipped_large_area}"))))
+                        geom_z_large = sqlite3.Binary(zlib.compress(_if_json_dumps_compact(rings).encode("utf-8"), level=1))
+                        con.execute(large_roi_sql, (source_id_large, cls_large, minx, miny, maxx, maxy, cx, cy, area, geom_z_large))
+                        if skipped_large_area % 10 == 0:
+                            con.commit()
+                        feature_index += 1; continue
+                except Exception:
+                    pass
+                source_id = str(feature.get("id", props.get("id", props.get("object_id", feature_index + 1))))
+                csv_item = csv_index.match(source_id, cx, cy, feature_index)
+                if csv_item is not None:
+                    csv_matched += 1
+                    means = list(csv_item.get("means", [None] * IF_MAX_CHANNELS))[:IF_MAX_CHANNELS]
+                    if any(v is not None for v in means):
+                        csv_with_means += 1
+                    else:
+                        csv_missing += 1
+                else:
+                    means = [None] * IF_MAX_CHANNELS
+                    csv_missing += 1
+                cls_geo = _geojson_feature_class_name(feature, props)
+                cls_csv = str(csv_item.get("class_name", "")) if csv_item else ""
+                cls = cls_geo if cls_geo and cls_geo != "annotation" else (cls_csv or cls_geo or "Cell")
+                geom_z = sqlite3.Binary(zlib.compress(_if_json_dumps_compact(rings).encode("utf-8"), level=1))
+                batch.append([source_id, cls, minx, miny, maxx, maxy, cx, cy, area] + means + [geom_z])
+                count += 1
+                feature_index += 1
+                if len(batch) >= 2000:
+                    con.executemany(insert_sql, batch); con.commit(); batch.clear()
+                    if message_cb is not None:
+                        message_cb(f"CSV-backed cache: {count:,}/{total_expected:,} objects cached | CSV matched {csv_matched:,} | with means {csv_with_means:,} | missing {csv_missing:,} | large ROIs skipped {skipped_large_area:,}")
+                    if progress_cb is not None:
+                        progress_cb(feature_index, total_expected if total_expected > 0 else 0)
+            if batch:
+                con.executemany(insert_sql, batch); con.commit()
+            con.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", [
+                ("cell_count", str(count)), ("skipped_count", str(skipped)),
+                ("measured_count", str(csv_with_means)), ("measurement_failed_count", str(csv_missing)),
+                ("csv_row_count", str(len(csv_index.rows))), ("csv_matched_count", str(csv_matched)),
+                ("csv_with_means_count", str(csv_with_means)), ("csv_missing_count", str(csv_missing)),
+                ("csv_id_matches", str(csv_index.id_matches)), ("csv_centroid_matches", str(csv_index.centroid_matches)),
+                ("csv_order_matches", str(csv_index.order_matches)), ("csv_unmatched", str(csv_index.unmatched)),
+                ("skipped_large_area_count", str(skipped_large_area)), ("large_roi_count", str(skipped_large_area)), ("build_complete", "1"),
+                ("completed", datetime.now().isoformat(timespec="seconds")),
+            ])
+            con.commit()
+            try:
+                con.execute("ANALYZE"); con.commit()
+            except Exception:
+                pass
+            if progress_cb is not None:
+                progress_cb(count, total_expected if total_expected > 0 else count)
+            return {
+                "cache_path": cache_path, "cell_count": count, "skipped_count": skipped,
+                "measured_count": csv_with_means, "measurement_failed_count": csv_missing,
+                "skipped_large_area_count": skipped_large_area, "large_roi_count": skipped_large_area, "max_cell_area_px": max_cell_area_px,
+                "geo_scale_x": geo_scale_x, "geo_scale_y": geo_scale_y,
+                "geo_ratio_x": scale_info.get("ratio_x", 1.0), "geo_ratio_y": scale_info.get("ratio_y", 1.0),
+                "geo_scale_mode": scale_info.get("mode", ""), "measurement_source": "csv",
+                "csv_path": csv_path, "csv_row_count": len(csv_index.rows), "csv_matched_count": csv_matched,
+                "csv_with_means_count": csv_with_means, "csv_missing_count": csv_missing,
+                "csv_id_matches": csv_index.id_matches, "csv_centroid_matches": csv_index.centroid_matches,
+                "csv_order_matches": csv_index.order_matches, "task": "if_cache",
+            }
+        finally:
+            con.close()
+    finally:
+        try:
+            backend.close()
+        except Exception:
+            pass
+
+def _if_build_cache_job(cancel_event, progress_cb, message_cb, image_path, geojson_path, cache_path, max_cell_area_px=IF_DEFAULT_MAX_CELL_AREA_PX, csv_path=""):
+    if csv_path and Path(str(csv_path)).exists():
+        return _if_build_cell_cache_from_csv(
+            image_path=image_path,
+            geojson_path=geojson_path,
+            csv_path=str(csv_path),
+            cache_path=cache_path,
+            cancel_event=cancel_event,
+            progress_cb=progress_cb,
+            message_cb=message_cb,
+            max_cell_area_px=max_cell_area_px,
+        )
+    return _if_build_cell_cache(
+        image_path=image_path,
+        geojson_path=geojson_path,
+        cache_path=cache_path,
+        cancel_event=cancel_event,
+        progress_cb=progress_cb,
+        message_cb=message_cb,
+        max_cell_area_px=max_cell_area_px,
+    )
+
+
+def _if_cache_meta(cache_path: str) -> Dict[str, str]:
+    """Read cache metadata and provide safe fallbacks for older/partial caches."""
+    if not cache_path or not Path(cache_path).exists():
+        return {}
+    con = _if_connect_cache(cache_path)
+    try:
+        meta = {}
+        try:
+            rows = con.execute("SELECT key, value FROM meta").fetchall()
+            meta = {str(r["key"]): str(r["value"]) for r in rows}
+        except Exception:
+            meta = {}
+        # Older caches did not store build_complete. Treat caches with cell_count
+        # as complete, but caches without cell_count as partial/incomplete.
+        if "build_complete" not in meta:
+            meta["build_complete"] = "1" if meta.get("cell_count") else "0"
+        # If cell_count is missing, count current rows only for diagnostics.
+        if not meta.get("cell_count"):
+            try:
+                meta["partial_row_count"] = str(int(con.execute("SELECT COUNT(*) FROM cells").fetchone()[0]))
+            except Exception:
+                meta["partial_row_count"] = "?"
+        return meta
+    finally:
+        con.close()
+
+def _if_row_positive_channels(row, thresholds: Sequence[float], enabled_channels: Sequence[bool]) -> List[int]:
+    pos = []
+    for i in range(IF_MAX_CHANNELS):
+        if i >= len(thresholds) or i >= len(enabled_channels) or not enabled_channels[i]:
+            continue
+        value = row[f"c{i}_mean"]
+        if value is None:
+            continue
+        try:
+            if float(value) >= float(thresholds[i]):
+                pos.append(i)
+        except Exception:
+            pass
+    return pos
+
+
+def _if_centroid_ring(cx: float, cy: float, radius: float = 4.0, n: int = 10):
+    pts = []
+    r = max(1.0, float(radius))
+    for k in range(max(6, int(n))):
+        a = 2.0 * math.pi * k / max(6, int(n))
+        pts.append((float(cx) + math.cos(a) * r, float(cy) + math.sin(a) * r))
+    return pts
+
+
+def _if_query_visible_cells(cache_path: str, roi_full: Tuple[int, int, int, int], limit: int = 50000,
+                            sample_if_needed: bool = True, return_info: bool = False,
+                            max_area_px: Optional[float] = None):
+    """Return cells intersecting the current ROI without overwhelming the GUI.
+
+    If the ROI contains more cells than the display limit, a deterministic
+    id-modulo sample is returned instead of the first N rows. This gives a much
+    better low-zoom overview while keeping drawing light.
+    """
+    if not cache_path or not Path(cache_path).exists() or roi_full is None:
+        if return_info:
+            return [], {"total": 0, "sampled": False, "sample_step": 1, "limit": int(limit or 0), "incomplete": False}
+        return []
+    meta = _if_cache_meta(cache_path)
+    # Do not use a cache that is still being built or was interrupted before
+    # the final cell_count/build_complete metadata was written.
+    if str(meta.get("build_complete", "0")) != "1":
+        if return_info:
+            return [], {"total": 0, "sampled": False, "sample_step": 1, "limit": int(limit or 0), "incomplete": True, "partial_rows": meta.get("partial_row_count", "?")}
+        return []
+    x, y, w, h = [float(v) for v in roi_full]
+    try:
+        max_area_px = float(max_area_px) if max_area_px not in (None, '') else None
+    except Exception:
+        max_area_px = None
+    if max_area_px is not None and max_area_px <= 0:
+        max_area_px = None
+    x2 = x + w
+    y2 = y + h
+    limit = max(1, int(limit or 1))
+    con = _if_connect_cache(cache_path)
+    try:
+        where = "maxx >= ? AND minx <= ? AND maxy >= ? AND miny <= ?"
+        params = (x, x2, y, y2)
+        if max_area_px is not None:
+            where += " AND area <= ?"
+            params = params + (float(max_area_px),)
+        try:
+            total = int(con.execute(f"SELECT COUNT(*) FROM cells WHERE {where}", params).fetchone()[0])
+        except Exception:
+            total = 0
+        sample_step = 1
+        sampled = False
+        extra_where = ""
+        extra_params = []
+        if sample_if_needed and total > limit:
+            sample_step = max(1, int(math.ceil(float(total) / float(limit))))
+            sampled = True
+            extra_where = " AND (id % ?) = 0"
+            extra_params.append(sample_step)
+        sql = f"""
+            SELECT id, source_id, class_name, minx, miny, maxx, maxy, cx, cy, area,
+                   {', '.join([f'c{i}_mean' for i in range(IF_MAX_CHANNELS)])}, geom_z
+            FROM cells
+            WHERE {where}{extra_where}
+            LIMIT ?
+        """
+        rows = con.execute(sql, params + tuple(extra_params) + (limit,)).fetchall()
+        info = {"total": total, "sampled": sampled, "sample_step": sample_step, "limit": limit, "returned": len(rows)}
+        return (rows, info) if return_info else rows
+    finally:
+        con.close()
+
+
+def _if_query_visible_large_rois(cache_path: str, roi_full: Tuple[int, int, int, int], limit: int = 50):
+    """Return large tissue/annotation ROIs intersecting the current view.
+
+    These are stored when objects exceed Max cell area during cache build. They
+    are not painted as cell overlays, but can be used as a tissue mask for
+    pixel-level threshold preview.
+    """
+    if not cache_path or not Path(cache_path).exists() or roi_full is None:
+        return []
+    x, y, w, h = [float(v) for v in roi_full]
+    x2 = x + w
+    y2 = y + h
+    con = _if_connect_cache(cache_path)
+    try:
+        try:
+            rows = con.execute(
+                """
+                SELECT id, source_id, class_name, minx, miny, maxx, maxy, cx, cy, area, geom_z
+                FROM large_rois
+                WHERE maxx >= ? AND minx <= ? AND maxy >= ? AND miny <= ?
+                ORDER BY area DESC
+                LIMIT ?
+                """,
+                (x, x2, y, y2, max(1, int(limit or 1))),
+            ).fetchall()
+            return rows
+        except Exception:
+            return []
+    finally:
+        con.close()
+
+
+def _if_rasterize_roi_rows_to_mask(roi_rows, roi_full: Tuple[int, int, int, int], out_shape_hw: Tuple[int, int]) -> np.ndarray:
+    """Rasterize large ROI rows into the current preview pixel grid."""
+    import zlib
+    from PIL import Image, ImageDraw
+    h, w = int(out_shape_hw[0]), int(out_shape_hw[1])
+    if h <= 0 or w <= 0:
+        return np.zeros((0, 0), dtype=bool)
+    mask_img = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(mask_img)
+    rx, ry, rw, rh = [float(v) for v in roi_full]
+    if rw <= 0 or rh <= 0:
+        return np.zeros((h, w), dtype=bool)
+
+    def map_pt(x, y):
+        px = (float(x) - rx) / rw * float(w)
+        py = (float(y) - ry) / rh * float(h)
+        return (px, py)
+
+    for row in roi_rows or []:
+        try:
+            blob = row["geom_z"]
+            rings = json.loads(zlib.decompress(blob).decode("utf-8")) if blob is not None else []
+        except Exception:
+            rings = []
+        for ring in rings or []:
+            pts = []
+            for pt in ring or []:
+                try:
+                    x, y = float(pt[0]), float(pt[1])
+                    if np.isfinite(x) and np.isfinite(y):
+                        pts.append(map_pt(x, y))
+                except Exception:
+                    continue
+            if len(pts) >= 3:
+                draw.polygon(pts, outline=1, fill=1)
+    return np.asarray(mask_img, dtype=np.uint8) > 0
+
+
+def _if_alpha_blend_mask(rgb: np.ndarray, mask: np.ndarray, color: QColor, alpha: float):
+    """Alpha blend a single QColor over rgb where mask is True."""
+    if mask is None or not np.any(mask):
+        return rgb
+    a = max(0.0, min(1.0, float(alpha)))
+    if a <= 0:
+        return rgb
+    c = np.array([color.red(), color.green(), color.blue()], dtype=np.float32)
+    out = rgb.astype(np.float32, copy=False)
+    out[mask] = out[mask] * (1.0 - a) + c * a
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _if_apply_tissue_pixel_threshold_overlay(
+    rgb: np.ndarray,
+    raw_arr: np.ndarray,
+    axes: str,
+    roi_full: Tuple[int, int, int, int],
+    cache_path: Optional[str],
+    thresholds: Sequence[float],
+    enabled_channels: Sequence[bool],
+    show_positive: Sequence[bool],
+    show_negative: bool,
+    show_multi: bool,
+    opacity: int = 120,
+    restrict_to_large_roi: bool = True,
+):
+    """Apply a fast pixel-level threshold overlay to the current displayed ROI.
+
+    This uses the already-loaded preview/ROI array, not the full-resolution image,
+    so it remains fast for panning/zooming. If restrict_to_large_roi is enabled,
+    pixels are classified only inside large tissue annotation polygons stored in
+    the cache. At low zoom this is an overview; at higher zoom it becomes closer
+    to the native data.
+    """
+    out = _to_uint8_rgb(rgb).copy()
+    stats = {"tissue_pixels": 0, "shown_pixels": 0, "large_rois": 0, "masked": False}
+    for i in range(IF_MAX_CHANNELS):
+        stats[f"C{i + 1}+"] = 0
+    stats["multi"] = 0
+    stats["negative"] = 0
+    if raw_arr is None or roi_full is None:
+        return out, stats
+    try:
+        raw_yxc, raw_axes = _if_raw_crop_to_yxc(raw_arr, axes)
+    except Exception:
+        return out, stats
+    raw_yxc = np.asarray(raw_yxc)
+    if raw_yxc.ndim == 2:
+        raw_yxc = raw_yxc[:, :, None]
+    h, w = out.shape[:2]
+    if raw_yxc.shape[0] != h or raw_yxc.shape[1] != w:
+        # Conservative fallback: skip if raw and RGB are not aligned.
+        return out, stats
+
+    if restrict_to_large_roi:
+        large_rows = _if_query_visible_large_rois(str(cache_path), roi_full, limit=50) if cache_path else []
+        stats["large_rois"] = len(large_rows)
+        tissue_mask = _if_rasterize_roi_rows_to_mask(large_rows, roi_full, (h, w)) if large_rows else np.zeros((h, w), dtype=bool)
+        stats["masked"] = True
+    else:
+        tissue_mask = np.ones((h, w), dtype=bool)
+        stats["masked"] = False
+    if not np.any(tissue_mask):
+        return out, stats
+    stats["tissue_pixels"] = int(np.count_nonzero(tissue_mask))
+
+    n_ch = min(raw_yxc.shape[2], IF_MAX_CHANNELS)
+    pos_count = np.zeros((h, w), dtype=np.uint8)
+    first_pos = np.full((h, w), -1, dtype=np.int16)
+    for ch in range(n_ch):
+        if ch >= len(enabled_channels) or not enabled_channels[ch]:
+            continue
+        try:
+            mask = (raw_yxc[:, :, ch].astype(np.float32, copy=False) >= float(thresholds[ch])) & tissue_mask
+        except Exception:
+            continue
+        stats[f"C{ch + 1}+"] = int(np.count_nonzero(mask))
+        first_pos[(first_pos < 0) & mask] = ch
+        pos_count[mask] += 1
+
+    alpha = max(0, min(255, int(opacity))) / 255.0
+    # Negative first, then single positives, then multi-positive on top.
+    if show_negative:
+        neg_mask = (pos_count == 0) & tissue_mask
+        stats["negative"] = int(np.count_nonzero(neg_mask))
+        out = _if_alpha_blend_mask(out, neg_mask, IF_STATUS_COLORS.get("Negative", QColor(150, 150, 150)), alpha)
+    else:
+        stats["negative"] = int(np.count_nonzero((pos_count == 0) & tissue_mask))
+
+    for ch in range(n_ch):
+        if ch >= len(show_positive) or not show_positive[ch]:
+            continue
+        single_mask = (pos_count == 1) & (first_pos == ch) & tissue_mask
+        if np.any(single_mask):
+            out = _if_alpha_blend_mask(out, single_mask, IF_STATUS_COLORS.get(f"C{ch + 1}+", _deterministic_qcolor_for_text(f"C{ch + 1}+")), alpha)
+
+    multi_mask = (pos_count >= 2) & tissue_mask
+    stats["multi"] = int(np.count_nonzero(multi_mask))
+    if show_multi and np.any(multi_mask):
+        out = _if_alpha_blend_mask(out, multi_mask, IF_STATUS_COLORS.get("Multi+", QColor(255, 220, 0)), alpha)
+    elif not show_multi:
+        # If multi overlay is disabled, show multi-positive pixels as the first
+        # enabled positive channel that passes, when that channel is visible.
+        for ch in range(n_ch):
+            if ch >= len(show_positive) or not show_positive[ch]:
+                continue
+            m = multi_mask & (first_pos == ch)
+            if np.any(m):
+                out = _if_alpha_blend_mask(out, m, IF_STATUS_COLORS.get(f"C{ch + 1}+", _deterministic_qcolor_for_text(f"C{ch + 1}+")), alpha)
+
+    shown = np.zeros((h, w), dtype=bool)
+    if show_negative:
+        shown |= (pos_count == 0) & tissue_mask
+    for ch in range(n_ch):
+        if ch < len(show_positive) and show_positive[ch]:
+            shown |= (pos_count == 1) & (first_pos == ch) & tissue_mask
+    if show_multi:
+        shown |= multi_mask
+    stats["shown_pixels"] = int(np.count_nonzero(shown))
+    return out, stats
+
+
+def _if_visible_rows_to_annotations(rows, thresholds: Sequence[float], enabled_channels: Sequence[bool],
+                                    show_positive: Sequence[bool], show_negative: bool,
+                                    show_multi: bool, use_polygons: bool,
+                                    centroid_radius: float = 4.0) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    import zlib
+    annotations = []
+    stats = {"visible": 0, "shown": 0, "negative": 0, "multi": 0}
+    for i in range(IF_MAX_CHANNELS):
+        stats[f"C{i + 1}+"] = 0
+    for row in rows or []:
+        stats["visible"] += 1
+        pos = _if_row_positive_channels(row, thresholds, enabled_channels)
+        for ch in pos:
+            stats[f"C{ch + 1}+"] += 1
+        if len(pos) >= 2:
+            stats["multi"] += 1
+        if not pos:
+            stats["negative"] += 1
+
+        # Display filtering.
+        if len(pos) >= 2 and show_multi:
+            cls = "Multi+"
+        elif len(pos) == 1:
+            ch = pos[0]
+            if ch >= len(show_positive) or not show_positive[ch]:
+                continue
+            cls = f"C{ch + 1}+"
+        elif not pos and show_negative:
+            cls = "Negative"
+        else:
+            continue
+
+        if len(pos) >= 2 and not show_multi:
+            # If multi checkbox is off, still allow display under individual channels.
+            shown_individual = False
+            for ch in pos:
+                if ch < len(show_positive) and show_positive[ch]:
+                    cls = f"C{ch + 1}+"
+                    shown_individual = True
+                    break
+            if not shown_individual:
+                continue
+
+        color = IF_STATUS_COLORS.get(cls, _deterministic_qcolor_for_text(cls))
+        rings = None
+        if use_polygons:
+            try:
+                blob = row["geom_z"]
+                if blob is not None:
+                    rings = json.loads(zlib.decompress(blob).decode("utf-8"))
+            except Exception:
+                rings = None
+        if not rings:
+            rings = [_if_centroid_ring(row["cx"], row["cy"], radius=centroid_radius)]
+        annotations.append({
+            "id": row["id"],
+            "class_name": cls,
+            "rings": rings,
+            "color": color,
+            "properties": {
+                "source_id": row["source_id"],
+                "area": row["area"],
+                "positive_channels": ",".join([f"C{ch + 1}" for ch in pos]),
+            },
+        })
+        stats["shown"] += 1
+    return annotations, stats
+
+
+def _if_export_rows_to_csv(cache_path: str, roi_full: Tuple[int, int, int, int], out_path: str,
+                           thresholds: Sequence[float], enabled_channels: Sequence[bool],
+                           max_area_px: Optional[float] = IF_DEFAULT_MAX_CELL_AREA_PX):
+    rows = _if_query_visible_cells(cache_path, roi_full, limit=1_000_000, max_area_px=max_area_px)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["id", "source_id", "class_name", "cx", "cy", "area"] + [f"c{i}_mean" for i in range(IF_MAX_CHANNELS)] + ["positive_channels"]
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            pos = _if_row_positive_channels(row, thresholds, enabled_channels)
+            writer.writerow({
+                "id": row["id"],
+                "source_id": row["source_id"],
+                "class_name": row["class_name"],
+                "cx": row["cx"],
+                "cy": row["cy"],
+                "area": row["area"],
+                **{f"c{i}_mean": row[f"c{i}_mean"] for i in range(IF_MAX_CHANNELS)},
+                "positive_channels": ";".join([f"C{ch + 1}" for ch in pos]),
+            })
+    return out_path, len(rows)
+
+
 def draw_geojson_annotations_on_rgb(rgb: np.ndarray, annotations: List[Dict[str, Any]], roi_full: Tuple[int, int, int, int],
                                     color: Optional[QColor] = None, opacity: int = 110,
                                     fill: bool = True, boundary_width: int = 2,
@@ -4993,6 +6822,9 @@ class TileCapturePopup(QDialog):
         controls.addWidget(self.save_btn)
         layout.addLayout(controls)
 
+
+
+
     def closeEvent(self, event):
         # Keep the dialog reusable and synchronize the checkbox in the main panel.
         event.ignore()
@@ -5059,6 +6891,660 @@ class ThumbnailExplorerWorker(QThread):
 # ============================================================
 
 class WSICropTileMergeGUI(QMainWindow):
+    # ========================================================
+    # IF Threshold Explorer page
+    # ========================================================
+
+    def _build_if_threshold_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        file_box = QGroupBox("IF Cell Threshold Explorer - image + cell GeoJSON + optional QuPath CSV")
+        file_grid = QGridLayout(file_box)
+        img_btn = QPushButton("Load IF image")
+        img_btn.clicked.connect(self.load_if_image_file)
+        geo_btn = QPushButton("Load cell GeoJSON")
+        geo_btn.clicked.connect(self.load_if_geojson_file)
+        csv_btn = QPushButton("Load measurements CSV")
+        csv_btn.clicked.connect(self.load_if_measurements_csv_file)
+        cache_btn = QPushButton("Open existing cache")
+        cache_btn.clicked.connect(self.open_if_cache_file)
+        build_btn = QPushButton("Build / rebuild cache")
+        build_btn.setToolTip("If a QuPath measurements CSV is loaded, build is fast and imports Cell: ... (C#): Mean. Otherwise it measures means from raw image pixels.")
+        build_btn.clicked.connect(self.build_if_cache)
+        self.if_image_label = QLabel("Image: none")
+        self.if_geojson_label = QLabel("GeoJSON: none")
+        self.if_csv_label = QLabel("CSV: none (optional but much faster)")
+        self.if_cache_label = QLabel("Cache: none")
+        for lbl in (self.if_image_label, self.if_geojson_label, self.if_csv_label, self.if_cache_label):
+            lbl.setStyleSheet("padding: 6px; border: 1px solid #bdc3c7; border-radius: 5px;")
+            lbl.setWordWrap(True)
+        file_grid.addWidget(img_btn, 0, 0)
+        file_grid.addWidget(self.if_image_label, 0, 1, 1, 4)
+        file_grid.addWidget(geo_btn, 1, 0)
+        file_grid.addWidget(self.if_geojson_label, 1, 1, 1, 4)
+        file_grid.addWidget(csv_btn, 2, 0)
+        file_grid.addWidget(self.if_csv_label, 2, 1, 1, 4)
+        file_grid.addWidget(cache_btn, 3, 0)
+        file_grid.addWidget(build_btn, 3, 1)
+        file_grid.addWidget(self.if_cache_label, 3, 2, 1, 3)
+        layout.addWidget(file_box)
+
+        main = QHBoxLayout()
+        main.setSpacing(10)
+
+        left_panel = QWidget()
+        left_panel.setMinimumWidth(360)
+        left_panel.setMaximumWidth(430)
+        left_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        left = QVBoxLayout(left_panel)
+        left.setContentsMargins(0, 0, 0, 0)
+
+        self.if_channel_table = QTableWidget()
+        self.if_channel_table.setColumnCount(3)
+        self.if_channel_table.setHorizontalHeaderLabels(["On", "Channel", "Color"])
+        self.if_channel_table.setColumnWidth(0, 45)
+        self.if_channel_table.setColumnWidth(1, 90)
+        self.if_channel_table.setColumnWidth(2, 140)
+        self.if_channel_table.verticalHeader().setVisible(False)
+        self.if_channel_table.verticalHeader().setDefaultSectionSize(24)
+        self.if_channel_table.setMaximumHeight(190)
+        left.addWidget(QLabel("IF display channels"))
+        left.addWidget(self.if_channel_table)
+
+        threshold_box = QGroupBox("Thresholds and visible positivity")
+        th_grid = QGridLayout(threshold_box)
+        self.if_threshold_spins = []
+        self.if_show_pos_checks = []
+        for i in range(4):
+            th_grid.addWidget(QLabel(f"C{i + 1}"), i, 0)
+            spin = QDoubleSpinBox()
+            spin.setRange(-1_000_000_000, 1_000_000_000)
+            spin.setDecimals(3)
+            spin.setSingleStep(10.0)
+            spin.setValue(float(IF_DEFAULT_THRESHOLDS[i]))
+            spin.valueChanged.connect(lambda *_: self.schedule_if_threshold_update())
+            self.if_threshold_spins.append(spin)
+            th_grid.addWidget(spin, i, 1)
+            chk = QCheckBox(f"show C{i + 1}+")
+            chk.setChecked(i in (1, 2, 3))
+            chk.stateChanged.connect(lambda *_: self.schedule_if_threshold_update())
+            self.if_show_pos_checks.append(chk)
+            th_grid.addWidget(chk, i, 2)
+        self.if_show_multi_chk = QCheckBox("show multi-positive")
+        self.if_show_multi_chk.setChecked(True)
+        self.if_show_multi_chk.stateChanged.connect(lambda *_: self.schedule_if_threshold_update())
+        self.if_show_negative_chk = QCheckBox("show negative")
+        self.if_show_negative_chk.setChecked(False)
+        self.if_show_negative_chk.stateChanged.connect(lambda *_: self.schedule_if_threshold_update())
+        th_grid.addWidget(self.if_show_multi_chk, 4, 0, 1, 2)
+        th_grid.addWidget(self.if_show_negative_chk, 4, 2)
+        left.addWidget(threshold_box)
+
+        overlay_box = QGroupBox("Overlay mode")
+        overlay_grid = QGridLayout(overlay_box)
+        self.if_overlay_enabled_chk = QCheckBox("Show overlay / annotations")
+        self.if_overlay_enabled_chk.setChecked(True)
+        self.if_overlay_enabled_chk.setToolTip("Fast toggle to compare the IF image with/without threshold overlays.")
+        self.if_overlay_enabled_chk.stateChanged.connect(lambda *_: self.schedule_if_threshold_update(delay_ms=0))
+        self.if_analysis_level_combo = QComboBox()
+        self.if_analysis_level_combo.addItems(["Cell level", "Tissue pixel level", "Cell + tissue"])
+        self.if_analysis_level_combo.setToolTip("Cell level uses GeoJSON/CSV cells. Tissue pixel level thresholds pixels inside the large tissue ROI using the current image view.")
+        self.if_analysis_level_combo.currentIndexChanged.connect(lambda *_: self.schedule_if_threshold_update())
+        self.if_overlay_mode_combo = QComboBox()
+        self.if_overlay_mode_combo.addItems(["Centroids only (fastest)", "Polygons when zoom >= 800%", "Polygons always"])
+        self.if_overlay_mode_combo.currentIndexChanged.connect(lambda *_: self.schedule_if_threshold_update())
+        self.if_opacity_slider = QSlider(Qt.Horizontal)
+        self.if_opacity_slider.setRange(0, 100)
+        self.if_opacity_slider.setValue(55)
+        self.if_opacity_slider.valueChanged.connect(lambda *_: self.schedule_if_threshold_update())
+        self.if_opacity_value_label = QLabel("55%")
+        self.if_fill_chk = QCheckBox("Fill overlay")
+        self.if_fill_chk.setChecked(True)
+        self.if_fill_chk.stateChanged.connect(lambda *_: self.schedule_if_threshold_update())
+        self.if_limit_spin = QSpinBox()
+        self.if_limit_spin.setRange(500, 500000)
+        self.if_limit_spin.setValue(50000)
+        self.if_limit_spin.setSingleStep(5000)
+        self.if_limit_spin.valueChanged.connect(lambda *_: self.schedule_if_threshold_update())
+        self.if_max_area_spin = QDoubleSpinBox()
+        self.if_max_area_spin.setRange(0, 1_000_000_000)
+        self.if_max_area_spin.setDecimals(0)
+        self.if_max_area_spin.setSingleStep(5000)
+        self.if_max_area_spin.setValue(float(IF_DEFAULT_MAX_CELL_AREA_PX))
+        self.if_max_area_spin.setToolTip("Maximum object area in pixels to treat as a cell. Large tissue/annotation polygons above this value are saved as tissue ROIs, not cell overlays. Set 0 to disable.")
+        self.if_max_area_spin.valueChanged.connect(lambda *_: self.schedule_if_threshold_update())
+        self.if_tissue_large_roi_chk = QCheckBox("Tissue pixels only inside large ROI")
+        self.if_tissue_large_roi_chk.setChecked(True)
+        self.if_tissue_large_roi_chk.setToolTip("When using Tissue pixel level, restrict pixel thresholding to the large tissue annotation stored in the cache.")
+        self.if_tissue_large_roi_chk.stateChanged.connect(lambda *_: self.schedule_if_threshold_update())
+        overlay_grid.addWidget(self.if_overlay_enabled_chk, 0, 0, 1, 3)
+        overlay_grid.addWidget(QLabel("Analysis:"), 1, 0)
+        overlay_grid.addWidget(self.if_analysis_level_combo, 1, 1, 1, 2)
+        overlay_grid.addWidget(QLabel("Mode:"), 2, 0)
+        overlay_grid.addWidget(self.if_overlay_mode_combo, 2, 1, 1, 2)
+        overlay_grid.addWidget(QLabel("Opacity:"), 3, 0)
+        overlay_grid.addWidget(self.if_opacity_slider, 3, 1)
+        overlay_grid.addWidget(self.if_opacity_value_label, 3, 2)
+        overlay_grid.addWidget(self.if_fill_chk, 4, 0, 1, 2)
+        overlay_grid.addWidget(QLabel("Display/sample limit:"), 5, 0)
+        overlay_grid.addWidget(self.if_limit_spin, 5, 1)
+        overlay_grid.addWidget(QLabel("Max cell area px²:"), 6, 0)
+        overlay_grid.addWidget(self.if_max_area_spin, 6, 1)
+        overlay_grid.addWidget(self.if_tissue_large_roi_chk, 7, 0, 1, 3)
+        left.addWidget(overlay_box)
+
+        nav_box = QGroupBox("Navigation / export")
+        nav_grid = QGridLayout(nav_box)
+        zoom_in_btn = QPushButton("Zoom +")
+        zoom_in_btn.clicked.connect(lambda: self.change_if_zoom(1.25))
+        zoom_out_btn = QPushButton("Zoom -")
+        zoom_out_btn.clicked.connect(lambda: self.change_if_zoom(0.8))
+        fit_btn = QPushButton("Fit")
+        fit_btn.clicked.connect(lambda: self.set_if_zoom(1.0))
+        update_btn = QPushButton("Update")
+        update_btn.clicked.connect(self.update_if_threshold_preview)
+        export_btn = QPushButton("Export visible CSV")
+        export_btn.clicked.connect(self.export_if_visible_csv)
+        self.if_zoom_label = QLabel("Zoom: 100%")
+        self.if_stats_label = QLabel("No cache loaded")
+        self.if_stats_label.setWordWrap(True)
+        nav_grid.addWidget(zoom_out_btn, 0, 0)
+        nav_grid.addWidget(zoom_in_btn, 0, 1)
+        nav_grid.addWidget(fit_btn, 0, 2)
+        nav_grid.addWidget(update_btn, 1, 0)
+        nav_grid.addWidget(export_btn, 1, 1, 1, 2)
+        nav_grid.addWidget(self.if_zoom_label, 2, 0, 1, 3)
+        nav_grid.addWidget(self.if_stats_label, 3, 0, 1, 3)
+        left.addWidget(nav_box)
+
+        left.addStretch(1)
+
+        main.addWidget(left_panel, 0)
+
+        self.if_preview_label = ZoomRegionPreviewLabel()
+        self.if_preview_label.setText("IF Threshold Explorer")
+        self.if_preview_label.setAlignment(Qt.AlignCenter)
+        self.if_preview_label.setMinimumSize(720, 560)
+        self.if_preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        main.addWidget(self.if_preview_label, 1)
+        layout.addLayout(main, 1)
+        return page
+
+    def load_if_image_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select IF image", "", _image_file_filter())
+        if path:
+            self._load_if_image_from_path(Path(path))
+
+    def _load_if_image_from_path(self, path: Path):
+        path = Path(path)
+        try:
+            if getattr(self, "if_backend", None) is not None:
+                try:
+                    self.if_backend.close()
+                except Exception:
+                    pass
+            self.if_image_path = path
+            self.if_backend = _if_load_measurement_backend(str(path))
+            self.if_zoom = 1.0
+            arr, axes, meta = read_zoom_region_from_backend(
+                self.if_backend,
+                center_xy=None,
+                zoom=1.0,
+                viewport_size=(max(640, self.if_preview_label.width()), max(420, self.if_preview_label.height())) if hasattr(self, "if_preview_label") else (900, 600),
+                max_side=1200,
+            )
+            self.if_arr, self.if_axes, self.if_meta = arr, axes, meta
+            if meta.get("full_dims"):
+                self.if_full_dims = tuple(meta["full_dims"])
+            else:
+                h, w = np.asarray(arr).shape[:2]
+                self.if_full_dims = (w, h)
+            self.if_center = (self.if_full_dims[0] / 2.0, self.if_full_dims[1] / 2.0)
+            self.if_image_label.setText(f"Image: {path.name} | axes={axes} | reader={meta.get('reader')} | full={self.if_full_dims[0]} × {self.if_full_dims[1]}")
+            self.populate_if_channel_table()
+            # Suggest/use default cache if it already exists.
+            if self.if_geojson_path and not self.if_cache_path:
+                cp = _if_default_cache_path(str(self.if_image_path), str(self.if_geojson_path))
+                if cp.exists():
+                    self.if_cache_path = cp
+                    self._refresh_if_cache_label()
+            self.update_if_threshold_preview()
+        except Exception as e:
+            QMessageBox.critical(self, "IF image load error", str(e))
+
+    def load_if_geojson_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select cell GeoJSON",
+            "",
+            "GeoJSON files (*.geojson *.json);;All Files (*)",
+        )
+        if not path:
+            return
+        self.if_geojson_path = Path(path)
+        self.if_geojson_label.setText(f"GeoJSON: {self.if_geojson_path.name}")
+        cp = _if_default_cache_path(str(self.if_image_path) if self.if_image_path else None, str(self.if_geojson_path))
+        self.if_cache_path = cp if cp.exists() else None
+        self._refresh_if_cache_label()
+        if self.if_cache_path:
+            self.update_if_threshold_preview()
+        else:
+            self.info_label.setText("GeoJSON selected. Build the measured SQLite cache once; it will calculate mean_C# from the image inside each cell polygon.")
+
+    def load_if_measurements_csv_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select QuPath measurements CSV",
+            "",
+            "CSV / TSV files (*.csv *.tsv *.txt);;All Files (*)",
+        )
+        if not path:
+            return
+        self.if_csv_path = Path(path)
+        if hasattr(self, "if_csv_label"):
+            self.if_csv_label.setText(f"CSV: {self.if_csv_path.name} | will import Cell: ... (C#): Mean")
+        self.info_label.setText("Measurements CSV selected. Build/rebuild cache will use the fast CSV path instead of measuring every cell from the image.")
+
+    def open_if_cache_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open IF cells SQLite cache",
+            "",
+            "SQLite cache (*.sqlite *.db);;All Files (*)",
+        )
+        if not path:
+            return
+        self.if_cache_path = Path(path)
+        self._refresh_if_cache_label()
+        self.update_if_threshold_preview()
+
+    def _refresh_if_cache_label(self):
+        if not getattr(self, "if_cache_label", None):
+            return
+        if not self.if_cache_path:
+            self.if_cache_label.setText("Cache: none")
+            return
+        meta = _if_cache_meta(str(self.if_cache_path))
+        complete = str(meta.get("build_complete", "0")) == "1"
+        n = meta.get("cell_count", "?")
+        if not complete and n == "?":
+            n = f"partial {meta.get('partial_row_count', '?')}"
+        measured = meta.get("measured_count", "?")
+        failed = meta.get("measurement_failed_count", "0")
+        skipped_large = meta.get("skipped_large_area_count", "")
+        max_area_meta = meta.get("max_cell_area_px", "")
+        reader = meta.get("image_reader", "")
+        source = meta.get("measurement_source", "raw")
+        incomplete_txt = " | INCOMPLETE / still building or interrupted" if not complete else ""
+        extra = f" | source={source} | usable means={measured} | missing/no mean={failed}" if measured != "?" else f" | source={source}"
+        if source == "csv":
+            extra += f" | CSV matched={meta.get('csv_matched_count', '?')}"
+        if skipped_large not in ("", "0"):
+            extra += f" | large ROIs={meta.get('large_roi_count', skipped_large)}"
+        try:
+            if max_area_meta:
+                extra += f" | max area={float(max_area_meta):.0f}px²"
+        except Exception:
+            pass
+        reader_txt = f" | reader={reader}" if reader else ""
+        scale_x = meta.get("geojson_to_image_scale_x", "")
+        scale_y = meta.get("geojson_to_image_scale_y", "")
+        ratio_x = meta.get("geojson_coord_ratio_x", "")
+        ratio_y = meta.get("geojson_coord_ratio_y", "")
+        scale_txt = ""
+        try:
+            sx = float(scale_x); sy = float(scale_y)
+            rx = float(ratio_x); ry = float(ratio_y)
+            scale_txt = f" | geo→img scale=({sx:.4g},{sy:.4g}) ratio=({rx:.3g},{ry:.3g})"
+        except Exception:
+            pass
+        self.if_cache_label.setText(f"Cache: {Path(self.if_cache_path).name} | cells={n}{extra}{reader_txt}{scale_txt}{incomplete_txt}")
+        if meta.get("geojson_path") and not self.if_geojson_path:
+            self.if_geojson_path = Path(meta.get("geojson_path"))
+            self.if_geojson_label.setText(f"GeoJSON: {self.if_geojson_path.name}")
+        if meta.get("csv_path") and hasattr(self, "if_csv_label") and not getattr(self, "if_csv_path", None):
+            self.if_csv_path = Path(meta.get("csv_path"))
+            self.if_csv_label.setText(f"CSV: {self.if_csv_path.name}")
+
+    def build_if_cache(self):
+        if not self.if_image_path:
+            QMessageBox.warning(self, "No image", "Select the IF multichannel image first. The cache measures mean_C# from this image.")
+            return
+        if not self.if_geojson_path:
+            QMessageBox.warning(self, "No GeoJSON", "Select the cell GeoJSON first.")
+            return
+        cache_path = _if_default_cache_path(str(self.if_image_path) if self.if_image_path else None, str(self.if_geojson_path))
+        # Important: do NOT point the viewer to the cache being created. The
+        # builder writes a new timestamped file and the GUI switches to it only
+        # when the job has fully completed and build_complete=1 is stored.
+        self.if_cache_building = True
+        using_csv = bool(getattr(self, "if_csv_path", None) and Path(self.if_csv_path).exists())
+        self.if_cache_label.setText("Cache: building CSV-backed cache... viewer will switch when finished" if using_csv else "Cache: building measured cache... viewer will switch when finished")
+        self.if_stats_label.setText("Building cache from QuPath CSV means. Overlay is paused." if using_csv else "Building measured cache. Overlay is paused to avoid reading a partial SQLite file.")
+        self._start_background_job(
+            "IF cell cache build",
+            _if_build_cache_job,
+            self._on_if_cache_built,
+            str(self.if_image_path or ""),
+            str(self.if_geojson_path),
+            str(cache_path),
+            float(self.if_max_area_spin.value()) if hasattr(self, 'if_max_area_spin') else float(IF_DEFAULT_MAX_CELL_AREA_PX),
+            str(self.if_csv_path) if using_csv else "",
+        )
+
+    def _on_if_cache_built(self, result):
+        self.if_cache_building = False
+        self.if_cache_path = Path(result.get("cache_path"))
+        self._refresh_if_cache_label()
+        source = result.get("measurement_source", "raw image")
+        extra = ""
+        if source == "csv":
+            extra = (
+                f"\nCSV rows: {result.get('csv_row_count', 0):,}. "
+                f"CSV matched: {result.get('csv_matched_count', 0):,}. "
+                f"With Cell mean values: {result.get('csv_with_means_count', 0):,}. "
+                f"Missing: {result.get('csv_missing_count', 0):,}.\n"
+                f"Match mode: ID={result.get('csv_id_matches', 0):,}, "
+                f"centroid={result.get('csv_centroid_matches', 0):,}, "
+                f"order fallback={result.get('csv_order_matches', 0):,}."
+            )
+        QMessageBox.information(
+            self,
+            "IF cache built",
+            f"Cached {result.get('cell_count', 0):,} cells. "
+            f"Mean source: {source}. "
+            f"Usable means: {result.get('measured_count', 0):,}. "
+            f"Missing/no mean: {result.get('measurement_failed_count', 0):,}. "
+            f"Skipped {result.get('skipped_count', 0):,}. Large tissue ROIs stored {result.get('large_roi_count', result.get('skipped_large_area_count', 0)):,}."
+            f"{extra}\n"
+            f"GeoJSON→image scale: X={float(result.get('geo_scale_x', 1.0)):.6g}, "
+            f"Y={float(result.get('geo_scale_y', 1.0)):.6g} "
+            f"(ratio X={float(result.get('geo_ratio_x', 1.0)):.3g}, "
+            f"Y={float(result.get('geo_ratio_y', 1.0)):.3g}; {result.get('geo_scale_mode', '')}).\n\n"
+            f"{self.if_cache_path}",
+        )
+        self.info_label.setText(f"IF cache ready: {self.if_cache_path}")
+        self.update_if_threshold_preview()
+
+    def populate_if_channel_table(self, settings: Optional[List[Dict[str, Any]]] = None):
+        if self.if_arr is None or not hasattr(self, "if_channel_table"):
+            return
+        n_total = _count_display_channels(self.if_arr, self.if_axes)
+        n = min(int(n_total), 6)
+        self.if_channel_table.setRowCount(n)
+        for i in range(n):
+            st = settings[i] if settings and i < len(settings) else {}
+            chk = QCheckBox()
+            chk.setChecked(bool(st.get("visible", True)))
+            chk.stateChanged.connect(lambda *_: self.schedule_if_threshold_update())
+            self.if_channel_table.setCellWidget(i, 0, chk)
+            item = QTableWidgetItem(f"C{i + 1}")
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.if_channel_table.setItem(i, 1, item)
+            color_combo = QComboBox()
+            color_combo.addItems(list(COLOR_MAPS.keys()))
+            default_color = st.get("color", DEFAULT_CHANNEL_COLORS[i % len(DEFAULT_CHANNEL_COLORS)])
+            color_combo.setCurrentText(default_color if default_color in COLOR_MAPS else "gray")
+            color_combo.currentIndexChanged.connect(lambda *_: self.schedule_if_threshold_update())
+            self.if_channel_table.setCellWidget(i, 2, color_combo)
+
+    def get_if_channel_settings_from_table(self) -> List[Dict[str, Any]]:
+        settings = []
+        if not hasattr(self, "if_channel_table"):
+            return settings
+        for r in range(self.if_channel_table.rowCount()):
+            chk = self.if_channel_table.cellWidget(r, 0)
+            color_combo = self.if_channel_table.cellWidget(r, 2)
+            settings.append({
+                "channel": r,
+                "visible": chk.isChecked() if chk else True,
+                "color": color_combo.currentText() if color_combo else DEFAULT_CHANNEL_COLORS[r % len(DEFAULT_CHANNEL_COLORS)],
+            })
+        return settings
+
+    def if_threshold_values(self) -> List[float]:
+        vals = [0.0] * IF_MAX_CHANNELS
+        for i, spin in enumerate(getattr(self, "if_threshold_spins", []) or []):
+            if i < IF_MAX_CHANNELS:
+                vals[i] = float(spin.value())
+        return vals
+
+    def if_enabled_threshold_channels(self) -> List[bool]:
+        enabled = [False] * IF_MAX_CHANNELS
+        for i, chk in enumerate(getattr(self, "if_show_pos_checks", []) or []):
+            if i < IF_MAX_CHANNELS:
+                # Only checked channels participate in positivity, multi-positive,
+                # and negative calculations. This avoids DAPI/C1 affecting C2/C3/C4 logic.
+                enabled[i] = bool(chk.isChecked())
+        return enabled
+
+    def schedule_if_threshold_update(self, delay_ms: int = 40):
+        if hasattr(self, "_if_render_timer"):
+            self._if_render_timer.start(max(0, int(delay_ms)))
+        else:
+            self.update_if_threshold_preview()
+
+    def update_if_threshold_preview(self):
+        if self.if_image_path is None:
+            return
+        try:
+            if getattr(self, "if_backend", None) is None:
+                self.if_backend = _if_load_measurement_backend(str(self.if_image_path))
+            viewport = (max(640, self.if_preview_label.width()), max(420, self.if_preview_label.height()))
+            arr, axes, meta = read_zoom_region_from_backend(
+                self.if_backend,
+                center_xy=getattr(self, "if_center", None),
+                zoom=max(1.0, float(self.if_zoom)),
+                viewport_size=viewport,
+                max_side=max(1400, int(max(viewport) * 2)),
+            )
+            self.if_arr, self.if_axes, self.if_meta = arr, axes, meta
+            if meta.get("full_dims"):
+                self.if_full_dims = tuple(meta["full_dims"])
+            self.if_last_rgb = render_channel_composite(arr, axes, self.get_if_channel_settings_from_table())
+            self._update_if_threshold_pixmap()
+        except Exception as e:
+            self.info_label.setText(f"IF preview error: {e}")
+
+    def _if_overlay_use_polygons(self) -> bool:
+        text = self.if_overlay_mode_combo.currentText() if hasattr(self, "if_overlay_mode_combo") else "Centroids only"
+        if text.startswith("Polygons always"):
+            return True
+        if text.startswith("Polygons when"):
+            return float(getattr(self, "if_zoom", 1.0)) >= 8.0
+        return False
+
+    def _update_if_threshold_pixmap(self):
+        if self.if_last_rgb is None:
+            return
+        roi = self.if_meta.get("roi") if isinstance(self.if_meta, dict) else None
+        full_dims = getattr(self, "if_full_dims", None)
+        overlay_enabled = bool(self.if_overlay_enabled_chk.isChecked()) if hasattr(self, "if_overlay_enabled_chk") else True
+        analysis_mode = self.if_analysis_level_combo.currentText() if hasattr(self, "if_analysis_level_combo") else "Cell level"
+        do_cells = overlay_enabled and analysis_mode in ("Cell level", "Cell + tissue")
+        do_tissue = overlay_enabled and analysis_mode in ("Tissue pixel level", "Cell + tissue")
+        opacity_percent = int(self.if_opacity_slider.value()) if hasattr(self, "if_opacity_slider") else 55
+        if hasattr(self, "if_opacity_value_label"):
+            self.if_opacity_value_label.setText(f"{opacity_percent}%")
+
+        # Prepare positivity display choices once; both cell and tissue modes use them.
+        show_pos = [False] * IF_MAX_CHANNELS
+        for i, chk in enumerate(getattr(self, "if_show_pos_checks", []) or []):
+            show_pos[i] = bool(chk.isChecked())
+        thresholds = self.if_threshold_values()
+        enabled_channels = self.if_enabled_threshold_channels()
+        show_negative = bool(self.if_show_negative_chk.isChecked()) if hasattr(self, "if_show_negative_chk") else False
+        show_multi = bool(self.if_show_multi_chk.isChecked()) if hasattr(self, "if_show_multi_chk") else True
+
+        display_rgb = _to_uint8_rgb(self.if_last_rgb)
+        tissue_stats = None
+        if do_tissue and roi is not None:
+            restrict = bool(self.if_tissue_large_roi_chk.isChecked()) if hasattr(self, "if_tissue_large_roi_chk") else True
+            display_rgb, tissue_stats = _if_apply_tissue_pixel_threshold_overlay(
+                display_rgb,
+                getattr(self, "if_arr", None),
+                getattr(self, "if_axes", ""),
+                roi,
+                str(self.if_cache_path) if self.if_cache_path else None,
+                thresholds=thresholds,
+                enabled_channels=enabled_channels,
+                show_positive=show_pos,
+                show_negative=show_negative,
+                show_multi=show_multi,
+                opacity=int(round(opacity_percent / 100.0 * 255)),
+                restrict_to_large_roi=restrict,
+            )
+
+        self.if_preview_label.set_preview(
+            display_rgb,
+            roi_full=roi,
+            full_dims=full_dims,
+            center_callback=self._on_if_center_changed,
+            rectangle_callback=None,
+            zoom_callback=self._on_if_view_zoom,
+        )
+
+        annotations = []
+        stats = None
+        if do_cells and self.if_cache_path and Path(self.if_cache_path).exists() and roi is not None:
+            limit = int(self.if_limit_spin.value()) if hasattr(self, "if_limit_spin") else 50000
+            max_area = float(self.if_max_area_spin.value()) if hasattr(self, 'if_max_area_spin') else float(IF_DEFAULT_MAX_CELL_AREA_PX)
+            rows, query_info = _if_query_visible_cells(str(self.if_cache_path), roi, limit=limit, return_info=True, max_area_px=max_area)
+            # Radius is specified in screen-ish pixels, converted back to full-resolution pixels.
+            try:
+                display_w = max(1, int(self.if_preview_label._display_rect().width()))
+                radius_full = max(2.0, float(roi[2]) / float(display_w) * 4.0)
+            except Exception:
+                radius_full = 4.0
+            annotations, stats = _if_visible_rows_to_annotations(
+                rows,
+                thresholds=thresholds,
+                enabled_channels=enabled_channels,
+                show_positive=show_pos,
+                show_negative=show_negative,
+                show_multi=show_multi,
+                use_polygons=self._if_overlay_use_polygons(),
+                centroid_radius=radius_full,
+            )
+            if stats is not None and query_info is not None:
+                stats["visible_total"] = int(query_info.get("total", stats.get("visible", 0)))
+                stats["sampled"] = bool(query_info.get("sampled", False))
+                stats["sample_step"] = int(query_info.get("sample_step", 1))
+                stats["returned"] = int(query_info.get("returned", len(rows)))
+                stats["incomplete"] = bool(query_info.get("incomplete", False))
+                stats["partial_rows"] = query_info.get("partial_rows", "?")
+
+        self.if_preview_label.set_annotations(annotations if overlay_enabled else [])
+        self.if_preview_label.set_annotation_style(
+            opacity=int(round(opacity_percent / 100.0 * 255)),
+            fill=bool(self.if_fill_chk.isChecked()) if hasattr(self, "if_fill_chk") else True,
+            boundary_width=1,
+        )
+        class_styles = {name: {"visible": True, "color": QColor(color)} for name, color in IF_STATUS_COLORS.items()}
+        self.if_preview_label.set_annotation_class_styles(class_styles)
+        if hasattr(self, "if_zoom_label"):
+            self.if_zoom_label.setText(f"Zoom: {int(self.if_zoom * 100)}%")
+        if hasattr(self, "if_stats_label"):
+            if not overlay_enabled:
+                self.if_stats_label.setText("Overlay OFF. Image only.")
+            elif stats:
+                if stats.get("incomplete"):
+                    self.if_stats_label.setText(
+                        f"Cache incomplete/partial rows={stats.get('partial_rows', '?')}. "
+                        "Wait for Build / rebuild cache to finish, then the viewer will switch automatically."
+                    )
+                else:
+                    sample_txt = ""
+                    if stats.get("sampled"):
+                        sample_txt = f" | sampled 1/{stats.get('sample_step', 1)} returned={stats.get('returned', stats.get('visible', 0)):,}"
+                    txt = (
+                        f"Cell ROI: {stats.get('visible_total', stats.get('visible', 0)):,}{sample_txt} | shown: {stats.get('shown', 0):,} | "
+                        f"C2+: {stats.get('C2+', 0):,} | C3+: {stats.get('C3+', 0):,} | C4+: {stats.get('C4+', 0):,} | "
+                        f"multi+: {stats.get('multi', 0):,} | neg: {stats.get('negative', 0):,}"
+                    )
+                    if tissue_stats:
+                        mask_txt = f"large ROI={tissue_stats.get('large_rois', 0)}" if tissue_stats.get("masked") else "full ROI"
+                        txt += (
+                            f"\nTissue pixels ({mask_txt}): shown={tissue_stats.get('shown_pixels', 0):,} / "
+                            f"mask={tissue_stats.get('tissue_pixels', 0):,} | C2+={tissue_stats.get('C2+', 0):,} | "
+                            f"C3+={tissue_stats.get('C3+', 0):,} | C4+={tissue_stats.get('C4+', 0):,} | "
+                            f"multi+={tissue_stats.get('multi', 0):,}"
+                        )
+                    self.if_stats_label.setText(txt)
+            elif tissue_stats:
+                mask_txt = f"large ROI={tissue_stats.get('large_rois', 0)}" if tissue_stats.get("masked") else "full ROI"
+                self.if_stats_label.setText(
+                    f"Tissue pixels ({mask_txt}): shown={tissue_stats.get('shown_pixels', 0):,} / "
+                    f"mask={tissue_stats.get('tissue_pixels', 0):,} | "
+                    f"C2+={tissue_stats.get('C2+', 0):,} | C3+={tissue_stats.get('C3+', 0):,} | "
+                    f"C4+={tissue_stats.get('C4+', 0):,} | multi+={tissue_stats.get('multi', 0):,}"
+                )
+            elif self.if_cache_path:
+                if do_tissue:
+                    self.if_stats_label.setText("Tissue mode active, but no large tissue ROI is available in this cache/view. Rebuild cache with Max cell area so large annotations are stored, or uncheck 'Tissue pixels only inside large ROI'.")
+                else:
+                    self.if_stats_label.setText("Cache loaded. No cells in current ROI or current overlay filters hide them.")
+            else:
+                self.if_stats_label.setText("No cache loaded. Build/open cache to overlay cell positivity or tissue ROI masks.")
+        self.info_label.setText(f"IF Threshold Explorer | mode={analysis_mode} | ROI={roi} | cell overlays={len(annotations) if overlay_enabled else 0:,}" )
+
+    def _on_if_center_changed(self, cx, cy):
+        self.if_center = (float(cx), float(cy))
+        self.schedule_if_threshold_update(delay_ms=35)
+
+    def _on_if_view_zoom(self, factor: float, center_xy=None):
+        self.change_if_zoom(factor, center_xy=center_xy)
+
+    def change_if_zoom(self, factor: float, center_xy=None):
+        if not getattr(self, "if_full_dims", None):
+            return
+        if center_xy is not None:
+            self.if_center = (float(center_xy[0]), float(center_xy[1]))
+        self.if_zoom = max(1.0, min(512.0, float(self.if_zoom) * float(factor)))
+        self.schedule_if_threshold_update(delay_ms=10)
+
+    def set_if_zoom(self, zoom: float):
+        self.if_zoom = max(1.0, float(zoom))
+        if self.if_full_dims:
+            self.if_center = (self.if_full_dims[0] / 2.0, self.if_full_dims[1] / 2.0)
+        self.schedule_if_threshold_update(delay_ms=10)
+
+    def export_if_visible_csv(self):
+        if not self.if_cache_path or not Path(self.if_cache_path).exists():
+            QMessageBox.warning(self, "No cache", "Build or open an IF cell cache first.")
+            return
+        roi = self.if_meta.get("roi") if isinstance(self.if_meta, dict) else None
+        if roi is None:
+            QMessageBox.warning(self, "No ROI", "Load the image preview first.")
+            return
+        default_dir = self.if_image_path.parent if self.if_image_path else Path(self.if_cache_path).parent
+        x, y, w, h = [int(round(float(v))) for v in roi]
+        default_name = f"IF_visible_cells_x{x}_y{y}_w{w}_h{h}.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export visible IF cells CSV",
+            str(default_dir / default_name),
+            "CSV files (*.csv);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            out_path, n = _if_export_rows_to_csv(
+                str(self.if_cache_path),
+                roi,
+                path,
+                thresholds=self.if_threshold_values(),
+                enabled_channels=self.if_enabled_threshold_channels(),
+                max_area_px=float(self.if_max_area_spin.value()) if hasattr(self, 'if_max_area_spin') else float(IF_DEFAULT_MAX_CELL_AREA_PX),
+            )
+            QMessageBox.information(self, "Exported", f"Exported {n:,} visible cell rows:\n{out_path}")
+            self.info_label.setText(f"Exported IF visible CSV: {out_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "IF export error", str(e))
+
+
     def __init__(self):
         super().__init__()
         self.setWindowIcon(QIcon(resource_path(APP_ICON_PATH)))
@@ -5105,6 +7591,21 @@ class WSICropTileMergeGUI(QMainWindow):
         self.crop_center = None
         self.crop_preview_meta = {}
         self.batch_channel_paths = []
+        self.if_image_path = None
+        self.if_geojson_path = None
+        self.if_csv_path = None
+        self.if_cache_path = None
+        self.if_backend = None
+        self.if_arr = None
+        self.if_axes = None
+        self.if_meta = {}
+        self.if_full_dims = None
+        self.if_center = None
+        self.if_zoom = 1.0
+        self.if_last_rgb = None
+        self._if_render_timer = QTimer(self)
+        self._if_render_timer.setSingleShot(True)
+        self._if_render_timer.timeout.connect(self.update_if_threshold_preview)
         self.explorer_paths = []
         self.explorer_current_folder = None
         self.explorer_thumb_worker = None
@@ -5126,7 +7627,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.mode_combo = QComboBox()
         self.mode_combo.addItems([
             "Crop", "Tiles", "Merge Tiles", "Split LIF",
-            "Downsample", "Image Preview", "Explorer"
+            "Downsample", "Image Preview", "IF Threshold Explorer", "Explorer"
         ])
         self.mode_combo.setMaximumWidth(180)
 
@@ -5163,6 +7664,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.stack.addWidget(self._build_lif_page())
         self.stack.addWidget(self._build_downsample_page())
         self.stack.addWidget(self._build_preview_page())
+        self.stack.addWidget(self._build_if_threshold_page())
         self.stack.addWidget(self._build_explorer_page())
         self.mode_combo.currentIndexChanged.connect(lambda: self.stack.setCurrentIndex(self.mode_combo.currentIndex()))
 
@@ -5239,6 +7741,24 @@ class WSICropTileMergeGUI(QMainWindow):
         else:
             self.progress.setVisible(False)
 
+    def _on_background_progress(self, value, total):
+        try:
+            value = int(value)
+        except Exception:
+            value = 0
+        try:
+            total = int(total)
+        except Exception:
+            total = 0
+        if total <= 0:
+            # Unknown-length stage, e.g. streaming a huge GeoJSON before the
+            # exact cell count is known. Keep the progress bar animated rather
+            # than showing a misleading frozen 0%.
+            self.progress.setRange(0, 0)
+        else:
+            self.progress.setRange(0, max(1, total))
+            self.progress.setValue(max(0, min(value, total)))
+
     def _start_background_job(self, title, job_func, done_callback, *args, **kwargs):
         if self.active_worker is not None and self.active_worker.isRunning():
             QMessageBox.warning(self, "Job already running", "Wait for the current job to finish or click Cancel job.")
@@ -5250,7 +7770,7 @@ class WSICropTileMergeGUI(QMainWindow):
         worker = AppWorker(job_func, *args, **kwargs)
         self.active_worker = worker
         worker.message.connect(self.info_label.setText)
-        worker.progress.connect(lambda value, total: (self.progress.setRange(0, max(1, int(total))), self.progress.setValue(int(value))))
+        worker.progress.connect(self._on_background_progress)
         worker.finished_ok.connect(lambda result: self._background_job_done(title, result, done_callback))
         worker.failed.connect(lambda text: self._background_job_failed(title, text))
         worker.finished.connect(lambda: self._set_busy_state(False))
@@ -5658,7 +8178,7 @@ class WSICropTileMergeGUI(QMainWindow):
         action_layout = QHBoxLayout(action_box)
         self.explorer_target_combo = QComboBox()
         self.explorer_target_combo.addItems([
-            "Image Preview", "Crop", "Tiles", "Downsample", "Batch JPG Preview"
+            "Image Preview", "IF Threshold Explorer", "Crop", "Tiles", "Downsample", "Batch JPG Preview"
         ])
         send_btn = QPushButton("Send selected to mode")
         send_btn.clicked.connect(self.send_explorer_selection_to_mode)
@@ -5968,6 +8488,11 @@ class WSICropTileMergeGUI(QMainWindow):
                 self.mode_combo.setCurrentText("Image Preview")
                 if len(paths) > 1:
                     self.info_label.setText(f"Image Preview uses one image; opened first selected: {paths[0].name}")
+            elif target == "IF Threshold Explorer":
+                self._load_if_image_from_path(paths[0])
+                self.mode_combo.setCurrentText("IF Threshold Explorer")
+                if len(paths) > 1:
+                    self.info_label.setText(f"IF Threshold Explorer uses one image; loaded first selected: {paths[0].name}")
             elif target == "Crop":
                 self._load_crop_from_path(paths[0])
                 self.mode_combo.setCurrentText("Crop")
@@ -6843,6 +9368,11 @@ class WSICropTileMergeGUI(QMainWindow):
                 self.backend.close()
         except Exception:
             pass
+        try:
+            if getattr(self, "if_backend", None) is not None:
+                self.if_backend.close()
+        except Exception:
+            pass
         super().closeEvent(event)
 
     # ========================================================
@@ -7503,8 +10033,12 @@ class WSICropTileMergeGUI(QMainWindow):
                 max(480, int(self.crop_thumb_in.width())),
                 max(300, int(self.crop_thumb_in.height())),
             )
-            arr, axes, meta = read_zoom_region_from_file(
-                str(self.backend.path),
+            # Use the already-open backend so crop preview can reuse OpenSlide/TIFF
+            # handles and access pyramid/overview levels. The previous path opened
+            # the file again with read_zoom_region_from_file(), which could fall
+            # back to the "Zoom preview skipped" placeholder for some pyramidal TIFFs.
+            arr, axes, meta = read_zoom_region_from_backend(
+                self.backend,
                 center_xy=self.crop_center,
                 zoom=max(1.0, float(self.crop_zoom)),
                 viewport_size=viewport,
