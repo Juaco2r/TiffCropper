@@ -3835,9 +3835,10 @@ def read_zoom_region_from_backend(backend, center_xy=None, zoom: float = 1.0,
 def read_roi_region_from_backend(backend, roi_full: Tuple[int, int, int, int], max_side: int = 1200):
     """Read a specific full-resolution ROI for display without loading it at full size.
 
-    This is used by the tile pop-up. It chooses an OpenSlide/TIFF pyramid level
-    or strided zarr/memmap slice according to the display size. The full-size
-    tile is only read when the user explicitly saves the tile JPG.
+    The ROI and all returned metadata are always expressed in full-resolution
+    source coordinates. Reduced pyramid/overview levels are used only as an
+    internal display source. This prevents preview level selection from changing
+    crop coordinates or target output size.
     """
     if backend is None or not getattr(backend, "path", None) or not getattr(backend, "slide_dims", None):
         raise RuntimeError("No cached preview backend is loaded.")
@@ -3850,6 +3851,7 @@ def read_roi_region_from_backend(backend, roi_full: Tuple[int, int, int, int], m
         "reader": f"{backend.reader}-cached-roi-preview",
         "roi": roi,
         "full_dims": (int(full_w), int(full_h)),
+        "coordinate_space": "full-resolution image pixels",
     }
 
     if backend.reader == "openslide":
@@ -3862,45 +3864,21 @@ def read_roi_region_from_backend(backend, roi_full: Tuple[int, int, int, int], m
         return arr, "YXS", {**meta, "reader": "openslide-cached-roi-preview", "level": int(level), "step": ds}
 
     if backend.reader == "tifffile":
-        za, series, axes, zarr_error = backend._get_tiff_zarr()
-        axes = axes or getattr(series, "axes", "") or ""
+        # Do not call _get_tiff_zarr first. That can touch the full-resolution
+        # image and be very slow for large compressed OME-TIFFs. Open the TIFF
+        # directory, try overview/pyramid levels first, then fall back to zarr.
+        if getattr(backend, "_tif_obj", None) is None:
+            backend._tif_obj = tifffile.TiffFile(backend.path)
+            backend._tif_series = backend._tif_obj.series[0]
+            backend._tif_axes = getattr(backend._tif_series, "axes", "") or ""
+            backend._zarr_array = None
+            backend._zarr_error = None
+        series = backend._tif_series
+        axes = backend._tif_axes or getattr(series, "axes", "") or ""
         shape = tuple(getattr(series, "shape", ()) or ())
-        try:
-            levels = list(getattr(series, "levels", []) or [])
-            if len(levels) > 1:
-                best_level = levels[0]
-                best_ds = 1.0
-                best_score = float("inf")
-                for lv in levels:
-                    lv_axes = getattr(lv, "axes", axes) or axes
-                    lv_shape = tuple(getattr(lv, "shape", ()) or ())
-                    if not lv_shape:
-                        continue
-                    if lv_axes and len(lv_axes) == len(lv_shape) and "Y" in lv_axes and "X" in lv_axes:
-                        lv_w = int(lv_shape[lv_axes.index("X")])
-                        lv_h = int(lv_shape[lv_axes.index("Y")])
-                    elif len(lv_shape) >= 2:
-                        lv_h, lv_w = int(lv_shape[-2]), int(lv_shape[-1])
-                    else:
-                        continue
-                    ds_x = float(full_w) / max(1.0, float(lv_w))
-                    ds_y = float(full_h) / max(1.0, float(lv_h))
-                    ds = max(1.0, (ds_x + ds_y) / 2.0)
-                    score = abs(math.log(ds / target_ds)) if target_ds > 0 else ds
-                    if score < best_score:
-                        best_score = score
-                        best_level = lv
-                        best_ds = ds
-                if best_level is not series and best_ds > 1.01:
-                    import zarr
-                    lza = zarr.open(best_level.aszarr(), mode="r")
-                    lax = getattr(best_level, "axes", axes) or axes
-                    step = max(1, int(math.ceil(max(float(w) / best_ds, float(h) / best_ds) / float(max_side))))
-                    arr, out_axes = _slice_preview_zarr_region(lza, lax, roi, step=step, level_downsample=best_ds)
-                    return arr, out_axes, {**meta, "reader": "tifffile-pyramid-zarr-cached-roi-preview", "shape": shape, "axes": axes, "level_downsample": best_ds, "step": step}
-        except Exception as level_error:
-            meta["level_error"] = str(level_error)
+        zarr_error = getattr(backend, "_zarr_error", None)
 
+        # 1) Prefer pyramid/overview levels for display. Coordinates remain full-res.
         try:
             overview = _read_best_tiff_overview_region(
                 series, getattr(backend, "_tif_obj", None), full_w, full_h, roi,
@@ -3909,9 +3887,18 @@ def read_roi_region_from_backend(backend, roi_full: Tuple[int, int, int, int], m
             )
             if overview is not None:
                 arr, out_axes, ometa = overview
-                return arr, out_axes, {**meta, **ometa, "shape": shape, "axes": axes}
+                return arr, out_axes, {**meta, **ometa, "shape": shape, "axes": axes, "preview_from_overview": True}
         except Exception as overview_error:
             meta["overview_error"] = str(overview_error)
+
+        # 2) Full-resolution zarr/memmap only when no overview can serve the preview.
+        try:
+            za, series, axes, zarr_error = backend._get_tiff_zarr()
+            axes = axes or getattr(series, "axes", "") or ""
+            shape = tuple(getattr(series, "shape", ()) or ())
+        except Exception as e:
+            za = None
+            zarr_error = e
 
         step = max(1, int(math.ceil(max(float(w), float(h)) / float(max_side))))
         if za is not None:
@@ -3932,10 +3919,10 @@ def read_roi_region_from_backend(backend, roi_full: Tuple[int, int, int, int], m
             return arr, out_axes, {**meta, "reader": "tifffile-small-full-cached-roi-preview", "shape": shape, "axes": axes, "step": step}
 
         msg = (
-            "Tile preview skipped to keep GUI responsive.\n"
+            "Crop/tile preview skipped to keep GUI responsive.\n"
             f"File: {Path(backend.path).name}\nShape: {shape} axes={axes}\n"
-            "This TIFF could not expose pyramid, zarr, or memmap region access.\n"
-            "Saving may still work, but fast interactive viewing requires tiled/pyramidal OME-TIFF."
+            "No fast pyramid/overview, zarr, or memmap region access was available.\n"
+            "The selected crop coordinates are still full-resolution coordinates."
         )
         return _placeholder_rgb(msg, width=700, height=500), "YXS", {**meta, "reader": "safe-placeholder-cached-roi-preview", "shape": shape, "axes": axes, "error": str(zarr_error)}
 
@@ -4581,11 +4568,22 @@ class ImageBackend:
             arr = np.asarray(za[tuple(slicer)])
             return arr, axes if len(axes) == arr.ndim else _guess_axes_for_array(arr, axes), fallback_info
 
-        # Fallback: read the full series only when tiled/zarr access is unavailable.
-        # This is less efficient for very large files, so the reason is returned.
+        # Fallback: read the full series only for genuinely small images.
+        # For large compressed TIFF/OME-TIFF images this would allocate tens of GiB.
+        try:
+            spatial_pixels = int(self.slide_dims[0]) * int(self.slide_dims[1]) if self.slide_dims else 0
+        except Exception:
+            spatial_pixels = 0
+        if spatial_pixels > 25_000_000:
+            raise RuntimeError(
+                "This TIFF/OME-TIFF does not expose zarr/memmap region access for exact cropping, "
+                "and the full image is too large to read safely. Use a tiled/pyramidal OME-TIFF, "
+                "increase downsample for a visual crop, or use Tiles mode. "
+                f"Original zarr error: {zarr_error}"
+            )
         fallback_info = {
             "used": True,
-            "reason": f"zarr crop failed, used full read fallback: {zarr_error}"
+            "reason": f"zarr crop failed, used small full read fallback: {zarr_error}"
         }
         arr = series.asarray()
         slicer = self._build_spatial_slicer_raw(arr.ndim, axes, x, y, w, h)
@@ -4658,6 +4656,39 @@ class ImageBackend:
 # ============================================================
 # Save helper
 # ============================================================
+
+def _photometric_for_axes_shape(axes: str, shape) -> str:
+    """Return a safe tifffile photometric mode for a given axes/shape.
+
+    Tifffile raises "shape does not match stored shape" when an array with a
+    Samples axis (for example YXS or TZYXS) is written as minisblack OME.
+    Those arrays must be written as RGB/RGBA. Non-sample scientific IF arrays
+    such as CYX, ZCYX or TCZYX remain minisblack.
+    """
+    axes = (axes or "").strip()
+    try:
+        if axes and "S" in axes and len(axes) == len(shape):
+            s = int(shape[axes.index("S")])
+            if s in (3, 4):
+                return "rgb"
+    except Exception:
+        pass
+    try:
+        # Fallback for plain RGB arrays without axes metadata.
+        if len(shape) >= 3 and int(shape[-1]) in (3, 4):
+            return "rgb"
+    except Exception:
+        pass
+    return "minisblack"
+
+
+def _is_sample_axis_array(arr_shape, axes: str) -> bool:
+    axes = (axes or "").strip()
+    try:
+        return bool(axes and "S" in axes and len(axes) == len(arr_shape) and int(arr_shape[axes.index("S")]) in (3, 4))
+    except Exception:
+        return bool(len(arr_shape) >= 3 and int(arr_shape[-1]) in (3, 4))
+
 
 def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, lossless=True,
                    source_resolution=None, source_mpp=None, image_name=None, annotation_kv=None,
@@ -4786,13 +4817,15 @@ def save_multichannel_image(output_path, arr, axes=None, write_ome=True, lossles
 
     compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
 
+    photometric = _photometric_for_axes_shape(axes, arr.shape)
+
     tifffile.imwrite(
         str(output_path),
         arr,
         bigtiff=True,
         ome=bool(write_ome),
         metadata=metadata if metadata else None,
-        photometric="minisblack",
+        photometric=photometric,
         software=f"{APP_NAME} v{APP_VERSION}",
         resolution=resolution,
         resolutionunit=resolutionunit,
@@ -10564,6 +10597,23 @@ class WSICropTileMergeGUI(QMainWindow):
                 est_bytes, est_shape, est_axes, est_dtype = _estimate_tiff_raw_crop_bytes(
                     self.backend, x, y, w, h, downsample=raw_downsample
                 )
+                # If the source has a Samples axis (YXS/TZYXS), it is an RGB/RGBA
+                # image rather than scientific IF channel data. Saving this as
+                # minisblack OME causes tifffile's "shape does not match stored shape".
+                # Keep the crop in the normal in-memory path if small enough;
+                # save_multichannel_image will write it with photometric=rgb.
+                if est_shape is not None and est_axes and _is_sample_axis_array(est_shape, est_axes):
+                    if est_bytes is not None and est_bytes > MAX_INTERACTIVE_CROP_BYTES:
+                        QMessageBox.warning(
+                            self,
+                            "RGB/Sample-axis crop too large",
+                            "This source is stored with a Samples axis (for example YXS/TZYXS). "
+                            "It cannot be streamed safely as raw IF planes.\n\n"
+                            f"Estimated output: {_human_bytes(est_bytes)}\n"
+                            f"Shape: {est_shape}\nAxes: {est_axes}\n\n"
+                            "Use a downsampled visual crop, reduce the ROI, or use Tiles mode."
+                        )
+                        return
                 if est_bytes is not None and est_bytes > MAX_INTERACTIVE_CROP_BYTES:
                     if raw_downsample == 1.0 and est_axes and "S" not in est_axes:
                         self.info_label.setText(
