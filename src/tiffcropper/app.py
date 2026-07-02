@@ -787,6 +787,59 @@ MAX_INTERACTIVE_CROP_BYTES = 2.5 * 1024 ** 3
 MAX_PREVIEW_CROP_BYTES = 512 * 1024 ** 2
 
 
+def _exception_text(exc: Exception) -> str:
+    """Return a useful error message even for exceptions with empty str(exc)."""
+    try:
+        msg = str(exc)
+    except Exception:
+        msg = ""
+    if not msg:
+        msg = f"{type(exc).__name__} raised with no message."
+    try:
+        tb = traceback.format_exc()
+        if tb and "NoneType: None" not in tb:
+            msg = f"{msg}\n\nTraceback:\n{tb}"
+    except Exception:
+        pass
+    return msg
+
+
+def _resize_rgb_to_exact(rgb: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
+    """Resize a visual RGB array to an exact output size."""
+    rgb = _to_uint8_rgb(rgb)
+    out_w = max(1, int(out_w))
+    out_h = max(1, int(out_h))
+    if rgb.shape[1] == out_w and rgb.shape[0] == out_h:
+        return rgb
+    from PIL import Image
+    return np.asarray(Image.fromarray(rgb).resize((out_w, out_h), Image.Resampling.LANCZOS), dtype=np.uint8)
+
+
+def _read_visual_crop_for_save(backend, x: int, y: int, w: int, h: int, downsample: float = 1.0) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Read a crop for visual RGB saving without confusing preview levels with full-res coordinates.
+
+    For downsample=1, this asks the backend for an exact full-resolution crop.
+    For downsample>1, it deliberately uses a reduced pyramid/overview region and
+    then resizes to the exact requested output dimensions. This avoids reading a
+    huge full-resolution ROI only to downsample it immediately.
+    """
+    ds = max(1.0, float(downsample or 1.0))
+    out_w = max(1, int(round(float(w) / ds)))
+    out_h = max(1, int(round(float(h) / ds)))
+    if ds > 1.0:
+        # max_side is the desired output size, so read_roi_region_from_backend will
+        # choose a pyramid/overview level close to that size when available.
+        arr, axes, meta = read_roi_region_from_backend(backend, (int(x), int(y), int(w), int(h)), max_side=max(out_w, out_h))
+        rgb = _array_to_rgb_preview(arr, axes)
+        rgb = _resize_rgb_to_exact(rgb, out_w, out_h)
+        return rgb, {**(meta or {}), "visual_downsample": ds, "target_output_shape": (out_h, out_w, 3)}
+
+    # Exact visual crop. This can still use OpenSlide fallback inside backend.crop()
+    # for TIFF/OME-TIFF files that tifffile cannot expose by zarr/memmap.
+    rgb, info = backend.crop(int(x), int(y), int(w), int(h), fill=255)
+    return _to_uint8_rgb(rgb), {"reader": getattr(backend, "reader", "unknown"), "exact_visual_crop": True, **(info or {})}
+
+
 def _try_openslide_thumbnail(path: str, max_side: int = 256):
     """Try a small OpenSlide thumbnail even if tifffile could not expose a fast preview.
 
@@ -4287,11 +4340,23 @@ class ImageBackend:
         return self._get_openslide()
 
     def _get_tiff_zarr(self):
-        """Open a TIFF/OME-TIFF once and reuse its zarr view for repeated crops."""
+        """Open a TIFF/OME-TIFF once and reuse its zarr view for repeated crops.
+
+        Important: some preview paths open ``self._tif_obj`` first only to inspect
+        pyramid/overview levels.  In that case ``_zarr_array`` is still None and
+        ``_zarr_error`` is also None.  Older versions returned immediately in that
+        state, so exact cropping thought there was no zarr/memmap access and raised
+        a false error.  This method now creates the zarr view whenever it has not
+        actually been attempted yet.
+        """
         if self._tif_obj is None:
             self._tif_obj = tifffile.TiffFile(self.path)
             self._tif_series = self._tif_obj.series[0]
-            self._tif_axes = getattr(self._tif_series, "axes", "")
+            self._tif_axes = getattr(self._tif_series, "axes", "") or ""
+            self._zarr_array = None
+            self._zarr_error = None
+
+        if self._zarr_array is None and self._zarr_error is None:
             try:
                 z = self._tif_series.aszarr()
                 import zarr
@@ -4300,6 +4365,7 @@ class ImageBackend:
             except Exception as e:
                 self._zarr_array = None
                 self._zarr_error = e
+
         return self._zarr_array, self._tif_series, self._tif_axes, self._zarr_error
 
     def _read_with_pil(self, path: str) -> np.ndarray:
@@ -4556,8 +4622,41 @@ class ImageBackend:
         return out, {"used": failed0 > 0, "failed0": failed0, "recovered": recovered, "fallback_level": min_lvl_used}
 
     def _crop_tifffile(self, path, x, y, w, h):
-        arr, axes, fallback_info = self._crop_tifffile_raw(path, x, y, w, h)
-        return _array_to_rgb_preview(arr, axes), fallback_info
+        """Return an RGB visual crop from a TIFF/OME-TIFF.
+
+        The preferred path is exact full-resolution tifffile/zarr access.  If a
+        compressed TIFF cannot expose zarr/memmap access, try OpenSlide as a
+        visual-only fallback before failing.  This keeps normal RGB crop export
+        usable for very large TIFFs while raw IF export still requires tifffile
+        zarr/memmap access so that scientific channel intensities are preserved.
+        """
+        try:
+            arr, axes, fallback_info = self._crop_tifffile_raw(path, x, y, w, h)
+            return _array_to_rgb_preview(arr, axes), fallback_info
+        except Exception as tif_error:
+            openslide = _try_import_openslide()
+            if openslide is not None:
+                try:
+                    slide = openslide.OpenSlide(str(path))
+                    try:
+                        img = slide.read_region((int(x), int(y)), 0, (int(w), int(h))).convert("RGB")
+                        return np.asarray(img, dtype=np.uint8), {
+                            "used": True,
+                            "reason": f"visual OpenSlide fallback after tifffile crop failed: {tif_error}",
+                            "fallback_reader": "openslide-visual",
+                        }
+                    finally:
+                        try:
+                            slide.close()
+                        except Exception:
+                            pass
+                except Exception as os_error:
+                    raise RuntimeError(
+                        "Could not crop this TIFF/OME-TIFF through tifffile/zarr/memmap, "
+                        "and the visual OpenSlide fallback also failed.\n\n"
+                        f"tifffile error: {tif_error}\nOpenSlide fallback error: {os_error}"
+                    ) from tif_error
+            raise
 
     def _crop_tifffile_raw(self, path, x, y, w, h):
         fallback_info = {"used": False}
@@ -7219,7 +7318,7 @@ class WSICropTileMergeGUI(QMainWindow):
     def _build_if_threshold_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(4, 4, 4, 4)
 
         file_box = QGroupBox("IF Cell Threshold Explorer - image + cell GeoJSON + optional QuPath CSV")
         file_grid = QGridLayout(file_box)
@@ -7387,7 +7486,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.if_preview_label = ZoomRegionPreviewLabel()
         self.if_preview_label.setText("IF Threshold Explorer")
         self.if_preview_label.setAlignment(Qt.AlignCenter)
-        self.if_preview_label.setMinimumSize(500, 360)
+        self.if_preview_label.setMinimumSize(460, 300)
         self.if_preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         main.addWidget(self.if_preview_label, 1)
         layout.addLayout(main, 1)
@@ -7871,7 +7970,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.setWindowIcon(QIcon(resource_path(APP_ICON_PATH)))
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Preview / Tile / Merge")
         self.setGeometry(40, 40, 980, 640)
-        self.setMinimumSize(700, 500)
+        self.setMinimumSize(600, 420)
         self.setStyleSheet("background-color: #f0f0f0;")
 
         self.backend = ImageBackend()
@@ -7938,11 +8037,13 @@ class WSICropTileMergeGUI(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(4)
 
         title = QLabel(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Preview / Tile / Merge")
-        title.setFont(QFont("Arial", 14, QFont.Bold))
+        title.setFont(QFont("Arial", 12, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("color: #2c3e50; margin: 4px;")
+        title.setStyleSheet("color: #2c3e50; margin: 2px;")
         root.addWidget(title)
 
         menu_row = QHBoxLayout()
@@ -7976,13 +8077,15 @@ class WSICropTileMergeGUI(QMainWindow):
         root.addLayout(menu_row)
 
         self.info_label = QLabel("")
-        self.info_label.setStyleSheet("color: #27ae60; padding: 8px;")
+        self.info_label.setStyleSheet("color: #27ae60; padding: 3px;")
+        self.info_label.setMaximumHeight(42)
+        self.info_label.setWordWrap(True)
 
         self.stack = QStackedWidget()
-        self.stack_scroll = QScrollArea()
-        self.stack_scroll.setWidgetResizable(True)
-        self.stack_scroll.setWidget(self.stack)
-        root.addWidget(self.stack_scroll, 1)
+        # Keep the main pages directly in the window.  A global QScrollArea made
+        # the Linux UI feel cramped because users had to scroll inside the app to
+        # reach bottom controls.  Individual widgets are now compacted instead.
+        root.addWidget(self.stack, 1)
         self.stack.addWidget(self._build_crop_page())
         self.stack.addWidget(self._build_tiles_page())
         self.stack.addWidget(self._build_merge_page())
@@ -8339,11 +8442,11 @@ class WSICropTileMergeGUI(QMainWindow):
         self.downsample_whole_label.setFixedSize(520, 380)
         self.downsample_original_label = QLabel("Original-resolution square")
         self.downsample_original_label.setAlignment(Qt.AlignCenter)
-        self.downsample_original_label.setFixedSize(330, 330)
+        self.downsample_original_label.setFixedSize(260, 260)
         self.downsample_original_label.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
         self.downsample_result_label = QLabel("Downsampled square")
         self.downsample_result_label.setAlignment(Qt.AlignCenter)
-        self.downsample_result_label.setFixedSize(330, 330)
+        self.downsample_result_label.setFixedSize(260, 260)
         self.downsample_result_label.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
         prev_layout.addWidget(self.downsample_whole_label)
         prev_layout.addWidget(self.downsample_original_label)
@@ -8428,8 +8531,8 @@ class WSICropTileMergeGUI(QMainWindow):
                 new_w = max(1, int(round(rgb_original.shape[1] / self.downsample_factor_spin.value())))
                 new_h = max(1, int(round(rgb_original.shape[0] / self.downsample_factor_spin.value())))
                 rgb_ds = np.asarray(Image.fromarray(_to_uint8_rgb(rgb_original)).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
-            self._set_label_pixmap(self.downsample_original_label, _downsample_for_preview(rgb_original, 320))
-            self._set_label_pixmap(self.downsample_result_label, _downsample_for_preview(rgb_ds, 320))
+            self._set_label_pixmap(self.downsample_original_label, _downsample_for_preview(rgb_original, 250))
+            self._set_label_pixmap(self.downsample_result_label, _downsample_for_preview(rgb_ds, 250))
             self.info_label.setText(f"Downsample preview ROI X={x}, Y={y}, W={w}, H={h} | DS={self.downsample_factor_spin.value():g}")
         except Exception as e:
             self.info_label.setText(f"Downsample preview error: {e}")
@@ -8476,7 +8579,7 @@ class WSICropTileMergeGUI(QMainWindow):
     def _build_explorer_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(4, 4, 4, 4)
 
         folder_box = QGroupBox("Image file explorer")
         folder_layout = QGridLayout(folder_box)
@@ -8489,7 +8592,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.explorer_folder_edit.returnPressed.connect(self.scan_explorer_folder)
         self.explorer_thumb_size_spin = QSpinBox()
         self.explorer_thumb_size_spin.setRange(80, 384)
-        self.explorer_thumb_size_spin.setValue(128)
+        self.explorer_thumb_size_spin.setValue(112)
         self.explorer_thumb_size_spin.setSuffix(" px")
         folder_layout.addWidget(browse_btn, 0, 0)
         folder_layout.addWidget(self.explorer_folder_edit, 0, 1, 1, 4)
@@ -8532,7 +8635,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.explorer_folder_nav = QListWidget()
         self.explorer_folder_nav.setMinimumWidth(170)
         self.explorer_folder_nav.setMaximumWidth(260)
-        self.explorer_folder_nav.setMaximumHeight(240)
+        self.explorer_folder_nav.setMaximumHeight(150)
         self.explorer_folder_nav.itemDoubleClicked.connect(self.navigate_explorer_folder_item)
         self.explorer_folder_nav.itemClicked.connect(self.navigate_explorer_folder_item)
         folder_nav_layout.addWidget(QLabel("Parents and subfolders"))
@@ -8544,8 +8647,8 @@ class WSICropTileMergeGUI(QMainWindow):
         self.explorer_list.setResizeMode(QListWidget.Adjust)
         self.explorer_list.setMovement(QListWidget.Static)
         self.explorer_list.setSpacing(6)
-        self.explorer_list.setIconSize(QSize(128, 100))
-        self.explorer_list.setGridSize(QSize(170, 155))
+        self.explorer_list.setIconSize(QSize(112, 88))
+        self.explorer_list.setGridSize(QSize(150, 132))
         self.explorer_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.explorer_list.itemSelectionChanged.connect(self.update_explorer_selection_label)
         self.explorer_list.itemDoubleClicked.connect(lambda *_: self.send_explorer_selection_to_mode(force_target="Image Preview"))
@@ -8845,7 +8948,7 @@ class WSICropTileMergeGUI(QMainWindow):
     def _build_preview_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(4, 4, 4, 4)
 
         top = QHBoxLayout()
         load_btn = QPushButton("Load image")
@@ -9020,7 +9123,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.preview_image_label = ZoomRegionPreviewLabel()
         self.preview_image_label.setText("Preview")
         self.preview_image_label.setAlignment(Qt.AlignCenter)
-        self.preview_image_label.setMinimumSize(500, 360)
+        self.preview_image_label.setMinimumSize(460, 300)
         self.preview_image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview_image_label.set_annotation_draw_callbacks(
             created_callback=self._on_preview_annotation_drawn,
@@ -10315,13 +10418,13 @@ class WSICropTileMergeGUI(QMainWindow):
         prev = QGroupBox("Preview - left-drag a rectangle; wheel zooms; right/middle-drag pans")
         prev_layout = QHBoxLayout(prev)
         self.crop_thumb_in = CropSelectionLabel()
-        self.crop_thumb_in.setMinimumSize(360, 220)
-        self.crop_thumb_in.setMaximumHeight(340)
+        self.crop_thumb_in.setMinimumSize(300, 170)
+        self.crop_thumb_in.setMaximumHeight(260)
         self.crop_thumb_in.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.crop_thumb_out = QLabel("Crop preview")
         self.crop_thumb_out.setAlignment(Qt.AlignCenter)
-        self.crop_thumb_out.setMinimumSize(360, 220)
-        self.crop_thumb_out.setMaximumHeight(340)
+        self.crop_thumb_out.setMinimumSize(300, 170)
+        self.crop_thumb_out.setMaximumHeight(260)
         self.crop_thumb_out.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.crop_thumb_out.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
         prev_layout.addWidget(self.crop_thumb_in)
@@ -10523,7 +10626,7 @@ class WSICropTileMergeGUI(QMainWindow):
             if self.crop_preview_chk.isChecked():
                 self.refresh_crop_input_preview()
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.critical(self, "Error", _exception_text(e))
 
     def select_full_crop_area(self):
         if not self.backend.path or not self.backend.slide_dims:
@@ -10559,7 +10662,7 @@ class WSICropTileMergeGUI(QMainWindow):
                 f"Preview ready from reduced region | ROI={roi_full} | reader={meta.get('reader', '') if isinstance(meta, dict) else ''} | source_shape={source_shape}"
             )
         except Exception as e:
-            QMessageBox.critical(self, "Preview Error", str(e))
+            QMessageBox.critical(self, "Preview Error", _exception_text(e))
 
     def _crop_output_settings(self):
         suffix = self.crop_suffix_edit.text().strip() or "final"
@@ -10588,6 +10691,22 @@ class WSICropTileMergeGUI(QMainWindow):
                 and self.backend.reader == "tifffile"
                 and output_format != "jpeg"
             )
+
+            # RGB/RGBA pyramidal TIFFs often have a Samples axis (YXS or TZYXS).
+            # They are visual images, not raw IF channel stacks. Treat these as
+            # visual RGB crops even if the Preserve raw checkbox is enabled; this
+            # prevents tifffile OME writing errors such as "shape does not match
+            # stored shape" and allows OpenSlide/pyramid fallbacks for cropping.
+            if preserve_raw:
+                _est_bytes0, _est_shape0, _est_axes0, _est_dtype0 = _estimate_tiff_raw_crop_bytes(
+                    self.backend, x, y, w, h, downsample=raw_downsample
+                )
+                if _est_shape0 is not None and _est_axes0 and _is_sample_axis_array(_est_shape0, _est_axes0):
+                    preserve_raw = False
+                    self.info_label.setText(
+                        f"Source uses RGB/RGBA Samples axis ({_est_axes0}); saving as visual RGB crop instead of raw IF planes."
+                    )
+                    QApplication.processEvents()
 
             # Preflight memory guard.  This prevents NumPy from attempting to
             # allocate tens of GiB for very large crops such as whole-slide RGB
@@ -10681,12 +10800,7 @@ class WSICropTileMergeGUI(QMainWindow):
                 cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
                 saved_text = f"Saved raw multichannel crop: {out_path} | shape={tuple(roi.shape)} | axes={axes or 'unknown'} | dtype={roi.dtype}{cal_text}"
             else:
-                roi, _ = self.backend.crop(x, y, w, h, fill=255)
-                if raw_downsample != 1.0:
-                    from PIL import Image
-                    new_w = max(1, int(round(roi.shape[1] / raw_downsample)))
-                    new_h = max(1, int(round(roi.shape[0] / raw_downsample)))
-                    roi = np.asarray(Image.fromarray(roi).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
+                roi, crop_meta = _read_visual_crop_for_save(self.backend, x, y, w, h, downsample=raw_downsample)
                 save_rgb_image(
                     out_path, roi, output_format, write_ome, self.crop_lossless_chk.isChecked(),
                     self.backend.source_resolution, self.backend.source_mpp, out_path.stem,
@@ -10694,7 +10808,8 @@ class WSICropTileMergeGUI(QMainWindow):
                     pixel_scale=raw_downsample
                 )
                 cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
-                saved_text = f"Saved RGB crop: {out_path} | Reader: {self.backend.reader}{cal_text}"
+                reader_text = crop_meta.get("reader", self.backend.reader) if isinstance(crop_meta, dict) else self.backend.reader
+                saved_text = f"Saved RGB crop: {out_path} | Reader: {reader_text} | output_shape={tuple(roi.shape)}{cal_text}"
 
             # Display a reduced preview instead of converting the full saved crop.
             if self.crop_preview_chk.isChecked():
@@ -10707,7 +10822,7 @@ class WSICropTileMergeGUI(QMainWindow):
             self.info_label.setText(saved_text)
             QMessageBox.information(self, "Success", saved_text)
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.critical(self, "Error", _exception_text(e))
 
     # ========================================================
     # Tiles page
@@ -10960,7 +11075,7 @@ class WSICropTileMergeGUI(QMainWindow):
 
             self.tiles_thumb.setPixmap(pm.scaled(self.tiles_thumb.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
         except Exception as e:
-            QMessageBox.critical(self, "Preview Error", str(e))
+            QMessageBox.critical(self, "Preview Error", _exception_text(e))
 
     def save_tiles_bulk(self):
         if not self.bulk_paths:
