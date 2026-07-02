@@ -33,7 +33,7 @@ from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QIcon, Q
 # ============================================================
 
 APP_NAME = "TiffCropper"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 APP_TITLE = "PathoImage Toolkit: WSI, IF, OME-TIFF and LIF Image Utility"
 APP_DOI = "10.5281/zenodo.20316535"
 APP_GITHUB = "https://github.com/Juaco2r/TiffCropper"
@@ -767,6 +767,202 @@ def _placeholder_rgb(message: str, width: int = 900, height: int = 600) -> np.nd
         return arr
 
 
+
+
+def _human_bytes(n: float) -> str:
+    """Human readable byte count used in memory-safety messages."""
+    try:
+        n = float(n)
+    except Exception:
+        return "unknown"
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    i = 0
+    while n >= 1024.0 and i < len(units) - 1:
+        n /= 1024.0
+        i += 1
+    return f"{n:.1f} {units[i]}"
+
+
+MAX_INTERACTIVE_CROP_BYTES = 2.5 * 1024 ** 3
+MAX_PREVIEW_CROP_BYTES = 512 * 1024 ** 2
+
+
+def _try_openslide_thumbnail(path: str, max_side: int = 256):
+    """Try a small OpenSlide thumbnail even if tifffile could not expose a fast preview.
+
+    This is intended for Explorer thumbnails only. It can help with pyramidal TIFFs
+    whose reduced levels are accessible through OpenSlide but not through tifffile.
+    """
+    openslide = _try_import_openslide()
+    if openslide is None:
+        return None
+    try:
+        slide = openslide.OpenSlide(str(path))
+        try:
+            img = slide.get_thumbnail((int(max_side), int(max_side))).convert("RGB")
+            return np.asarray(img, dtype=np.uint8), "YXS", {"reader": "openslide-thumbnail-fallback"}
+        finally:
+            try:
+                slide.close()
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
+def _safe_int_product(values) -> int:
+    out = 1
+    for v in values:
+        out *= int(v)
+    return int(out)
+
+
+def _estimate_rgb_crop_bytes(width: int, height: int, downsample: float = 1.0, channels: int = 3, dtype=np.uint8) -> int:
+    ds = max(1.0, float(downsample or 1.0))
+    w = max(1, int(round(float(width) / ds)))
+    h = max(1, int(round(float(height) / ds)))
+    return _safe_int_product([h, w, int(channels)]) * np.dtype(dtype).itemsize
+
+
+def _tiff_output_shape_for_crop(backend, x: int, y: int, w: int, h: int, downsample: float = 1.0):
+    """Return output shape/axes/dtype for a raw tifffile crop without reading pixels."""
+    if backend is None or getattr(backend, "reader", None) != "tifffile":
+        return None, None, None
+    try:
+        za, series, axes, _ = backend._get_tiff_zarr()
+        axes = axes or getattr(series, "axes", "") or ""
+        shape = tuple(getattr(series, "shape", ()) or ())
+        dtype = getattr(series, "dtype", None)
+        if dtype is None and za is not None:
+            dtype = za.dtype
+        dtype = np.dtype(dtype or np.uint16)
+        ds = max(1.0, float(downsample or 1.0))
+        out_w = max(1, int(round(float(w) / ds)))
+        out_h = max(1, int(round(float(h) / ds)))
+        if axes and len(axes) == len(shape) and "Y" in axes and "X" in axes:
+            out_shape = list(shape)
+            out_shape[axes.index("Y")] = out_h
+            out_shape[axes.index("X")] = out_w
+            return tuple(int(v) for v in out_shape), axes, dtype
+        # Conservative fallback assumes the final two axes are Y/X.
+        out_shape = list(shape)
+        if len(out_shape) >= 2:
+            out_shape[-2] = out_h
+            out_shape[-1] = out_w
+        else:
+            out_shape = [out_h, out_w]
+        return tuple(int(v) for v in out_shape), _guess_axes_for_array(np.empty((1, 1), dtype=dtype), axes), dtype
+    except Exception:
+        return None, None, None
+
+
+def _estimate_tiff_raw_crop_bytes(backend, x: int, y: int, w: int, h: int, downsample: float = 1.0) -> Tuple[Optional[int], Optional[Tuple[int, ...]], Optional[str], Optional[np.dtype]]:
+    shape, axes, dtype = _tiff_output_shape_for_crop(backend, x, y, w, h, downsample=downsample)
+    if shape is None or dtype is None:
+        return None, shape, axes, dtype
+    return _safe_int_product(shape) * np.dtype(dtype).itemsize, shape, axes, np.dtype(dtype)
+
+
+def _normalize_axes_for_tiff_write(arr_shape, axes: str) -> str:
+    axes = (axes or "").strip()
+    if axes and len(axes) == len(arr_shape):
+        return axes
+    if len(arr_shape) == 2:
+        return "YX"
+    if len(arr_shape) == 3:
+        if arr_shape[-1] in (3, 4):
+            return "YXS"
+        if arr_shape[0] <= 16:
+            return "CYX"
+    return _guess_axes_for_array(np.empty(tuple(1 for _ in arr_shape)), axes)
+
+
+def save_tiff_raw_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: int,
+                              write_ome: bool = True, lossless: bool = True,
+                              image_name: Optional[str] = None):
+    """Save a raw TIFF/OME-TIFF crop without materializing the full ROI in RAM.
+
+    This path is intentionally conservative: it supports no-downsample crops and
+    non-Sample axes such as CYX, ZCYX, TCYX, TCZYX. RGB/Sample-axis images are
+    not streamed here because tifffile may collapse singleton T/Z axes for RGB
+    samples; those should be saved as visual crops with a downsample or tiles.
+    """
+    if backend is None or getattr(backend, "reader", None) != "tifffile":
+        raise RuntimeError("Low-memory raw crop requires a tifffile-backed image.")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    full_w, full_h = backend.slide_dims
+    x, y, w, h = backend.clip_roi(int(x), int(y), int(w), int(h), full_w, full_h)
+    za, series, axes, zarr_error = backend._get_tiff_zarr()
+    axes = axes or getattr(series, "axes", "") or ""
+    shape = tuple(getattr(series, "shape", ()) or ())
+    dtype = np.dtype(getattr(series, "dtype", None) or (za.dtype if za is not None else np.uint16))
+    if not axes or len(axes) != len(shape) or "Y" not in axes or "X" not in axes:
+        raise RuntimeError("Low-memory raw crop requires known Y/X axes in the TIFF series.")
+    if "S" in axes:
+        raise RuntimeError(
+            "Low-memory raw crop does not stream RGB/Sample-axis images safely. "
+            "Use a downsampled visual crop or tile the image instead."
+        )
+    if za is None:
+        try:
+            za = tifffile.memmap(backend.path, series=0)
+        except Exception as exc:
+            raise RuntimeError(f"Could not access TIFF pixels by zarr or memmap for low-memory crop: {zarr_error}; {exc}")
+
+    y_axis = axes.index("Y")
+    x_axis = axes.index("X")
+    out_shape = list(shape)
+    out_shape[y_axis] = int(h)
+    out_shape[x_axis] = int(w)
+    out_shape = tuple(int(v) for v in out_shape)
+    non_spatial_axes = [i for i, ax in enumerate(axes) if ax not in ("Y", "X")]
+    non_spatial_shape = tuple(int(shape[i]) for i in non_spatial_axes)
+    non_spatial_pos = {axis_index: pos for pos, axis_index in enumerate(non_spatial_axes)}
+
+    def gen_planes():
+        iterator_shape = non_spatial_shape if non_spatial_shape else (1,)
+        for idx in np.ndindex(iterator_shape):
+            slicer = []
+            for dim_i, ax in enumerate(axes):
+                if ax == "Y":
+                    slicer.append(slice(int(y), int(y + h)))
+                elif ax == "X":
+                    slicer.append(slice(int(x), int(x + w)))
+                else:
+                    slicer.append(idx[non_spatial_pos[dim_i]] if non_spatial_shape else 0)
+            plane = np.asarray(za[tuple(slicer)])
+            yield np.ascontiguousarray(plane)
+
+    metadata = {"axes": axes, "Name": image_name or output_path.stem}
+    if backend.source_mpp:
+        try:
+            metadata.update({
+                "PhysicalSizeX": float(backend.source_mpp[0]),
+                "PhysicalSizeY": float(backend.source_mpp[1]),
+                "PhysicalSizeXUnit": "µm",
+                "PhysicalSizeYUnit": "µm",
+            })
+        except Exception:
+            pass
+    resolution = None
+    resolutionunit = None
+    if backend.source_resolution:
+        try:
+            xres, yres, unit = backend.source_resolution
+            if xres and yres and unit:
+                resolution = (float(xres), float(yres))
+                resolutionunit = unit
+        except Exception:
+            pass
+    compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
+    tifffile.imwrite(
+        str(output_path), gen_planes(), shape=out_shape, dtype=dtype,
+        bigtiff=True, ome=bool(write_ome), metadata=metadata,
+        photometric="minisblack", software=f"{APP_NAME} v{APP_VERSION}",
+        resolution=resolution, resolutionunit=resolutionunit, **compression_kwargs
+    )
+    return {"shape": out_shape, "axes": axes, "dtype": str(dtype), "lowmem": True}
 def read_preview_array_from_file(path: str, max_side: int = 1200, allow_full_fallback: bool = False) -> Tuple[np.ndarray, str, Dict[str, Any]]:
     """Read a memory-light representative preview array from RGB, TIFF, or OME-TIFF.
 
@@ -2538,7 +2734,7 @@ class ZoomRegionPreviewLabel(QLabel):
         super().__init__(parent)
         self.setAlignment(Qt.AlignCenter)
         self.setMouseTracking(True)
-        self.setMinimumSize(720, 560)
+        self.setMinimumSize(420, 300)
         self.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
         self._pixmap_original = None
         self._roi_full = None
@@ -6961,6 +7157,14 @@ class ThumbnailExplorerWorker(QThread):
                 arr, axes, meta = read_preview_array_from_file(
                     path, max_side=self.max_side, allow_full_fallback=False
                 )
+                # If tifffile could only return a placeholder, try OpenSlide's
+                # thumbnail path as a final Explorer-only fallback. This is useful
+                # for large pyramidal TIFFs where an overview is available through
+                # OpenSlide but not through tifffile/zarr.
+                if str(meta.get("reader", "")).startswith("safe-placeholder"):
+                    os_thumb = _try_openslide_thumbnail(path, max_side=self.max_side)
+                    if os_thumb is not None:
+                        arr, axes, meta = os_thumb
                 rgb = _array_to_rgb_preview(arr, axes)
                 rgb = _downsample_for_preview(rgb, max_side=self.max_side)
                 self.item_ready.emit(path, rgb, str(meta.get("reader", "")))
@@ -7633,7 +7837,8 @@ class WSICropTileMergeGUI(QMainWindow):
         super().__init__()
         self.setWindowIcon(QIcon(resource_path(APP_ICON_PATH)))
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Preview / Tile / Merge")
-        self.setGeometry(80, 60, 1040, 720)
+        self.setGeometry(40, 40, 980, 640)
+        self.setMinimumSize(700, 500)
         self.setStyleSheet("background-color: #f0f0f0;")
 
         self.backend = ImageBackend()
@@ -7702,9 +7907,9 @@ class WSICropTileMergeGUI(QMainWindow):
         root = QVBoxLayout(central)
 
         title = QLabel(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Preview / Tile / Merge")
-        title.setFont(QFont("Arial", 16, QFont.Bold))
+        title.setFont(QFont("Arial", 14, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("color: #2c3e50; margin: 12px;")
+        title.setStyleSheet("color: #2c3e50; margin: 4px;")
         root.addWidget(title)
 
         menu_row = QHBoxLayout()
@@ -7741,7 +7946,10 @@ class WSICropTileMergeGUI(QMainWindow):
         self.info_label.setStyleSheet("color: #27ae60; padding: 8px;")
 
         self.stack = QStackedWidget()
-        root.addWidget(self.stack, 1)
+        self.stack_scroll = QScrollArea()
+        self.stack_scroll.setWidgetResizable(True)
+        self.stack_scroll.setWidget(self.stack)
+        root.addWidget(self.stack_scroll, 1)
         self.stack.addWidget(self._build_crop_page())
         self.stack.addWidget(self._build_tiles_page())
         self.stack.addWidget(self._build_merge_page())
@@ -8247,8 +8455,8 @@ class WSICropTileMergeGUI(QMainWindow):
         self.explorer_folder_edit.setPlaceholderText("Folder containing image files")
         self.explorer_folder_edit.returnPressed.connect(self.scan_explorer_folder)
         self.explorer_thumb_size_spin = QSpinBox()
-        self.explorer_thumb_size_spin.setRange(96, 512)
-        self.explorer_thumb_size_spin.setValue(180)
+        self.explorer_thumb_size_spin.setRange(80, 384)
+        self.explorer_thumb_size_spin.setValue(128)
         self.explorer_thumb_size_spin.setSuffix(" px")
         folder_layout.addWidget(browse_btn, 0, 0)
         folder_layout.addWidget(self.explorer_folder_edit, 0, 1, 1, 4)
@@ -8289,8 +8497,9 @@ class WSICropTileMergeGUI(QMainWindow):
         folder_nav_box = QGroupBox("Folders")
         folder_nav_layout = QVBoxLayout(folder_nav_box)
         self.explorer_folder_nav = QListWidget()
-        self.explorer_folder_nav.setMinimumWidth(250)
-        self.explorer_folder_nav.setMaximumWidth(360)
+        self.explorer_folder_nav.setMinimumWidth(170)
+        self.explorer_folder_nav.setMaximumWidth(260)
+        self.explorer_folder_nav.setMaximumHeight(240)
         self.explorer_folder_nav.itemDoubleClicked.connect(self.navigate_explorer_folder_item)
         self.explorer_folder_nav.itemClicked.connect(self.navigate_explorer_folder_item)
         folder_nav_layout.addWidget(QLabel("Parents and subfolders"))
@@ -8301,9 +8510,9 @@ class WSICropTileMergeGUI(QMainWindow):
         self.explorer_list.setViewMode(QListWidget.IconMode)
         self.explorer_list.setResizeMode(QListWidget.Adjust)
         self.explorer_list.setMovement(QListWidget.Static)
-        self.explorer_list.setSpacing(10)
-        self.explorer_list.setIconSize(QSize(180, 140))
-        self.explorer_list.setGridSize(QSize(220, 210))
+        self.explorer_list.setSpacing(6)
+        self.explorer_list.setIconSize(QSize(128, 100))
+        self.explorer_list.setGridSize(QSize(170, 155))
         self.explorer_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.explorer_list.itemSelectionChanged.connect(self.update_explorer_selection_label)
         self.explorer_list.itemDoubleClicked.connect(lambda *_: self.send_explorer_selection_to_mode(force_target="Image Preview"))
@@ -10073,10 +10282,14 @@ class WSICropTileMergeGUI(QMainWindow):
         prev = QGroupBox("Preview - left-drag a rectangle; wheel zooms; right/middle-drag pans")
         prev_layout = QHBoxLayout(prev)
         self.crop_thumb_in = CropSelectionLabel()
-        self.crop_thumb_in.setFixedSize(540, 330)
+        self.crop_thumb_in.setMinimumSize(360, 220)
+        self.crop_thumb_in.setMaximumHeight(340)
+        self.crop_thumb_in.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.crop_thumb_out = QLabel("Crop preview")
         self.crop_thumb_out.setAlignment(Qt.AlignCenter)
-        self.crop_thumb_out.setFixedSize(540, 330)
+        self.crop_thumb_out.setMinimumSize(360, 220)
+        self.crop_thumb_out.setMaximumHeight(340)
+        self.crop_thumb_out.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.crop_thumb_out.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
         prev_layout.addWidget(self.crop_thumb_in)
         prev_layout.addWidget(self.crop_thumb_out)
@@ -10296,36 +10509,22 @@ class WSICropTileMergeGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Please select a file first.")
             return
         try:
-            preserve_raw = (
-                hasattr(self, "crop_preserve_channels_chk")
-                and self.crop_preserve_channels_chk.isChecked()
-                and self.backend.reader == "tifffile"
+            x, y, w, h = self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
+            roi_full = (int(x), int(y), int(w), int(h))
+            # Preview must never read the full selected crop into RAM.  For very
+            # large crops, read a pyramid/overview or strided region only.
+            arr, axes, meta = read_roi_region_from_backend(
+                self.backend, roi_full, max_side=1200
             )
-            if preserve_raw:
-                raw, axes, _ = self.backend.crop_raw(
-                    self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
-                )
-                downsample = float(self.crop_downsample_spin.value())
-                raw_preview, axes_preview = _resize_spatial_array(raw, axes, downsample) if downsample != 1.0 else (raw, axes)
-                roi_preview = _array_to_rgb_preview(raw_preview, axes_preview)
-                shape_text = f"raw shape={tuple(raw.shape)} | axes={axes or 'unknown'} | dtype={raw.dtype}"
-            else:
-                roi_preview, _ = self.backend.crop(
-                    self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value(), fill=255
-                )
-                downsample = float(self.crop_downsample_spin.value())
-                if downsample != 1.0:
-                    from PIL import Image
-                    new_w = max(1, int(round(roi_preview.shape[1] / downsample)))
-                    new_h = max(1, int(round(roi_preview.shape[0] / downsample)))
-                    roi_preview = np.asarray(Image.fromarray(roi_preview).resize((new_w, new_h), Image.Resampling.LANCZOS), dtype=np.uint8)
-                shape_text = f"preview={roi_preview.shape[1]} x {roi_preview.shape[0]} px"
-
+            roi_preview = _array_to_rgb_preview(arr, axes)
             if self.crop_preview_chk.isChecked():
                 if self.backend.slide_dims:
                     self.refresh_crop_input_preview()
                 self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(roi_preview, 512))
-            self.info_label.setText(f"Preview ready: {shape_text} | Reader: {self.backend.reader}")
+            source_shape = meta.get("shape", "") if isinstance(meta, dict) else ""
+            self.info_label.setText(
+                f"Preview ready from reduced region | ROI={roi_full} | reader={meta.get('reader', '') if isinstance(meta, dict) else ''} | source_shape={source_shape}"
+            )
         except Exception as e:
             QMessageBox.critical(self, "Preview Error", str(e))
 
@@ -10348,6 +10547,7 @@ class WSICropTileMergeGUI(QMainWindow):
         try:
             suffix, raw_downsample, combo, output_format, write_ome, ext = self._crop_output_settings()
             out_path = self.backend.path_obj.parent / f"{self.backend.path_obj.stem}_crop_{suffix}{ext}"
+            x, y, w, h = self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
 
             preserve_raw = (
                 hasattr(self, "crop_preserve_channels_chk")
@@ -10356,10 +10556,68 @@ class WSICropTileMergeGUI(QMainWindow):
                 and output_format != "jpeg"
             )
 
+            # Preflight memory guard.  This prevents NumPy from attempting to
+            # allocate tens of GiB for very large crops such as whole-slide RGB
+            # regions.  The preview path remains available because it uses a
+            # reduced pyramid/overview region.
             if preserve_raw:
-                roi, axes, _ = self.backend.crop_raw(
-                    self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
+                est_bytes, est_shape, est_axes, est_dtype = _estimate_tiff_raw_crop_bytes(
+                    self.backend, x, y, w, h, downsample=raw_downsample
                 )
+                if est_bytes is not None and est_bytes > MAX_INTERACTIVE_CROP_BYTES:
+                    if raw_downsample == 1.0 and est_axes and "S" not in est_axes:
+                        self.info_label.setText(
+                            f"Large raw crop detected ({_human_bytes(est_bytes)}). Saving with low-memory streaming..."
+                        )
+                        QApplication.processEvents()
+                        result = save_tiff_raw_crop_lowmem(
+                            self.backend, out_path, x, y, w, h,
+                            write_ome=write_ome, lossless=self.crop_lossless_chk.isChecked(),
+                            image_name=out_path.stem,
+                        )
+                        # Show only a reduced preview after saving.
+                        try:
+                            arr, axes, meta = read_roi_region_from_backend(self.backend, (x, y, w, h), max_side=1000)
+                            preview_rgb = _array_to_rgb_preview(arr, axes)
+                            if self.crop_preview_chk.isChecked():
+                                self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(preview_rgb, 512))
+                        except Exception:
+                            pass
+                        cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
+                        saved_text = (
+                            f"Saved large raw crop using low-memory streaming: {out_path} | "
+                            f"shape={result.get('shape')} | axes={result.get('axes')} | dtype={result.get('dtype')}{cal_text}"
+                        )
+                        self.info_label.setText(saved_text)
+                        QMessageBox.information(self, "Success", saved_text)
+                        return
+                    QMessageBox.warning(
+                        self,
+                        "Crop too large for memory",
+                        "This raw crop is too large for the current in-memory/downsample path.\n\n"
+                        f"Estimated output: {_human_bytes(est_bytes)}\n"
+                        f"Shape: {est_shape}\nAxes: {est_axes}\n\n"
+                        "Use downsampled tiles, reduce the ROI, or save an undownsampled non-RGB raw crop when possible."
+                    )
+                    return
+            else:
+                est_rgb = _estimate_rgb_crop_bytes(w, h, downsample=raw_downsample, channels=3, dtype=np.uint8)
+                if est_rgb > MAX_INTERACTIVE_CROP_BYTES:
+                    QMessageBox.warning(
+                        self,
+                        "Crop too large for RGB output",
+                        "This crop would require a very large RGB array and was stopped before allocation.\n\n"
+                        f"Estimated RGB output: {_human_bytes(est_rgb)}\n"
+                        f"ROI: X={x}, Y={y}, W={w}, H={h}\n\n"
+                        "Recommended options:\n"
+                        "1) Increase Downsample before saving a visual RGB crop.\n"
+                        "2) For IF/OME-TIFF, enable Preserve raw channels and save OME-TIFF.\n"
+                        "3) Use Tiles mode for whole-slide export."
+                    )
+                    return
+
+            if preserve_raw:
+                roi, axes, _ = self.backend.crop_raw(x, y, w, h)
                 if raw_downsample != 1.0:
                     roi, axes = _resize_spatial_array(roi, axes, raw_downsample)
                 save_multichannel_image(
@@ -10370,13 +10628,10 @@ class WSICropTileMergeGUI(QMainWindow):
                     image_name=out_path.stem,
                     pixel_scale=raw_downsample
                 )
-                preview_rgb = _array_to_rgb_preview(roi, axes)
                 cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
                 saved_text = f"Saved raw multichannel crop: {out_path} | shape={tuple(roi.shape)} | axes={axes or 'unknown'} | dtype={roi.dtype}{cal_text}"
             else:
-                roi, _ = self.backend.crop(
-                    self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value(), fill=255
-                )
+                roi, _ = self.backend.crop(x, y, w, h, fill=255)
                 if raw_downsample != 1.0:
                     from PIL import Image
                     new_w = max(1, int(round(roi.shape[1] / raw_downsample)))
@@ -10388,12 +10643,17 @@ class WSICropTileMergeGUI(QMainWindow):
                     self.backend.openslide_props if write_ome else None,
                     pixel_scale=raw_downsample
                 )
-                preview_rgb = roi
                 cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
                 saved_text = f"Saved RGB crop: {out_path} | Reader: {self.backend.reader}{cal_text}"
 
+            # Display a reduced preview instead of converting the full saved crop.
             if self.crop_preview_chk.isChecked():
-                self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(preview_rgb, 512))
+                try:
+                    arr, axes_p, meta = read_roi_region_from_backend(self.backend, (x, y, w, h), max_side=1000)
+                    preview_rgb = _array_to_rgb_preview(arr, axes_p)
+                    self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(preview_rgb, 512))
+                except Exception:
+                    pass
             self.info_label.setText(saved_text)
             QMessageBox.information(self, "Success", saved_text)
         except Exception as e:
