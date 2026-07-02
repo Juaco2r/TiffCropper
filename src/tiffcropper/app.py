@@ -111,6 +111,26 @@ def _has_ext(path_or_name, exts):
     return any(name.endswith(e) for e in exts)
 
 
+def _is_ome_tiff_name(path_or_name) -> bool:
+    """Return True for OME-TIFF names.
+
+    These should be opened with tifffile first because OpenSlide can sometimes
+    open them as generic pyramidal TIFFs but not expose OME physical calibration
+    or multichannel axes.
+    """
+    name = str(path_or_name).lower()
+    return name.endswith(('.ome.tif', '.ome.tiff'))
+
+
+def _format_mpp_text(mpp) -> str:
+    try:
+        if mpp and mpp[0] and mpp[1]:
+            return f"{float(mpp[0]):.6g} x {float(mpp[1]):.6g} µm/px"
+    except Exception:
+        pass
+    return "unknown"
+
+
 def _image_file_filter():
     exts = " ".join(f"*{e}" for e in SUPPORTED_EXTENSIONS)
     return f"Image Files ({exts});;All Files (*)"
@@ -3962,6 +3982,23 @@ class ImageBackend:
 
         lower_name = self.path_obj.name.lower()
 
+        # OME-TIFF and scientific multichannel TIFFs should prefer tifffile.
+        # OpenSlide may open some OME-TIFFs as generic TIFFs but then lose the
+        # OME axes and physical pixel size; crops saved afterwards may appear as
+        # 1 µm/px.  For .ome.tif/.ome.tiff, preserve scientific metadata first.
+        if _is_ome_tiff_name(lower_name) and _has_ext(lower_name, TIFF_EXTENSIONS):
+            try:
+                w, h, res, mpp = self._probe_tifffile(path)
+                self.reader = "tifffile"
+                self.file_kind = "tiff"
+                self.slide_dims = (int(w), int(h))
+                self.source_resolution = res
+                self.source_mpp = mpp
+                self.openslide_props = {}
+                return self
+            except Exception as e:
+                self._fail_log.append(("tifffile", str(e)))
+
         if _has_ext(lower_name, OPENSLIDE_EXTENSIONS):
             try:
                 w, h, res, mpp, props = self._probe_openslide(path)
@@ -4104,6 +4141,21 @@ class ImageBackend:
             if mpp_x and mpp_y:
                 res_tuple = (_mpp_to_dpi(mpp_x), _mpp_to_dpi(mpp_y), "INCH")
                 mpp = (mpp_x, mpp_y)
+
+            # Calibration fallback for TIFF/OME-TIFF files opened through OpenSlide.
+            # Some pyramidal OME-TIFFs can be read by OpenSlide but OpenSlide does
+            # not expose PhysicalSizeX/Y; tifffile can still read the OME metadata.
+            if (mpp is None or res_tuple is None) and _has_ext(path, TIFF_EXTENSIONS):
+                try:
+                    _tw, _th, tif_res, tif_mpp = self._probe_tifffile(path)
+                    if tif_mpp is not None:
+                        mpp = tif_mpp
+                    if tif_res is not None:
+                        res_tuple = tif_res
+                    elif mpp is not None:
+                        res_tuple = _mpp_to_resolution_tuple(mpp[0], mpp[1])
+                except Exception:
+                    pass
             return int(w), int(h), res_tuple, mpp, props
         finally:
             try:
@@ -4141,13 +4193,29 @@ class ImageBackend:
             ru = tags.get("ResolutionUnit")
             if ru is not None:
                 try:
-                    u = int(ru.value)
-                    if u == 2:
-                        unit_str = "INCH"
-                    elif u == 3:
-                        unit_str = "CENTIMETER"
+                    u_val = ru.value
+                    # tifffile can expose enums, ints, or strings depending on file.
+                    if hasattr(u_val, "name"):
+                        name = str(u_val.name).upper()
+                        if "INCH" in name:
+                            unit_str = "INCH"
+                        elif "CENTIMETER" in name or "CENTIMETRE" in name:
+                            unit_str = "CENTIMETER"
+                    if unit_str is None:
+                        u = int(u_val)
+                        if u == 2:
+                            unit_str = "INCH"
+                        elif u == 3:
+                            unit_str = "CENTIMETER"
                 except Exception:
-                    unit_str = None
+                    try:
+                        txt = str(ru.value).upper()
+                        if "INCH" in txt:
+                            unit_str = "INCH"
+                        elif "CENTIMETER" in txt or "CENTIMETRE" in txt:
+                            unit_str = "CENTIMETER"
+                    except Exception:
+                        unit_str = None
 
             res_tuple = (xres_f, yres_f, unit_str) if (xres_f and yres_f and unit_str) else None
 
@@ -4420,6 +4488,11 @@ def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, loss
     if source_mpp:
         try:
             mpp_x_um, mpp_y_um = float(source_mpp[0]), float(source_mpp[1])
+            if resolution is None:
+                derived = _mpp_to_resolution_tuple(mpp_x_um, mpp_y_um)
+                if derived is not None:
+                    resolution = (float(derived[0]), float(derived[1]))
+                    resolutionunit = derived[2]
         except Exception:
             mpp_x_um = None
             mpp_y_um = None
@@ -4499,8 +4572,16 @@ def save_multichannel_image(output_path, arr, axes=None, write_ome=True, lossles
         try:
             metadata["PhysicalSizeX"] = float(source_mpp[0])
             metadata["PhysicalSizeY"] = float(source_mpp[1])
-            metadata["PhysicalSizeXUnit"] = "µm"
-            metadata["PhysicalSizeYUnit"] = "µm"
+            # Use ASCII "um" to maximize compatibility with QuPath/ImageJ readers.
+            metadata["PhysicalSizeXUnit"] = "um"
+            metadata["PhysicalSizeYUnit"] = "um"
+            # Ensure classic TIFF resolution tags are also written. Some viewers
+            # prioritize TIFF tags over OME-XML; this prevents defaulting to 1 µm/px.
+            if resolution is None:
+                derived = _mpp_to_resolution_tuple(float(source_mpp[0]), float(source_mpp[1]))
+                if derived is not None:
+                    resolution = (float(derived[0]), float(derived[1]))
+                    resolutionunit = derived[2]
         except Exception:
             pass
 
@@ -10189,7 +10270,7 @@ class WSICropTileMergeGUI(QMainWindow):
             self.crop_center = (w / 2.0, h / 2.0)
             self.crop_preview_meta = {}
             print("Loaded with:", self.backend.reader, self.backend.file_kind, self.backend.path_obj.suffix)
-            self.info_label.setText(f"Loaded: {Path(file_path).name} | Size: {w} x {h} px | Reader: {self.backend.reader}")
+            self.info_label.setText(f"Loaded: {Path(file_path).name} | Size: {w} x {h} px | Reader: {self.backend.reader} | MPP: {_format_mpp_text(self.backend.source_mpp)}")
             if self.crop_preview_chk.isChecked():
                 self.refresh_crop_input_preview()
         except Exception as e:
@@ -10287,7 +10368,8 @@ class WSICropTileMergeGUI(QMainWindow):
                     pixel_scale=raw_downsample
                 )
                 preview_rgb = _array_to_rgb_preview(roi, axes)
-                saved_text = f"Saved raw multichannel crop: {out_path} | shape={tuple(roi.shape)} | axes={axes or 'unknown'} | dtype={roi.dtype}"
+                cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
+                saved_text = f"Saved raw multichannel crop: {out_path} | shape={tuple(roi.shape)} | axes={axes or 'unknown'} | dtype={roi.dtype}{cal_text}"
             else:
                 roi, _ = self.backend.crop(
                     self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value(), fill=255
@@ -10304,7 +10386,8 @@ class WSICropTileMergeGUI(QMainWindow):
                     pixel_scale=raw_downsample
                 )
                 preview_rgb = roi
-                saved_text = f"Saved RGB crop: {out_path} | Reader: {self.backend.reader}"
+                cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
+                saved_text = f"Saved RGB crop: {out_path} | Reader: {self.backend.reader}{cal_text}"
 
             if self.crop_preview_chk.isChecked():
                 self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(preview_rgb, 512))
