@@ -7,6 +7,7 @@ import csv
 import json
 import traceback
 import threading
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -804,6 +805,24 @@ def _exception_text(exc: Exception) -> str:
     return msg
 
 
+def _is_safe_placeholder_meta(meta: Optional[Dict[str, Any]]) -> bool:
+    """Return True when a preview function returned a display-only placeholder.
+
+    Placeholder images are useful inside the GUI, but they must never be used as
+    crop/tile output data. This prevents text such as "Preview skipped to keep
+    GUI responsive" from being saved as if it were the real image content.
+    """
+    try:
+        reader = str((meta or {}).get("reader", "")).lower()
+        if "placeholder" in reader or "safe-placeholder" in reader:
+            return True
+        if "skipped" in str((meta or {}).get("error", "")).lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _resize_rgb_to_exact(rgb: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
     """Resize a visual RGB array to an exact output size."""
     rgb = _to_uint8_rgb(rgb)
@@ -830,6 +849,12 @@ def _read_visual_crop_for_save(backend, x: int, y: int, w: int, h: int, downsamp
         # max_side is the desired output size, so read_roi_region_from_backend will
         # choose a pyramid/overview level close to that size when available.
         arr, axes, meta = read_roi_region_from_backend(backend, (int(x), int(y), int(w), int(h)), max_side=max(out_w, out_h))
+        if _is_safe_placeholder_meta(meta):
+            raise RuntimeError(
+                "Save aborted because the ROI preview returned a display-only placeholder instead of pixels. "
+                "The placeholder is allowed in the GUI, but it must not be saved as image content. "
+                "Use the low-memory crop path, a TIFF/OME-TIFF output, or convert the source to a tiled/pyramidal OME-TIFF with region access."
+            )
         rgb = _array_to_rgb_preview(arr, axes)
         rgb = _resize_rgb_to_exact(rgb, out_w, out_h)
         return rgb, {**(meta or {}), "visual_downsample": ds, "target_output_shape": (out_h, out_w, 3)}
@@ -4860,6 +4885,166 @@ def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, loss
             resolutionunit=resolutionunit, **compression_kwargs
         )
 
+
+
+def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: int,
+                         downsample: float = 1.0, output_format: str = "tiff",
+                         write_ome: bool = False, lossless: bool = True,
+                         source_resolution=None, source_mpp=None, image_name: Optional[str] = None,
+                         annotation_kv: Optional[Dict[str, Any]] = None,
+                         chunk_size: int = 2048, progress_callback=None) -> Dict[str, Any]:
+    """Save a large visual RGB crop using disk-backed chunks instead of one huge RAM array.
+
+    This is intended for large H&E/RGB-style crops where a single array could be
+    many GiB. It reads the source in manageable chunks, writes those chunks into a
+    temporary memory-mapped array on disk, and then writes the final TIFF/OME-TIFF.
+
+    The function deliberately does not use preview arrays. Therefore a GUI
+    placeholder such as "Preview skipped to keep GUI responsive" can never become
+    saved image content.
+    """
+    if backend is None or not getattr(backend, "path", None):
+        raise RuntimeError("No image backend is loaded.")
+
+    output_format = str(output_format or "tiff").lower()
+    if output_format == "jpeg":
+        raise RuntimeError(
+            "Large low-memory crop saving is supported for TIFF/OME-TIFF output. "
+            "JPEG requires a complete in-memory RGB image; increase downsample or save as TIFF/OME-TIFF."
+        )
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ds = max(1.0, float(downsample or 1.0))
+    full_w, full_h = backend.slide_dims
+    x, y, w, h = backend.clip_roi(int(x), int(y), int(w), int(h), int(full_w), int(full_h))
+    out_w = max(1, int(round(float(w) / ds)))
+    out_h = max(1, int(round(float(h) / ds)))
+    chunk_size = max(256, int(chunk_size or 2048))
+
+    # Calibration metadata must describe the output pixels after downsampling.
+    source_resolution, source_mpp = _scale_resolution_and_mpp(
+        source_resolution=source_resolution,
+        source_mpp=source_mpp,
+        pixel_scale=ds,
+    )
+
+    resolution = None
+    resolutionunit = None
+    if source_resolution is not None:
+        try:
+            xres, yres, unit = source_resolution
+            if xres and yres and unit:
+                resolution = (float(xres), float(yres))
+                resolutionunit = unit
+        except Exception:
+            resolution = None
+            resolutionunit = None
+
+    mpp_x_um = None
+    mpp_y_um = None
+    if source_mpp:
+        try:
+            mpp_x_um, mpp_y_um = float(source_mpp[0]), float(source_mpp[1])
+            if resolution is None:
+                derived = _mpp_to_resolution_tuple(mpp_x_um, mpp_y_um)
+                if derived is not None:
+                    resolution = (float(derived[0]), float(derived[1]))
+                    resolutionunit = derived[2]
+        except Exception:
+            mpp_x_um = None
+            mpp_y_um = None
+
+    temp_dir = tempfile.mkdtemp(prefix="tiffcropper_rgb_crop_")
+    temp_path = Path(temp_dir) / "rgb_crop_memmap.npy"
+    mm = None
+    try:
+        mm = np.lib.format.open_memmap(str(temp_path), mode="w+", dtype=np.uint8, shape=(out_h, out_w, 3))
+        total_blocks = int(math.ceil(out_h / chunk_size)) * int(math.ceil(out_w / chunk_size))
+        done = 0
+
+        from PIL import Image
+        for oy0 in range(0, out_h, chunk_size):
+            oy1 = min(out_h, oy0 + chunk_size)
+            for ox0 in range(0, out_w, chunk_size):
+                ox1 = min(out_w, ox0 + chunk_size)
+
+                if ds == 1.0:
+                    sx0 = int(x + ox0)
+                    sy0 = int(y + oy0)
+                    sw = int(ox1 - ox0)
+                    sh = int(oy1 - oy0)
+                else:
+                    sx0 = int(x + math.floor(ox0 * ds))
+                    sy0 = int(y + math.floor(oy0 * ds))
+                    sx1 = int(x + math.ceil(ox1 * ds))
+                    sy1 = int(y + math.ceil(oy1 * ds))
+                    sx1 = min(int(x + w), sx1)
+                    sy1 = min(int(y + h), sy1)
+                    sw = max(1, sx1 - sx0)
+                    sh = max(1, sy1 - sy0)
+
+                chunk, info = backend.crop(sx0, sy0, sw, sh, fill=255)
+                chunk = _to_uint8_rgb(chunk)
+                target_w = int(ox1 - ox0)
+                target_h = int(oy1 - oy0)
+                if chunk.shape[1] != target_w or chunk.shape[0] != target_h:
+                    chunk = np.asarray(
+                        Image.fromarray(chunk).resize((target_w, target_h), Image.Resampling.LANCZOS),
+                        dtype=np.uint8,
+                    )
+                mm[oy0:oy1, ox0:ox1, :] = chunk
+                done += 1
+                if progress_callback is not None:
+                    try:
+                        progress_callback(done, total_blocks)
+                        QApplication.processEvents()
+                    except Exception:
+                        pass
+
+        mm.flush()
+        compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
+        if write_ome:
+            ome_xml = _build_ome_xml_rgb(
+                size_x=int(out_w),
+                size_y=int(out_h),
+                physical_size_x_um=mpp_x_um,
+                physical_size_y_um=mpp_y_um,
+                image_name=image_name or output_path.stem,
+                annotation_kv=annotation_kv,
+            )
+            tifffile.imwrite(
+                str(output_path), mm, bigtiff=True, tile=(256, 256), photometric="rgb",
+                description=_ascii_safe(ome_xml), software=f"{APP_NAME} v{APP_VERSION}",
+                resolution=resolution, resolutionunit=resolutionunit, **compression_kwargs,
+            )
+        else:
+            tifffile.imwrite(
+                str(output_path), mm, bigtiff=True, tile=(256, 256), photometric="rgb",
+                description=_ascii_safe(f"Generated by {APP_NAME} v{APP_VERSION}"),
+                software=f"{APP_NAME} v{APP_VERSION}", resolution=resolution,
+                resolutionunit=resolutionunit, **compression_kwargs,
+            )
+
+        return {
+            "lowmem": True,
+            "shape": (int(out_h), int(out_w), 3),
+            "dtype": "uint8",
+            "downsample": float(ds),
+            "chunks": int(total_blocks),
+            "temp_bytes": int(out_h) * int(out_w) * 3,
+        }
+    finally:
+        try:
+            del mm
+        except Exception:
+            pass
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+            Path(temp_dir).rmdir()
+        except Exception:
+            pass
 
 def save_multichannel_image(output_path, arr, axes=None, write_ome=True, lossless=True,
                             source_resolution=None, source_mpp=None, image_name=None,
@@ -10684,6 +10869,8 @@ class WSICropTileMergeGUI(QMainWindow):
             suffix, raw_downsample, combo, output_format, write_ome, ext = self._crop_output_settings()
             out_path = self.backend.path_obj.parent / f"{self.backend.path_obj.stem}_crop_{suffix}{ext}"
             x, y, w, h = self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
+            visual_lowmem = False
+            visual_est_rgb = None
 
             preserve_raw = (
                 hasattr(self, "crop_preserve_channels_chk")
@@ -10770,20 +10957,24 @@ class WSICropTileMergeGUI(QMainWindow):
                     )
                     return
             else:
-                est_rgb = _estimate_rgb_crop_bytes(w, h, downsample=raw_downsample, channels=3, dtype=np.uint8)
-                if est_rgb > MAX_INTERACTIVE_CROP_BYTES:
-                    QMessageBox.warning(
-                        self,
-                        "Crop too large for RGB output",
-                        "This crop would require a very large RGB array and was stopped before allocation.\n\n"
-                        f"Estimated RGB output: {_human_bytes(est_rgb)}\n"
-                        f"ROI: X={x}, Y={y}, W={w}, H={h}\n\n"
-                        "Recommended options:\n"
-                        "1) Increase Downsample before saving a visual RGB crop.\n"
-                        "2) For IF/OME-TIFF, enable Preserve raw channels and save OME-TIFF.\n"
-                        "3) Use Tiles mode for whole-slide export."
+                visual_est_rgb = _estimate_rgb_crop_bytes(w, h, downsample=raw_downsample, channels=3, dtype=np.uint8)
+                if visual_est_rgb > MAX_INTERACTIVE_CROP_BYTES:
+                    if output_format == "jpeg":
+                        QMessageBox.warning(
+                            self,
+                            "JPEG crop too large",
+                            "This crop is too large to build as a single JPEG array.\n\n"
+                            f"Estimated RGB output: {_human_bytes(visual_est_rgb)}\n"
+                            f"ROI: X={x}, Y={y}, W={w}, H={h}\n\n"
+                            "Please save as TIFF/OME-TIFF for low-memory chunked export, "
+                            "increase Downsample, or use Tiles mode."
+                        )
+                        return
+                    visual_lowmem = True
+                    self.info_label.setText(
+                        f"Large RGB crop detected ({_human_bytes(visual_est_rgb)}). Saving with low-memory tiled export..."
                     )
-                    return
+                    QApplication.processEvents()
 
             if preserve_raw:
                 roi, axes, _ = self.backend.crop_raw(x, y, w, h)
@@ -10800,23 +10991,48 @@ class WSICropTileMergeGUI(QMainWindow):
                 cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
                 saved_text = f"Saved raw multichannel crop: {out_path} | shape={tuple(roi.shape)} | axes={axes or 'unknown'} | dtype={roi.dtype}{cal_text}"
             else:
-                roi, crop_meta = _read_visual_crop_for_save(self.backend, x, y, w, h, downsample=raw_downsample)
-                save_rgb_image(
-                    out_path, roi, output_format, write_ome, self.crop_lossless_chk.isChecked(),
-                    self.backend.source_resolution, self.backend.source_mpp, out_path.stem,
-                    self.backend.openslide_props if write_ome else None,
-                    pixel_scale=raw_downsample
-                )
-                cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
-                reader_text = crop_meta.get("reader", self.backend.reader) if isinstance(crop_meta, dict) else self.backend.reader
-                saved_text = f"Saved RGB crop: {out_path} | Reader: {reader_text} | output_shape={tuple(roi.shape)}{cal_text}"
+                if visual_lowmem:
+                    result = save_rgb_crop_lowmem(
+                        self.backend, out_path, x, y, w, h,
+                        downsample=raw_downsample, output_format=output_format,
+                        write_ome=write_ome, lossless=self.crop_lossless_chk.isChecked(),
+                        source_resolution=self.backend.source_resolution,
+                        source_mpp=self.backend.source_mpp,
+                        image_name=out_path.stem,
+                        annotation_kv=self.backend.openslide_props if write_ome else None,
+                        progress_callback=lambda done, total: self.info_label.setText(
+                            f"Saving large RGB crop by chunks: {done}/{total} blocks"
+                        ),
+                    )
+                    cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
+                    saved_text = (
+                        f"Saved large RGB crop using low-memory tiled export: {out_path} | "
+                        f"shape={result.get('shape')} | downsample={result.get('downsample')}{cal_text}"
+                    )
+                else:
+                    roi, crop_meta = _read_visual_crop_for_save(self.backend, x, y, w, h, downsample=raw_downsample)
+                    if _is_safe_placeholder_meta(crop_meta):
+                        raise RuntimeError(
+                            "The crop reader returned a display placeholder instead of real pixels. "
+                            "The crop was not saved to avoid writing the preview-warning text into the output image."
+                        )
+                    save_rgb_image(
+                        out_path, roi, output_format, write_ome, self.crop_lossless_chk.isChecked(),
+                        self.backend.source_resolution, self.backend.source_mpp, out_path.stem,
+                        self.backend.openslide_props if write_ome else None,
+                        pixel_scale=raw_downsample
+                    )
+                    cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
+                    reader_text = crop_meta.get("reader", self.backend.reader) if isinstance(crop_meta, dict) else self.backend.reader
+                    saved_text = f"Saved RGB crop: {out_path} | Reader: {reader_text} | output_shape={tuple(roi.shape)}{cal_text}"
 
             # Display a reduced preview instead of converting the full saved crop.
             if self.crop_preview_chk.isChecked():
                 try:
                     arr, axes_p, meta = read_roi_region_from_backend(self.backend, (x, y, w, h), max_side=1000)
-                    preview_rgb = _array_to_rgb_preview(arr, axes_p)
-                    self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(preview_rgb, 512))
+                    if not _is_safe_placeholder_meta(meta):
+                        preview_rgb = _array_to_rgb_preview(arr, axes_p)
+                        self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(preview_rgb, 512))
                 except Exception:
                     pass
             self.info_label.setText(saved_text)
