@@ -8,6 +8,7 @@ import json
 import traceback
 import threading
 import tempfile
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -888,6 +889,35 @@ def _try_openslide_thumbnail(path: str, max_side: int = 256):
         return None
 
 
+def _try_openslide_region(path: str, roi: Tuple[int, int, int, int], max_side: int = 1200):
+    """Try a lightweight OpenSlide region read as a visual TIFF fallback."""
+    openslide = _try_import_openslide()
+    if openslide is None:
+        return None
+    try:
+        slide = openslide.OpenSlide(str(path))
+        try:
+            x, y, w, h = [int(v) for v in roi]
+            target_ds = max(1.0, max(float(w), float(h)) / float(max(1, max_side)))
+            level = slide.get_best_level_for_downsample(target_ds)
+            ds = float(slide.level_downsamples[level])
+            lw = max(1, int(round(float(w) / ds)))
+            lh = max(1, int(round(float(h) / ds)))
+            img = slide.read_region((x, y), int(level), (lw, lh)).convert("RGB")
+            return np.asarray(img, dtype=np.uint8), "YXS", {
+                "reader": "openslide-visual-preview-fallback",
+                "level": int(level),
+                "step": ds,
+            }
+        finally:
+            try:
+                slide.close()
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
 def _safe_int_product(values) -> int:
     out = 1
     for v in values:
@@ -1041,6 +1071,67 @@ def save_tiff_raw_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int
         resolution=resolution, resolutionunit=resolutionunit, **compression_kwargs
     )
     return {"shape": out_shape, "axes": axes, "dtype": str(dtype), "lowmem": True}
+def _read_tiff_series_via_temporary_memmap(series, axes: str, roi: Tuple[int, int, int, int],
+                                            max_side: int = 1200) -> Tuple[np.ndarray, str, Dict[str, Any]]:
+    """Decode a TIFF series to temporary disk and return only a small ROI preview.
+
+    This is the final fallback for large compressed non-pyramidal TIFFs. It uses
+    disk instead of allocating the full image in RAM, then immediately copies only
+    the strided preview into memory and deletes the temporary cache.
+    """
+    shape = tuple(getattr(series, "shape", ()) or ())
+    dtype = np.dtype(getattr(series, "dtype", np.uint8))
+    estimated_bytes = _safe_int_product(shape) * dtype.itemsize if shape else 0
+    cache_dir = Path(tempfile.gettempdir()) / "tiffcropper_preview_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        free_bytes = shutil.disk_usage(str(cache_dir)).free
+    except Exception:
+        free_bytes = 0
+    if free_bytes and estimated_bytes and estimated_bytes > int(free_bytes * 0.85):
+        raise RuntimeError(
+            "Not enough temporary disk space for the low-memory TIFF preview. "
+            f"Required about {_human_bytes(estimated_bytes)}; available {_human_bytes(free_bytes)}."
+        )
+
+    fd, temp_name = tempfile.mkstemp(prefix="preview_", suffix=".bin", dir=str(cache_dir))
+    os.close(fd)
+    mm = None
+    try:
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+        mm = series.asarray(out=temp_name, maxworkers=max(1, min(2, os.cpu_count() or 1)))
+        mm_axes = axes if axes and len(axes) == mm.ndim else _guess_axes_for_array(mm, axes)
+        x, y, w, h = [int(v) for v in roi]
+        step = max(1, int(math.ceil(max(float(w), float(h)) / float(max(1, max_side)))))
+        small, out_axes = _slice_preview_zarr_region(mm, mm_axes, (x, y, w, h), step=step, level_downsample=1.0)
+        # Copy only the small preview; the large temporary memmap can then close.
+        small = np.array(small, copy=True)
+        return small, out_axes, {
+            "reader": "tifffile-temporary-disk-preview",
+            "step": step,
+            "decoded_cache_bytes": estimated_bytes,
+        }
+    finally:
+        if mm is not None:
+            try:
+                mmap_obj = getattr(mm, "_mmap", None)
+                if mmap_obj is not None:
+                    mmap_obj.close()
+            except Exception:
+                pass
+        try:
+            Path(temp_name).unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+
 def read_preview_array_from_file(path: str, max_side: int = 1200, allow_full_fallback: bool = False) -> Tuple[np.ndarray, str, Dict[str, Any]]:
     """Read a memory-light representative preview array from RGB, TIFF, or OME-TIFF.
 
@@ -1173,7 +1264,31 @@ def read_preview_array_from_file(path: str, max_side: int = 1200, allow_full_fal
             except Exception as overview_error:
                 last_error = overview_error
 
-            # Only small files are allowed to fall back to full read.
+            # Large compressed non-pyramidal TIFF fallback: decode once to a
+            # temporary disk-backed array and keep only the small overview in RAM.
+            try:
+                if axes and len(axes) == len(shape) and "Y" in axes and "X" in axes:
+                    full_h0 = int(shape[axes.index("Y")]); full_w0 = int(shape[axes.index("X")])
+                elif len(shape) >= 2:
+                    full_h0, full_w0 = int(shape[-2]), int(shape[-1])
+                else:
+                    full_w0 = full_h0 = 0
+                if full_w0 > 0 and full_h0 > 0:
+                    arr, axes2, dmeta = _read_tiff_series_via_temporary_memmap(
+                        s, axes, (0, 0, full_w0, full_h0), max_side=max_side
+                    )
+                    return arr, axes2, {**meta, **dmeta, "shape": shape, "axes": axes}
+            except Exception as disk_error:
+                last_error = disk_error
+
+            # Visual fallback for TIFFs that OpenSlide can decode even when
+            # tifffile cannot provide region access.
+            os_preview = _try_openslide_region(path, (0, 0, full_w0, full_h0), max_side=max_side) if full_w0 and full_h0 else None
+            if os_preview is not None:
+                arr, axes2, ometa = os_preview
+                return arr, axes2, {**meta, **ometa, "shape": shape, "axes": axes}
+
+            # Only small files are allowed to fall back to a normal RAM read.
             spatial_pixels = 0
             try:
                 if axes and len(axes) == len(shape) and "Y" in axes and "X" in axes:
@@ -1189,10 +1304,10 @@ def read_preview_array_from_file(path: str, max_side: int = 1200, allow_full_fal
                 return rgb, "YXS", {**meta, "reader": "tifffile-full-fallback", "shape": shape, "axes": axes}
 
             msg = (
-                "Preview skipped to keep GUI responsive.\n"
+                "Preview could not be decoded.\n"
                 f"File: {p.name}\nShape: {shape} axes={axes}\n"
-                "This TIFF could not expose a tiled/zarr or memmap preview.\n"
-                "Saving/cropping may still work; preview would require a full read."
+                "Pyramid, zarr, direct memmap, temporary disk preview, and OpenSlide fallbacks all failed.\n"
+                f"Last error: {last_error}"
             )
             return _placeholder_rgb(msg), "YXS", {**meta, "reader": "safe-placeholder", "shape": shape, "axes": axes, "error": str(last_error)}
 
@@ -1208,6 +1323,13 @@ def save_preview_jpg(path: Path, rgb: np.ndarray, quality: int = 95):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(_to_uint8_rgb(rgb)).save(str(path), quality=int(quality))
+
+
+def save_preview_png(path: Path, rgb: np.ndarray):
+    from PIL import Image
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(_to_uint8_rgb(rgb)).save(str(path), format="PNG")
 
 
 def _downsample_tiff_raw_lowmem(input_path: Path, output_path: Path, downsample: float,
@@ -2404,6 +2526,42 @@ def _apply_display_adjustments(rgb: np.ndarray, brightness: int = 0, negative: b
     return np.ascontiguousarray(arr)
 
 
+class ScalablePixmapLabel(QLabel):
+    """QLabel that keeps the original preview and rescales it with the widget.
+
+    A normal QLabel stores the already-scaled pixmap, so making the window
+    larger leaves a small preview centered inside a larger empty panel.  This
+    label keeps the source pixmap and redraws it whenever the panel is resized.
+    """
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._source_pixmap = None
+        self.setAlignment(Qt.AlignCenter)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_rgb(self, rgb):
+        self._source_pixmap = _numpy_rgb_to_qpixmap(_to_uint8_rgb(rgb))
+        self._rescale_source_pixmap()
+
+    def clear_preview(self, text=""):
+        self._source_pixmap = None
+        super().clear()
+        if text:
+            self.setText(str(text))
+
+    def _rescale_source_pixmap(self):
+        if self._source_pixmap is None or self.width() <= 1 or self.height() <= 1:
+            return
+        scaled = self._source_pixmap.scaled(
+            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        QLabel.setPixmap(self, scaled)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rescale_source_pixmap()
+
+
 class CropSelectionLabel(QLabel):
     """Interactive crop preview with zoom-region coordinates.
 
@@ -3423,14 +3581,24 @@ class ZoomRegionPreviewLabel(QLabel):
 
 
 def _compute_zoom_roi(full_w: int, full_h: int, center_xy, zoom: float, viewport_w: int, viewport_h: int):
-    """Compute an original-resolution ROI for a fixed zoom and preview aspect ratio."""
+    """Compute an original-resolution ROI for a fixed zoom and preview aspect ratio.
+
+    At Fit/100% the complete image must be visible, regardless of whether the
+    preview widget is wide, tall, or square. Older versions forced the viewport
+    aspect ratio even at zoom=1, which cropped the top and bottom of square images.
+    """
     full_w = int(full_w)
     full_h = int(full_h)
     zoom = max(1.0, float(zoom))
     viewport_w = max(1, int(viewport_w))
     viewport_h = max(1, int(viewport_h))
-    aspect = viewport_w / float(viewport_h)
 
+    # Fit means fit the entire image. The QLabel itself letterboxes the pixmap
+    # with KeepAspectRatio, so no source pixels need to be discarded.
+    if zoom <= 1.000001:
+        return 0, 0, full_w, full_h
+
+    aspect = viewport_w / float(viewport_h)
     roi_w = full_w / zoom
     roi_h = roi_w / aspect
     max_h_by_zoom = full_h / zoom
@@ -3545,7 +3713,22 @@ def read_zoom_region_from_file(path: str, center_xy=None, zoom: float = 1.0,
             except Exception as overview_error:
                 last_error = overview_error
 
-            # Avoid full reading huge files in the GUI thread.
+            # Decode to temporary disk rather than refusing to display a large
+            # compressed non-pyramidal TIFF. Only the strided ROI stays in RAM.
+            try:
+                arr, out_axes, dmeta = _read_tiff_series_via_temporary_memmap(
+                    s0, axes, roi, max_side=max_side
+                )
+                return arr, out_axes, {**meta, **dmeta, "shape": shape, "axes": axes, "roi": roi, "full_dims": (full_w, full_h)}
+            except Exception as disk_error:
+                last_error = disk_error
+
+            os_preview = _try_openslide_region(path, roi, max_side=max_side)
+            if os_preview is not None:
+                arr, out_axes, ometa = os_preview
+                return arr, out_axes, {**meta, **ometa, "shape": shape, "axes": axes, "roi": roi, "full_dims": (full_w, full_h)}
+
+            # Avoid a normal in-RAM full read for huge files.
             spatial_pixels = int(full_w) * int(full_h)
             if spatial_pixels <= 25_000_000:
                 arr = s0.asarray()
@@ -3567,10 +3750,10 @@ def read_zoom_region_from_file(path: str, center_xy=None, zoom: float = 1.0,
                 return arr, _guess_axes_for_array(arr, axes), {**meta, "reader": "tifffile-simple-region", "shape": shape, "axes": axes, "roi": roi, "step": step, "full_dims": (full_w, full_h)}
 
             msg = (
-                "Zoom preview skipped to keep GUI responsive.\n"
+                "Zoom preview could not be decoded.\n"
                 f"File: {p.name}\nShape: {shape} axes={axes}\n"
-                "This TIFF could not expose zarr or memmap region access.\n"
-                "Use saved previews or convert to tiled OME-TIFF for fast interactive viewing."
+                "Pyramid, zarr, direct memmap, temporary disk preview, and OpenSlide fallbacks all failed.\n"
+                f"Last error: {last_error}"
             )
             return _placeholder_rgb(msg, width=max(600, vw), height=max(400, vh)), "YXS", {**meta, "reader": "safe-placeholder-region", "shape": shape, "axes": axes, "roi": roi, "full_dims": (full_w, full_h), "error": str(last_error)}
 
@@ -3880,9 +4063,31 @@ def read_zoom_region_from_backend(backend, center_xy=None, zoom: float = 1.0,
             arr, out_axes = _slice_preview_zarr_region(mm, mm_axes, roi, step=step, level_downsample=1.0)
             return arr, out_axes, {**meta, "reader": "tifffile-memmap-cached-region", "shape": shape, "axes": mm_axes, "step": step}
         except Exception as mmap_error:
-            pass
+            meta["memmap_error"] = str(mmap_error)
 
-        # 4) Last safe fallback only for genuinely small images.
+        # 4) Large compressed non-pyramidal TIFF: create/reuse a decoded
+        # disk-backed cache. This keeps the full image out of RAM and makes later
+        # zoom/pan reads fast instead of displaying a warning placeholder.
+        try:
+            disk_mm, disk_axes = backend._get_tiff_decoded_memmap()
+            arr, out_axes = _slice_preview_zarr_region(disk_mm, disk_axes, roi, step=step, level_downsample=1.0)
+            return np.array(arr, copy=True), out_axes, {
+                **meta,
+                "reader": "tifffile-disk-cache-region",
+                "shape": shape,
+                "axes": disk_axes,
+                "step": step,
+            }
+        except Exception as disk_error:
+            meta["disk_preview_error"] = str(disk_error)
+
+        # Visual-only OpenSlide fallback, when supported by the TIFF.
+        os_preview = _try_openslide_region(backend.path, roi, max_side=max_side)
+        if os_preview is not None:
+            arr, out_axes, ometa = os_preview
+            return arr, out_axes, {**meta, **ometa, "shape": shape, "axes": axes}
+
+        # 5) Last normal RAM fallback only for genuinely small images.
         spatial_pixels = int(full_w) * int(full_h)
         if spatial_pixels <= 25_000_000:
             arr = series.asarray()
@@ -3890,10 +4095,10 @@ def read_zoom_region_from_backend(backend, center_xy=None, zoom: float = 1.0,
             return arr, out_axes, {**meta, "reader": "tifffile-small-full-cached-region", "shape": shape, "axes": axes, "step": step}
 
         msg = (
-            "Zoom preview skipped to keep GUI responsive.\n"
+            "Zoom preview could not be decoded.\n"
             f"File: {Path(backend.path).name}\nShape: {shape} axes={axes}\n"
-            "No fast pyramid/overview, zarr, or memmap region access was available.\n"
-            "Convert to a tiled/pyramidal OME-TIFF for fast interactive viewing."
+            "All pyramid, zarr, direct memmap, temporary disk cache, and OpenSlide fallbacks failed.\n"
+            f"Last error: {meta.get('disk_preview_error', zarr_error)}"
         )
         return _placeholder_rgb(msg, width=max(600, int(vw)), height=max(400, int(vh))), "YXS", {**meta, "reader": "safe-placeholder-cached-region", "shape": shape, "axes": axes, "error": str(zarr_error)}
 
@@ -3988,8 +4193,26 @@ def read_roi_region_from_backend(backend, roi_full: Tuple[int, int, int, int], m
             mm_axes = axes if axes and len(axes) == mm.ndim else _guess_axes_for_array(mm, axes)
             arr, out_axes = _slice_preview_zarr_region(mm, mm_axes, roi, step=step, level_downsample=1.0)
             return arr, out_axes, {**meta, "reader": "tifffile-memmap-cached-roi-preview", "shape": shape, "axes": mm_axes, "step": step}
-        except Exception:
-            pass
+        except Exception as mmap_error:
+            meta["memmap_error"] = str(mmap_error)
+
+        try:
+            disk_mm, disk_axes = backend._get_tiff_decoded_memmap()
+            arr, out_axes = _slice_preview_zarr_region(disk_mm, disk_axes, roi, step=step, level_downsample=1.0)
+            return np.array(arr, copy=True), out_axes, {
+                **meta,
+                "reader": "tifffile-disk-cache-roi-preview",
+                "shape": shape,
+                "axes": disk_axes,
+                "step": step,
+            }
+        except Exception as disk_error:
+            meta["disk_preview_error"] = str(disk_error)
+
+        os_preview = _try_openslide_region(backend.path, roi, max_side=max_side)
+        if os_preview is not None:
+            arr, out_axes, ometa = os_preview
+            return arr, out_axes, {**meta, **ometa, "shape": shape, "axes": axes}
 
         if int(full_w) * int(full_h) <= 25_000_000:
             arr = series.asarray()
@@ -3997,10 +4220,10 @@ def read_roi_region_from_backend(backend, roi_full: Tuple[int, int, int, int], m
             return arr, out_axes, {**meta, "reader": "tifffile-small-full-cached-roi-preview", "shape": shape, "axes": axes, "step": step}
 
         msg = (
-            "Crop/tile preview skipped to keep GUI responsive.\n"
+            "Crop/tile preview could not be decoded.\n"
             f"File: {Path(backend.path).name}\nShape: {shape} axes={axes}\n"
-            "No fast pyramid/overview, zarr, or memmap region access was available.\n"
-            "The selected crop coordinates are still full-resolution coordinates."
+            "All pyramid, zarr, direct memmap, temporary disk cache, and OpenSlide fallbacks failed.\n"
+            f"Last error: {meta.get('disk_preview_error', zarr_error)}"
         )
         return _placeholder_rgb(msg, width=700, height=500), "YXS", {**meta, "reader": "safe-placeholder-cached-roi-preview", "shape": shape, "axes": axes, "error": str(zarr_error)}
 
@@ -4221,6 +4444,9 @@ class ImageBackend:
         self._tif_axes = None
         self._zarr_array = None
         self._zarr_error = None
+        self._decoded_memmap = None
+        self._decoded_memmap_path = None
+        self._decoded_memmap_axes = None
 
     def load(self, path: str):
         # Close any cached reader before loading a new file.
@@ -4243,6 +4469,9 @@ class ImageBackend:
         self._tif_axes = None
         self._zarr_array = None
         self._zarr_error = None
+        self._decoded_memmap = None
+        self._decoded_memmap_path = None
+        self._decoded_memmap_axes = None
 
         lower_name = self.path_obj.name.lower()
 
@@ -4343,6 +4572,31 @@ class ImageBackend:
         self._zarr_array = None
         self._zarr_error = None
 
+        # Large compressed non-pyramidal TIFFs may be decoded once into a
+        # temporary disk-backed memmap for lightweight previews. Close and
+        # remove that cache when the image is changed or the app exits.
+        mm = getattr(self, "_decoded_memmap", None)
+        mm_path = getattr(self, "_decoded_memmap_path", None)
+        if mm is not None:
+            try:
+                mmap_obj = getattr(mm, "_mmap", None)
+                if mmap_obj is not None:
+                    mmap_obj.close()
+            except Exception:
+                pass
+        self._decoded_memmap = None
+        self._decoded_memmap_axes = None
+        self._decoded_memmap_path = None
+        if mm_path:
+            try:
+                mm_path_obj = Path(mm_path)
+                # Never delete the source TIFF when tifffile returned a direct
+                # memory map of an uncompressed file.
+                if self.path and mm_path_obj.resolve() != Path(self.path).resolve() and mm_path_obj.exists():
+                    mm_path_obj.unlink()
+            except Exception:
+                pass
+
     def __del__(self):
         try:
             self.close()
@@ -4392,6 +4646,59 @@ class ImageBackend:
                 self._zarr_error = e
 
         return self._zarr_array, self._tif_series, self._tif_axes, self._zarr_error
+
+    def _get_tiff_decoded_memmap(self):
+        """Return a cached disk-backed decoded TIFF array for preview fallback.
+
+        This path is used only when a large non-pyramidal compressed TIFF cannot
+        expose zarr or direct memmap region access. tifffile decodes the series
+        into a temporary file instead of a giant RAM array. The cache is reused
+        for subsequent zoom/pan operations and removed by :meth:`close`.
+        """
+        if self.reader != "tifffile":
+            raise RuntimeError("Disk-backed TIFF preview cache requires a tifffile backend.")
+        if self._decoded_memmap is not None:
+            return self._decoded_memmap, self._decoded_memmap_axes or self._tif_axes or ""
+
+        if self._tif_obj is None:
+            self._tif_obj = tifffile.TiffFile(self.path)
+            self._tif_series = self._tif_obj.series[0]
+            self._tif_axes = getattr(self._tif_series, "axes", "") or ""
+
+        series = self._tif_series
+        axes = self._tif_axes or getattr(series, "axes", "") or ""
+        shape = tuple(getattr(series, "shape", ()) or ())
+        dtype = np.dtype(getattr(series, "dtype", np.uint8))
+        estimated_bytes = _safe_int_product(shape) * dtype.itemsize if shape else 0
+
+        cache_dir = Path(tempfile.gettempdir()) / "tiffcropper_preview_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            free_bytes = shutil.disk_usage(str(cache_dir)).free
+        except Exception:
+            free_bytes = 0
+        if free_bytes and estimated_bytes and estimated_bytes > int(free_bytes * 0.85):
+            raise RuntimeError(
+                "Not enough temporary disk space to build the low-memory preview cache. "
+                f"Required about {_human_bytes(estimated_bytes)}; available {_human_bytes(free_bytes)}."
+            )
+
+        fd, temp_name = tempfile.mkstemp(prefix="decoded_", suffix=".bin", dir=str(cache_dir))
+        os.close(fd)
+        try:
+            # Keep worker count conservative: decoding to disk is I/O-bound and
+            # high parallelism can inflate temporary memory usage.
+            mm = series.asarray(out=temp_name, maxworkers=max(1, min(2, os.cpu_count() or 1)))
+            self._decoded_memmap = mm
+            self._decoded_memmap_path = str(getattr(mm, "filename", temp_name) or temp_name)
+            self._decoded_memmap_axes = axes if axes and len(axes) == mm.ndim else _guess_axes_for_array(mm, axes)
+            return self._decoded_memmap, self._decoded_memmap_axes
+        except Exception:
+            try:
+                Path(temp_name).unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
 
     def _read_with_pil(self, path: str) -> np.ndarray:
         Image = _try_import_pil()
@@ -4814,9 +5121,215 @@ def _is_sample_axis_array(arr_shape, axes: str) -> bool:
         return bool(len(arr_shape) >= 3 and int(arr_shape[-1]) in (3, 4))
 
 
+PYRAMID_TOTAL_LEVELS = 8
+
+
+def _spatial_axes_indices(shape, axes: str = None) -> Tuple[int, int, str]:
+    """Return Y/X axis indices and a normalized axes string."""
+    axes = _normalize_axes_for_tiff_write(shape, axes or "")
+    if axes and len(axes) == len(shape) and "Y" in axes and "X" in axes:
+        return axes.index("Y"), axes.index("X"), axes
+    if len(shape) < 2:
+        raise ValueError(f"Cannot build a pyramid for shape {tuple(shape)} without Y/X dimensions.")
+    return len(shape) - 2, len(shape) - 1, axes
+
+
+def _effective_pyramid_levels(shape, axes: str, requested_levels: int = PYRAMID_TOTAL_LEVELS) -> int:
+    """Return the number of distinct pyramid levels possible for the image."""
+    requested_levels = max(1, int(requested_levels or 1))
+    y_axis, x_axis, _ = _spatial_axes_indices(shape, axes)
+    h = max(1, int(shape[y_axis]))
+    w = max(1, int(shape[x_axis]))
+    levels = 1
+    while levels < requested_levels and (h > 1 or w > 1):
+        h = max(1, h // 2)
+        w = max(1, w // 2)
+        levels += 1
+    return levels
+
+
+def _close_and_remove_memmap(arr, path: Optional[Path]):
+    try:
+        mmap_obj = getattr(arr, "_mmap", None)
+        if mmap_obj is not None:
+            mmap_obj.close()
+    except Exception:
+        pass
+    if path is not None:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _half_downsample_to_memmap(src, axes: str, output_path: Path, chunk_rows: int = 128):
+    """Create a half-resolution array on disk with bounded RAM use.
+
+    Spatial Y/X dimensions are reduced by 2 using a 2x2 box average. All other
+    dimensions (C/Z/T/S) and the original dtype are preserved.
+    """
+    src = np.asarray(src)
+    y_axis, x_axis, axes = _spatial_axes_indices(src.shape, axes)
+    in_h = int(src.shape[y_axis])
+    in_w = int(src.shape[x_axis])
+    out_h = max(1, in_h // 2)
+    out_w = max(1, in_w // 2)
+    out_shape = list(src.shape)
+    out_shape[y_axis] = out_h
+    out_shape[x_axis] = out_w
+    out = np.lib.format.open_memmap(
+        str(output_path), mode="w+", dtype=src.dtype, shape=tuple(out_shape)
+    )
+
+    non_spatial_axes = [i for i in range(src.ndim) if i not in (y_axis, x_axis)]
+    non_spatial_shape = tuple(int(src.shape[i]) for i in non_spatial_axes)
+    axis_to_pos = {axis: pos for pos, axis in enumerate(non_spatial_axes)}
+    iterator_shape = non_spatial_shape if non_spatial_shape else (1,)
+    chunk_rows = max(16, int(chunk_rows or 128))
+
+    for idx in np.ndindex(iterator_shape):
+        in_base = [slice(None)] * src.ndim
+        out_base = [slice(None)] * src.ndim
+        for axis in non_spatial_axes:
+            value = idx[axis_to_pos[axis]] if non_spatial_shape else 0
+            in_base[axis] = int(value)
+            out_base[axis] = int(value)
+
+        for oy0 in range(0, out_h, chunk_rows):
+            oy1 = min(out_h, oy0 + chunk_rows)
+            sy0 = oy0 * 2
+            sy1 = min(in_h, oy1 * 2)
+            in_sel = list(in_base)
+            in_sel[y_axis] = slice(sy0, sy1)
+            in_sel[x_axis] = slice(0, min(in_w, out_w * 2))
+            plane = np.asarray(src[tuple(in_sel)])
+
+            # Scalar selection of all non-spatial axes should leave Y/X. If an
+            # unusual array layout remains, move Y/X to a 2D view conservatively.
+            plane = np.squeeze(plane)
+            if plane.ndim != 2:
+                raise ValueError(
+                    f"Could not create 2D pyramid plane from shape {src.shape}, axes={axes}; got {plane.shape}."
+                )
+
+            target_rows = oy1 - oy0
+            need_h = target_rows * 2
+            need_w = out_w * 2
+            pad_h = max(0, need_h - plane.shape[0])
+            pad_w = max(0, need_w - plane.shape[1])
+            if pad_h or pad_w:
+                plane = np.pad(plane, ((0, pad_h), (0, pad_w)), mode="edge")
+            plane = plane[:need_h, :need_w]
+
+            a = plane[0::2, 0::2]
+            b = plane[0::2, 1::2]
+            c = plane[1::2, 0::2]
+            d = plane[1::2, 1::2]
+            if np.issubdtype(src.dtype, np.bool_):
+                reduced = (a.astype(np.uint8) + b.astype(np.uint8) + c.astype(np.uint8) + d.astype(np.uint8)) >= 2
+            elif np.issubdtype(src.dtype, np.unsignedinteger):
+                reduced = (
+                    a.astype(np.uint64) + b.astype(np.uint64) +
+                    c.astype(np.uint64) + d.astype(np.uint64) + 2
+                ) // 4
+                reduced = reduced.astype(src.dtype)
+            elif np.issubdtype(src.dtype, np.signedinteger):
+                reduced = np.rint(
+                    (a.astype(np.int64) + b.astype(np.int64) + c.astype(np.int64) + d.astype(np.int64)) / 4.0
+                ).astype(src.dtype)
+            else:
+                reduced = (
+                    a.astype(np.float32) + b.astype(np.float32) +
+                    c.astype(np.float32) + d.astype(np.float32)
+                ) * 0.25
+                reduced = reduced.astype(src.dtype)
+
+            out_sel = list(out_base)
+            out_sel[y_axis] = slice(oy0, oy1)
+            out_sel[x_axis] = slice(0, out_w)
+            out[tuple(out_sel)] = reduced[:target_rows, :out_w]
+
+    out.flush()
+    return out, axes
+
+
+def _write_pyramidal_tiff(output_path: Path, arr, axes: str, write_ome: bool,
+                           lossless: bool, metadata: Optional[Dict[str, Any]],
+                           photometric: str, resolution=None, resolutionunit=None,
+                           description: Optional[str] = None,
+                           requested_levels: int = PYRAMID_TOTAL_LEVELS,
+                           low_memory_levels: bool = False) -> int:
+    """Write a tiled TIFF/OME-TIFF pyramid with up to eight total levels."""
+    output_path = Path(output_path)
+    arr = np.asarray(arr)
+    axes = _normalize_axes_for_tiff_write(arr.shape, axes)
+    level_count = _effective_pyramid_levels(arr.shape, axes, requested_levels)
+    compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="tiffcropper_pyramid_")) if low_memory_levels and level_count > 1 else None
+    current = arr
+    current_temp = None
+    try:
+        with tifffile.TiffWriter(str(output_path), bigtiff=True, ome=bool(write_ome)) as tif:
+            first_kwargs = dict(
+                photometric=photometric,
+                tile=(256, 256),
+                subifds=max(0, level_count - 1),
+                metadata=metadata if metadata else None,
+                software=f"{APP_NAME} v{APP_VERSION}",
+                resolution=resolution,
+                resolutionunit=resolutionunit,
+                **compression_kwargs,
+            )
+            if not write_ome and description:
+                first_kwargs["description"] = _ascii_safe(description)
+            tif.write(current, **first_kwargs)
+
+            for level_index in range(1, level_count):
+                if low_memory_levels:
+                    next_path = temp_dir / f"level_{level_index}.npy"
+                    next_arr, _ = _half_downsample_to_memmap(current, axes, next_path)
+                else:
+                    next_arr, _ = _resize_spatial_array(current, axes, downsample=2.0)
+                    next_path = None
+
+                level_resolution = None
+                if resolution is not None:
+                    try:
+                        scale = float(2 ** level_index)
+                        level_resolution = (float(resolution[0]) / scale, float(resolution[1]) / scale)
+                    except Exception:
+                        level_resolution = None
+                tif.write(
+                    next_arr,
+                    photometric=photometric,
+                    tile=(256, 256),
+                    subfiletype=1,
+                    metadata=None,
+                    resolution=level_resolution,
+                    resolutionunit=resolutionunit,
+                    **compression_kwargs,
+                )
+
+                if current_temp is not None:
+                    _close_and_remove_memmap(current, current_temp)
+                current = next_arr
+                current_temp = next_path
+
+        return level_count
+    finally:
+        if current_temp is not None:
+            _close_and_remove_memmap(current, current_temp)
+        if temp_dir is not None:
+            try:
+                temp_dir.rmdir()
+            except Exception:
+                shutil.rmtree(str(temp_dir), ignore_errors=True)
+
+
 def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, lossless=True,
                    source_resolution=None, source_mpp=None, image_name=None, annotation_kv=None,
-                   pixel_scale=1.0):
+                   pixel_scale=1.0, pyramid_levels: int = 1):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     rgb = _to_uint8_rgb(rgb)
@@ -4863,6 +5376,38 @@ def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, loss
 
     compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
 
+    if int(pyramid_levels or 1) > 1:
+        metadata = {"axes": "YXS", "Name": str(image_name or output_path.stem)}
+        if mpp_x_um and mpp_y_um:
+            metadata.update({
+                "PhysicalSizeX": float(mpp_x_um),
+                "PhysicalSizeY": float(mpp_y_um),
+                "PhysicalSizeXUnit": "um",
+                "PhysicalSizeYUnit": "um",
+            })
+        if annotation_kv:
+            # Keep source properties in the OME image description without
+            # replacing tifffile's pyramid-aware OME-XML.
+            try:
+                metadata["Description"] = json.dumps(annotation_kv, ensure_ascii=True, default=str)
+            except Exception:
+                pass
+        _write_pyramidal_tiff(
+            output_path,
+            rgb,
+            axes="YXS",
+            write_ome=bool(write_ome),
+            lossless=bool(lossless),
+            metadata=metadata if write_ome else None,
+            photometric="rgb",
+            resolution=resolution,
+            resolutionunit=resolutionunit,
+            description=f"Generated by {APP_NAME} v{APP_VERSION}; pyramidal TIFF with {int(pyramid_levels)} requested levels",
+            requested_levels=int(pyramid_levels),
+            low_memory_levels=False,
+        )
+        return
+
     if write_ome:
         ome_xml = _build_ome_xml_rgb(
             size_x=int(rgb.shape[1]),
@@ -4892,7 +5437,8 @@ def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: 
                          write_ome: bool = False, lossless: bool = True,
                          source_resolution=None, source_mpp=None, image_name: Optional[str] = None,
                          annotation_kv: Optional[Dict[str, Any]] = None,
-                         chunk_size: int = 2048, progress_callback=None) -> Dict[str, Any]:
+                         chunk_size: int = 2048, progress_callback=None,
+                         pyramid_levels: int = 1) -> Dict[str, Any]:
     """Save a large visual RGB crop using disk-backed chunks instead of one huge RAM array.
 
     This is intended for large H&E/RGB-style crops where a single array could be
@@ -5004,7 +5550,36 @@ def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: 
 
         mm.flush()
         compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
-        if write_ome:
+        written_levels = 1
+        if int(pyramid_levels or 1) > 1:
+            metadata = {"axes": "YXS", "Name": str(image_name or output_path.stem)}
+            if mpp_x_um and mpp_y_um:
+                metadata.update({
+                    "PhysicalSizeX": float(mpp_x_um),
+                    "PhysicalSizeY": float(mpp_y_um),
+                    "PhysicalSizeXUnit": "um",
+                    "PhysicalSizeYUnit": "um",
+                })
+            if annotation_kv:
+                try:
+                    metadata["Description"] = json.dumps(annotation_kv, ensure_ascii=True, default=str)
+                except Exception:
+                    pass
+            written_levels = _write_pyramidal_tiff(
+                output_path,
+                mm,
+                axes="YXS",
+                write_ome=bool(write_ome),
+                lossless=bool(lossless),
+                metadata=metadata if write_ome else None,
+                photometric="rgb",
+                resolution=resolution,
+                resolutionunit=resolutionunit,
+                description=f"Generated by {APP_NAME} v{APP_VERSION}; pyramidal TIFF",
+                requested_levels=int(pyramid_levels),
+                low_memory_levels=True,
+            )
+        elif write_ome:
             ome_xml = _build_ome_xml_rgb(
                 size_x=int(out_w),
                 size_y=int(out_h),
@@ -5033,6 +5608,7 @@ def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: 
             "downsample": float(ds),
             "chunks": int(total_blocks),
             "temp_bytes": int(out_h) * int(out_w) * 3,
+            "pyramid_levels": int(written_levels),
         }
     finally:
         try:
@@ -5048,7 +5624,7 @@ def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: 
 
 def save_multichannel_image(output_path, arr, axes=None, write_ome=True, lossless=True,
                             source_resolution=None, source_mpp=None, image_name=None,
-                            pixel_scale=1.0):
+                            pixel_scale=1.0, pyramid_levels: int = 1):
     """Save scientific crop data without RGB conversion or intensity normalization."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5102,6 +5678,23 @@ def save_multichannel_image(output_path, arr, axes=None, write_ome=True, lossles
     compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
 
     photometric = _photometric_for_axes_shape(axes, arr.shape)
+
+    if int(pyramid_levels or 1) > 1:
+        _write_pyramidal_tiff(
+            output_path,
+            arr,
+            axes=axes,
+            write_ome=bool(write_ome),
+            lossless=bool(lossless),
+            metadata=metadata if (write_ome and metadata) else None,
+            photometric=photometric,
+            resolution=resolution,
+            resolutionunit=resolutionunit,
+            description=f"Generated by {APP_NAME} v{APP_VERSION}; pyramidal TIFF",
+            requested_levels=int(pyramid_levels),
+            low_memory_levels=bool(arr.nbytes > MAX_PREVIEW_CROP_BYTES),
+        )
+        return
 
     tifffile.imwrite(
         str(output_path),
@@ -7389,38 +7982,79 @@ class TilePopupImageLabel(QLabel):
         painter.end()
 
 
+class TilePopupPane(QWidget):
+    """One pane inside the multi-view tile popup."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        self.title_label = QLabel("Image")
+        self.title_label.setAlignment(Qt.AlignCenter)
+        self.title_label.setStyleSheet("font-weight: 600; color: #2c3e50;")
+        layout.addWidget(self.title_label)
+        self.image_label = TilePopupImageLabel()
+        self.image_label.setMinimumSize(220, 220)
+        layout.addWidget(self.image_label, 1)
+        self.subtitle_label = QLabel("")
+        self.subtitle_label.setAlignment(Qt.AlignCenter)
+        self.subtitle_label.setWordWrap(True)
+        self.subtitle_label.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(self.subtitle_label)
+
+    def set_content(self, title: str, rgb: Optional[np.ndarray], subtitle: str = ""):
+        self.title_label.setText(str(title or "Image"))
+        self.subtitle_label.setText(str(subtitle or ""))
+        self.image_label.set_rgb(rgb)
+
+
 class TileCapturePopup(QDialog):
-    """Non-modal movable popup that shows the currently selected square tile."""
+    """Non-modal popup that shows up to 4 synchronized square-tile views."""
     def __init__(self, owner, parent=None):
         super().__init__(parent)
         self.owner = owner
         self.setWindowTitle("Tile capture preview")
         self.setModal(False)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
-        self.resize(650, 720)
+        self.resize(1050, 860)
 
         layout = QVBoxLayout(self)
-        self.image_label = TilePopupImageLabel()
-        layout.addWidget(self.image_label, 1)
 
         self.info_label = QLabel("Tile: not set")
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet("color: #555; padding: 4px;")
         layout.addWidget(self.info_label)
 
+        self.grid_layout = QGridLayout()
+        self.grid_layout.setSpacing(8)
+        self.tile_views = []
+        for idx in range(4):
+            pane = TilePopupPane()
+            self.tile_views.append(pane)
+            self.grid_layout.addWidget(pane, idx // 2, idx % 2)
+        layout.addLayout(self.grid_layout, 1)
+
         controls = QHBoxLayout()
         self.include_geojson_chk = QCheckBox("Include visible GeoJSON")
         self.include_geojson_chk.setChecked(True)
         self.include_geojson_chk.stateChanged.connect(lambda *_: self.owner.schedule_preview_tile_popup_update())
         controls.addWidget(self.include_geojson_chk)
+        controls.addSpacing(12)
+        controls.addWidget(QLabel("Tile suffix:"))
+        default_suffix = "tile"
+        try:
+            default_suffix = self.owner.preview_suffix_edit.text().strip() or "tile"
+        except Exception:
+            pass
+        self.suffix_edit = QLineEdit(default_suffix)
+        self.suffix_edit.setPlaceholderText("Suffix for saved PNG tile(s)")
+        self.suffix_edit.setMinimumWidth(180)
+        controls.addWidget(self.suffix_edit)
         controls.addStretch()
-        self.save_btn = QPushButton("Save Tile JPG")
-        self.save_btn.clicked.connect(self.owner.save_preview_tile_capture_jpg)
+        self.save_btn = QPushButton("Save visible tile(s) PNG")
+        self.save_btn.clicked.connect(self.owner.save_preview_tile_capture_png)
         controls.addWidget(self.save_btn)
         layout.addLayout(controls)
-
-
-
 
     def closeEvent(self, event):
         # Keep the dialog reusable and synchronize the checkbox in the main panel.
@@ -7435,9 +8069,36 @@ class TileCapturePopup(QDialog):
             self.owner.preview_image_label.enable_tile_mode(False)
         self.owner.update_preview_tile_overlay()
 
-    def set_tile(self, rgb: Optional[np.ndarray], info: str):
-        self.image_label.set_rgb(rgb)
-        self.info_label.setText(info)
+    def set_tiles(self, tiles: List[Dict[str, Any]], info: str):
+        self.info_label.setText(str(info or ""))
+        for idx, pane in enumerate(self.tile_views):
+            if idx < len(tiles):
+                item = tiles[idx] or {}
+                pane.setVisible(True)
+                pane.set_content(
+                    item.get("title", f"Image {idx + 1}"),
+                    item.get("rgb"),
+                    item.get("subtitle", ""),
+                )
+            else:
+                pane.setVisible(False)
+                pane.set_content("", None, "")
+
+
+class AutoHideStatusLabel(QLabel):
+    """Compact status line that is hidden when no operational message is active."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setVisible(False)
+
+    def setText(self, text):
+        value = str(text or "")
+        super().setText(value)
+        self.setVisible(bool(value.strip()))
+
+    def clear(self):
+        super().clear()
+        self.setVisible(False)
 
 
 # ============================================================
@@ -7445,51 +8106,70 @@ class TileCapturePopup(QDialog):
 # ============================================================
 
 class ThumbnailExplorerWorker(QThread):
-    """Build file-explorer thumbnails outside the GUI thread.
-
-    QPixmap/QIcon are created in the main thread; this worker only reads a small
-    RGB numpy preview using the same safe preview reader used elsewhere in the app.
-    """
+    """Build Explorer thumbnails in parallel without blocking the Qt GUI thread."""
     item_ready = pyqtSignal(str, object, str)
     item_failed = pyqtSignal(str, str)
     progress = pyqtSignal(int, int)
     finished_count = pyqtSignal(int)
 
-    def __init__(self, paths, max_side: int = 180, parent=None):
+    def __init__(self, paths, max_side: int = 180, workers: int = 2, parent=None):
         super().__init__(parent)
         self.paths = [str(p) for p in paths]
         self.max_side = int(max_side)
+        self.workers = max(1, min(int(workers or 2), 8))
         self._cancel_requested = False
 
     def cancel(self):
         self._cancel_requested = True
 
+    def _build_one_thumbnail(self, path: str):
+        arr, axes, meta = read_preview_array_from_file(
+            path, max_side=self.max_side, allow_full_fallback=False
+        )
+        if str(meta.get("reader", "")).startswith("safe-placeholder"):
+            os_thumb = _try_openslide_thumbnail(path, max_side=self.max_side)
+            if os_thumb is not None:
+                arr, axes, meta = os_thumb
+        rgb = _array_to_rgb_preview(arr, axes)
+        rgb = _downsample_for_preview(rgb, max_side=self.max_side)
+        return rgb, str(meta.get("reader", ""))
+
     def run(self):
         total = len(self.paths)
         done = 0
-        for path in self.paths:
+        if total == 0:
+            self.finished_count.emit(0)
+            return
+
+        executor = ThreadPoolExecutor(max_workers=self.workers)
+        futures = {}
+        try:
+            for path in self.paths:
+                if self._cancel_requested:
+                    break
+                futures[executor.submit(self._build_one_thumbnail, path)] = path
+
+            for future in as_completed(futures):
+                path = futures[future]
+                if self._cancel_requested:
+                    break
+                try:
+                    rgb, reader = future.result()
+                    self.item_ready.emit(path, rgb, reader)
+                except Exception as exc:
+                    self.item_failed.emit(path, str(exc))
+                done += 1
+                self.progress.emit(done, total)
+        finally:
             if self._cancel_requested:
-                break
+                for future in futures:
+                    future.cancel()
             try:
-                arr, axes, meta = read_preview_array_from_file(
-                    path, max_side=self.max_side, allow_full_fallback=False
-                )
-                # If tifffile could only return a placeholder, try OpenSlide's
-                # thumbnail path as a final Explorer-only fallback. This is useful
-                # for large pyramidal TIFFs where an overview is available through
-                # OpenSlide but not through tifffile/zarr.
-                if str(meta.get("reader", "")).startswith("safe-placeholder"):
-                    os_thumb = _try_openslide_thumbnail(path, max_side=self.max_side)
-                    if os_thumb is not None:
-                        arr, axes, meta = os_thumb
-                rgb = _array_to_rgb_preview(arr, axes)
-                rgb = _downsample_for_preview(rgb, max_side=self.max_side)
-                self.item_ready.emit(path, rgb, str(meta.get("reader", "")))
-            except Exception as exc:
-                self.item_failed.emit(path, str(exc))
-            done += 1
-            self.progress.emit(done, total)
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
         self.finished_count.emit(done)
+
 
 # ============================================================
 # Main GUI
@@ -8171,6 +8851,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.downsample_roi = None
         self.preview_path = None
         self.preview_backend = None  # cached reader for fast repeated Image Preview region reads
+        self.preview_linked_images = []  # additional registered/colocalized images for synchronized tile popup
         self.preview_arr = None
         self.preview_axes = None
         self.preview_meta = {}
@@ -8245,8 +8926,8 @@ class WSICropTileMergeGUI(QMainWindow):
 
         self.worker_spin = QSpinBox()
         self.worker_spin.setRange(1, max(1, min(8, (os.cpu_count() or 2))))
-        self.worker_spin.setValue(1)
-        self.worker_spin.setToolTip("Number of parallel files to process in bulk jobs. Use 1–2 for very large IF/LIF files.")
+        self.worker_spin.setValue(min(2, self.worker_spin.maximum()))
+        self.worker_spin.setToolTip("Parallel workers used for bulk processing and Explorer thumbnail generation. Use 1–2 for very large IF/LIF files.")
         self.cancel_job_btn = QPushButton("Cancel job")
         self.cancel_job_btn.setEnabled(False)
         self.cancel_job_btn.clicked.connect(self.cancel_background_job)
@@ -8261,10 +8942,13 @@ class WSICropTileMergeGUI(QMainWindow):
 
         root.addLayout(menu_row)
 
-        self.info_label = QLabel("")
-        self.info_label.setStyleSheet("color: #27ae60; padding: 3px;")
-        self.info_label.setMaximumHeight(42)
-        self.info_label.setWordWrap(True)
+        self.info_label = AutoHideStatusLabel()
+        self.info_label.setStyleSheet(
+            "color: #4b5563; background: #f7f9fb; border: 1px solid #d7dde3; "
+            "border-radius: 3px; padding: 4px 7px;"
+        )
+        self.info_label.setMaximumHeight(34)
+        self.info_label.setWordWrap(False)
 
         self.stack = QStackedWidget()
         # Keep the main pages directly in the window.  A global QScrollArea made
@@ -8279,7 +8963,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.stack.addWidget(self._build_preview_page())
         self.stack.addWidget(self._build_if_threshold_page())
         self.stack.addWidget(self._build_explorer_page())
-        self.mode_combo.currentIndexChanged.connect(lambda: self.stack.setCurrentIndex(self.mode_combo.currentIndex()))
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
 
         root.addWidget(self.info_label)
         self.progress = QProgressBar()
@@ -8288,7 +8972,18 @@ class WSICropTileMergeGUI(QMainWindow):
 
         self._install_preview_channel_shortcuts()
 
+    def _on_mode_changed(self, index: int):
+        """Switch tools without carrying explanatory text from another page."""
+        self.stack.setCurrentIndex(int(index))
+        if hasattr(self, "info_label"):
+            self.info_label.clear()
+
     def _set_label_pixmap(self, label, rgb):
+        # ScalablePixmapLabel keeps the original source and redraws it whenever
+        # the panel changes size. Other labels retain the legacy one-shot path.
+        if hasattr(label, "set_rgb") and callable(getattr(label, "set_rgb")):
+            label.set_rgb(rgb)
+            return
         pm = _numpy_rgb_to_qpixmap(_to_uint8_rgb(rgb))
         label.setPixmap(pm.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
@@ -8784,7 +9479,16 @@ class WSICropTileMergeGUI(QMainWindow):
         folder_layout.addWidget(refresh_btn, 0, 5)
         folder_layout.addWidget(QLabel("Thumbnail size:"), 1, 0)
         folder_layout.addWidget(self.explorer_thumb_size_spin, 1, 1)
-        folder_layout.addWidget(QLabel("Current folder only. Use the left folder panel to move through the hierarchy."), 1, 2, 1, 4)
+        self.explorer_recursive_chk = QCheckBox("Include subfolders")
+        self.explorer_recursive_chk.setChecked(False)
+        self.explorer_recursive_chk.setToolTip(
+            "List supported images from the selected folder and all nested sample folders."
+        )
+        self.explorer_recursive_chk.stateChanged.connect(
+            lambda *_: self.scan_explorer_folder() if self.explorer_folder_edit.text().strip() else None
+        )
+        folder_layout.addWidget(self.explorer_recursive_chk, 1, 2)
+        folder_layout.setColumnStretch(3, 1)
         layout.addWidget(folder_box)
 
         action_box = QGroupBox("Use selected images")
@@ -8815,15 +9519,17 @@ class WSICropTileMergeGUI(QMainWindow):
         browser_row = QHBoxLayout()
         browser_row.setSpacing(10)
 
-        folder_nav_box = QGroupBox("Folders")
+        folder_nav_box = QGroupBox("Folder hierarchy")
+        folder_nav_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         folder_nav_layout = QVBoxLayout(folder_nav_box)
+        folder_nav_layout.setContentsMargins(6, 8, 6, 6)
         self.explorer_folder_nav = QListWidget()
-        self.explorer_folder_nav.setMinimumWidth(170)
-        self.explorer_folder_nav.setMaximumWidth(260)
-        self.explorer_folder_nav.setMaximumHeight(150)
+        self.explorer_folder_nav.setMinimumWidth(220)
+        self.explorer_folder_nav.setMaximumWidth(360)
+        self.explorer_folder_nav.setMinimumHeight(260)
+        self.explorer_folder_nav.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self.explorer_folder_nav.itemDoubleClicked.connect(self.navigate_explorer_folder_item)
         self.explorer_folder_nav.itemClicked.connect(self.navigate_explorer_folder_item)
-        folder_nav_layout.addWidget(QLabel("Parents and subfolders"))
         folder_nav_layout.addWidget(self.explorer_folder_nav, 1)
         browser_row.addWidget(folder_nav_box, 0)
 
@@ -8915,12 +9621,27 @@ class WSICropTileMergeGUI(QMainWindow):
         self.explorer_current_folder = folder
         self._stop_explorer_worker()
         self._populate_explorer_folder_nav(folder)
+        recursive = bool(
+            hasattr(self, "explorer_recursive_chk") and self.explorer_recursive_chk.isChecked()
+        )
         try:
-            iterator = folder.iterdir()
-            self.explorer_paths = sorted([
-                p for p in iterator
-                if p.is_file() and _has_ext(p.name, SUPPORTED_EXTENSIONS)
-            ], key=lambda x: x.name.lower())
+            if recursive:
+                found_paths = []
+                for root_dir, dir_names, file_names in os.walk(str(folder)):
+                    dir_names.sort(key=str.lower)
+                    for file_name in sorted(file_names, key=str.lower):
+                        candidate = Path(root_dir) / file_name
+                        if _has_ext(candidate.name, SUPPORTED_EXTENSIONS):
+                            found_paths.append(candidate)
+                self.explorer_paths = sorted(
+                    found_paths,
+                    key=lambda x: str(x.relative_to(folder)).lower(),
+                )
+            else:
+                self.explorer_paths = sorted([
+                    candidate for candidate in folder.iterdir()
+                    if candidate.is_file() and _has_ext(candidate.name, SUPPORTED_EXTENSIONS)
+                ], key=lambda x: x.name.lower())
         except Exception as exc:
             QMessageBox.critical(self, "Explorer error", str(exc))
             return
@@ -8931,25 +9652,39 @@ class WSICropTileMergeGUI(QMainWindow):
         self.explorer_list.setGridSize(QSize(max(170, thumb_size + 50), max(170, int(thumb_size * 1.15) + 70)))
 
         loading_icon = QIcon(_numpy_rgb_to_qpixmap(_placeholder_rgb("Loading", width=thumb_size, height=max(96, int(thumb_size * 0.78)))))
-        for p in self.explorer_paths:
-            item = QListWidgetItem(loading_icon, f"{p.name}\nloading...")
-            item.setData(Qt.UserRole, str(p))
-            item.setToolTip(str(p))
+        for image_path in self.explorer_paths:
+            try:
+                display_name = str(image_path.relative_to(folder)) if recursive else image_path.name
+            except Exception:
+                display_name = image_path.name
+            item = QListWidgetItem(loading_icon, f"{display_name}\nLoading…")
+            item.setData(Qt.UserRole, str(image_path))
+            item.setData(Qt.UserRole + 2, display_name)
+            item.setToolTip(str(image_path))
             self.explorer_list.addItem(item)
 
         self.update_explorer_selection_label()
-        self.explorer_status_label.setText(f"Found {len(self.explorer_paths)} image file(s) in current folder. Building thumbnails...")
-        self.info_label.setText(f"Explorer loaded: {len(self.explorer_paths)} image file(s) in {folder.name or folder}.")
+        scope_text = "selected folder and subfolders" if recursive else "selected folder"
+        self.explorer_status_label.setText(
+            f"{len(self.explorer_paths)} image file(s) found in the {scope_text}. Building thumbnails…"
+        )
+        self.info_label.clear()
 
         if not self.explorer_paths:
             self.progress.setVisible(False)
-            self.explorer_status_label.setText("Explorer ready: no image files in this folder.")
+            self.explorer_status_label.setText("No supported image files were found in the selected scope.")
             return
 
         self.progress.setVisible(True)
         self.progress.setRange(0, len(self.explorer_paths))
         self.progress.setValue(0)
-        self.explorer_thumb_worker = ThumbnailExplorerWorker(self.explorer_paths, max_side=thumb_size, parent=self)
+        explorer_workers = int(self.worker_spin.value()) if hasattr(self, "worker_spin") else 2
+        self.explorer_thumb_worker = ThumbnailExplorerWorker(
+            self.explorer_paths,
+            max_side=thumb_size,
+            workers=explorer_workers,
+            parent=self,
+        )
         self.explorer_thumb_worker.item_ready.connect(self._on_explorer_thumbnail_ready)
         self.explorer_thumb_worker.item_failed.connect(self._on_explorer_thumbnail_failed)
         self.explorer_thumb_worker.progress.connect(self._on_explorer_thumbnail_progress)
@@ -8972,14 +9707,16 @@ class WSICropTileMergeGUI(QMainWindow):
         pm = _numpy_rgb_to_qpixmap(_to_uint8_rgb(rgb))
         pm = pm.scaled(QSize(thumb_size, int(thumb_size * 0.78)), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         item.setIcon(QIcon(pm))
-        item.setText(f"{Path(path).name}\n{reader}")
+        display_name = item.data(Qt.UserRole + 2) or Path(path).name
+        item.setText(f"{display_name}\n{reader}")
         item.setData(Qt.UserRole + 1, reader)
 
     def _on_explorer_thumbnail_failed(self, path: str, error: str):
         item = self._find_explorer_item_by_path(path)
         if item is None:
             return
-        item.setText(f"{Path(path).name}\npreview failed")
+        display_name = item.data(Qt.UserRole + 2) or Path(path).name
+        item.setText(f"{display_name}\nPreview unavailable")
         item.setToolTip(f"{path}\n\nThumbnail error:\n{error}")
 
     def _on_explorer_thumbnail_progress(self, done: int, total: int):
@@ -9296,10 +10033,21 @@ class WSICropTileMergeGUI(QMainWindow):
         self.preview_tile_info_label = QLabel("Tile: not set")
         self.preview_tile_info_label.setWordWrap(True)
         tile_layout.addWidget(self.preview_tile_info_label, 2, 0, 1, 2)
-        note = QLabel("When enabled, left-drag on the main preview moves the blue square. Right-drag pans the view. The pop-up updates and contains the Save Tile JPG button.")
+        note = QLabel("When enabled, left-drag on the main preview moves the blue square. Right-drag pans the view. The pop-up updates and can show up to 4 synchronized registered/colocalized images and save each tile as a separate PNG.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #555;")
         tile_layout.addWidget(note, 3, 0, 1, 2)
+        self.preview_add_linked_btn = QPushButton("Add linked images")
+        self.preview_add_linked_btn.setToolTip("Load up to 3 additional registered/colocalized images. They will be shown together in the tile pop-up using the same ROI coordinates.")
+        self.preview_add_linked_btn.clicked.connect(self.add_preview_linked_images)
+        tile_layout.addWidget(self.preview_add_linked_btn, 4, 0)
+        self.preview_clear_linked_btn = QPushButton("Clear linked")
+        self.preview_clear_linked_btn.clicked.connect(self.clear_preview_linked_images)
+        tile_layout.addWidget(self.preview_clear_linked_btn, 4, 1)
+        self.preview_linked_count_label = QLabel("Extra linked images: 0")
+        self.preview_linked_count_label.setWordWrap(True)
+        self.preview_linked_count_label.setStyleSheet("color: #555;")
+        tile_layout.addWidget(self.preview_linked_count_label, 5, 0, 1, 2)
         left.addWidget(tile_box)
         left.addStretch(1)
 
@@ -9330,6 +10078,7 @@ class WSICropTileMergeGUI(QMainWindow):
                 except Exception:
                     pass
             self.preview_path = Path(path)
+            self.clear_preview_linked_images(show_message=False)
             self.preview_backend = ImageBackend().load(path)
             self.preview_zoom = 1.0
             # Read a memory-light visible-region preview first to detect channels.
@@ -9355,6 +10104,84 @@ class WSICropTileMergeGUI(QMainWindow):
             self.update_channel_preview()
         except Exception as e:
             QMessageBox.critical(self, "Preview load error", str(e))
+
+    def _close_preview_linked_backends(self):
+        for item in list(getattr(self, "preview_linked_images", []) or []):
+            try:
+                b = item.get("backend")
+                if b is not None:
+                    b.close()
+            except Exception:
+                pass
+        self.preview_linked_images = []
+
+    def update_preview_linked_count_label(self):
+        if hasattr(self, "preview_linked_count_label"):
+            n = len(getattr(self, "preview_linked_images", []) or [])
+            names = ", ".join(item.get("path", Path("?")).name for item in self.preview_linked_images[:4])
+            txt = f"Extra linked images: {n}"
+            if names:
+                txt += f" | {names}"
+            self.preview_linked_count_label.setText(txt)
+
+    def clear_preview_linked_images(self, show_message: bool = False):
+        self._close_preview_linked_backends()
+        self.update_preview_linked_count_label()
+        self.schedule_preview_tile_popup_update(delay_ms=10)
+        if show_message:
+            self.info_label.setText("Linked images cleared from the tile pop-up.")
+
+    def add_preview_linked_images(self):
+        if self.preview_path is None or getattr(self, "preview_backend", None) is None:
+            QMessageBox.warning(self, "No base image", "Load the main preview image first.")
+            return
+        remaining = max(0, 3 - len(getattr(self, "preview_linked_images", []) or []))
+        if remaining <= 0:
+            QMessageBox.information(self, "Limit reached", "The tile pop-up supports up to 4 images total: 1 base image + 3 linked images.")
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select additional linked images",
+            str(self.preview_path.parent) if self.preview_path else "",
+            _image_file_filter(),
+        )
+        if not paths:
+            return
+        added = 0
+        errors = []
+        existing_paths = {str(self.preview_path.resolve())}
+        for item in getattr(self, "preview_linked_images", []) or []:
+            try:
+                existing_paths.add(str(Path(item.get("path")).resolve()))
+            except Exception:
+                pass
+        for path in paths:
+            if added >= remaining:
+                break
+            try:
+                rp = str(Path(path).resolve())
+                if rp in existing_paths:
+                    continue
+                b = ImageBackend().load(path)
+                dims = tuple(getattr(b, "slide_dims", ()) or ())
+                if getattr(self, "preview_full_dims", None) and dims != tuple(self.preview_full_dims):
+                    try:
+                        b.close()
+                    except Exception:
+                        pass
+                    errors.append(f"{Path(path).name}: dimensions {dims} do not match base image {self.preview_full_dims}.")
+                    continue
+                self.preview_linked_images.append({"path": Path(path), "backend": b, "full_dims": dims})
+                existing_paths.add(rp)
+                added += 1
+            except Exception as exc:
+                errors.append(f"{Path(path).name}: {exc}")
+        self.update_preview_linked_count_label()
+        self.schedule_preview_tile_popup_update(delay_ms=10)
+        if errors:
+            QMessageBox.warning(self, "Some linked images were not added", "\n".join(errors[:10]))
+        if added:
+            self.info_label.setText(f"Added {added} linked image(s) for synchronized multi-view tile preview.")
 
     def populate_channel_table(self, settings: Optional[List[Dict[str, Any]]] = None):
         if self.preview_arr is None:
@@ -9901,17 +10728,30 @@ class WSICropTileMergeGUI(QMainWindow):
             return popup.include_geojson_chk.isChecked()
         return True
 
-    def _render_current_preview_tile_rgb(self, include_geojson: bool = True, preview_max_side: Optional[int] = None) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
-        if self.preview_path is None:
-            raise RuntimeError("No image loaded.")
-        roi = self._current_preview_tile_roi()
-        if roi is None:
-            raise RuntimeError("Tile ROI is not defined.")
+    def _tile_popup_suffix(self) -> str:
+        popup = getattr(self, "preview_tile_popup", None)
+        if popup is not None and hasattr(popup, "suffix_edit"):
+            txt = popup.suffix_edit.text().strip()
+            if txt:
+                return txt
+        txt = self.preview_suffix_edit.text().strip() if hasattr(self, "preview_suffix_edit") else ""
+        return txt or "tile"
+
+    def _get_preview_tile_sources(self) -> List[Dict[str, Any]]:
+        sources = []
+        if self.preview_path is not None:
+            sources.append({"title": self.preview_path.name, "path": self.preview_path, "backend": getattr(self, "preview_backend", None), "is_base": True})
+        for item in getattr(self, "preview_linked_images", []) or []:
+            sources.append({"title": Path(item.get("path")).name, "path": Path(item.get("path")), "backend": item.get("backend"), "is_base": False})
+        return sources[:4]
+
+    def _render_preview_tile_rgb_from_source(self, source: Dict[str, Any], roi: Tuple[int, int, int, int],
+                                             include_geojson: bool = True, preview_max_side: Optional[int] = None) -> np.ndarray:
         x, y, w, h = roi
-        b = getattr(self, "preview_backend", None)
+        b = source.get("backend")
         close_after = False
         if b is None:
-            b = ImageBackend().load(str(self.preview_path))
+            b = ImageBackend().load(str(source.get("path")))
             close_after = True
         try:
             if preview_max_side is not None:
@@ -9922,8 +10762,9 @@ class WSICropTileMergeGUI(QMainWindow):
             if close_after:
                 b.close()
         rgb = render_channel_composite(raw, axes, self.get_channel_settings_from_table())
-        if include_geojson:
-            if bool(getattr(self, "preview_show_annotations_chk", None) and self.preview_show_annotations_chk.isChecked()):
+        if include_geojson and bool(getattr(self, "preview_show_annotations_chk", None) and self.preview_show_annotations_chk.isChecked()):
+            same_dims = tuple(getattr(b, "slide_dims", ()) or ()) == tuple(getattr(self, "preview_full_dims", ()) or ())
+            if same_dims:
                 opacity_percent = int(self.preview_annotation_opacity_slider.value()) if hasattr(self, "preview_annotation_opacity_slider") else 45
                 opacity_255 = int(round(opacity_percent / 100.0 * 255))
                 rgb = draw_geojson_annotations_on_rgb(
@@ -9936,37 +10777,69 @@ class WSICropTileMergeGUI(QMainWindow):
                     boundary_width=int(self.preview_annotation_boundary_spin.value()) if hasattr(self, "preview_annotation_boundary_spin") else 2,
                     class_styles=self.get_preview_annotation_class_styles_from_table(),
                 )
+        return rgb
+
+    def _render_current_preview_tile_rgb(self, include_geojson: bool = True, preview_max_side: Optional[int] = None) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+        sources = self._get_preview_tile_sources()
+        if not sources:
+            raise RuntimeError("No image loaded.")
+        roi = self._current_preview_tile_roi()
+        if roi is None:
+            raise RuntimeError("Tile ROI is not defined.")
+        rgb = self._render_preview_tile_rgb_from_source(sources[0], roi, include_geojson=include_geojson, preview_max_side=preview_max_side)
         return rgb, roi
+
+    def _render_preview_tile_views(self, include_geojson: bool = True, preview_max_side: Optional[int] = None):
+        if self.preview_path is None:
+            raise RuntimeError("No image loaded.")
+        roi = self._current_preview_tile_roi()
+        if roi is None:
+            raise RuntimeError("Tile ROI is not defined.")
+        x, y, w, h = roi
+        views = []
+        for idx, source in enumerate(self._get_preview_tile_sources(), start=1):
+            rgb = self._render_preview_tile_rgb_from_source(source, roi, include_geojson=include_geojson, preview_max_side=preview_max_side)
+            if preview_max_side is not None:
+                rgb = _downsample_for_preview(rgb, max_side=int(preview_max_side))
+            views.append({
+                "title": source.get("title", f"Image {idx}"),
+                "path": source.get("path"),
+                "rgb": rgb,
+                "subtitle": f"View {idx}",
+            })
+        return views, roi
 
     def update_preview_tile_popup_now(self):
         popup = getattr(self, "preview_tile_popup", None)
         if popup is None or not popup.isVisible():
             return
         try:
-            rgb, roi = self._render_current_preview_tile_rgb(include_geojson=self._tile_popup_include_geojson(), preview_max_side=1200)
-            # The popup uses a display-resolution ROI read, not a full-resolution tile read.
-            rgb_small = _downsample_for_preview(rgb, max_side=1200)
+            views, roi = self._render_preview_tile_views(include_geojson=self._tile_popup_include_geojson(), preview_max_side=1200)
             x, y, w, h = roi
-            popup.set_tile(rgb_small, f"Tile: X={x}, Y={y}, size={w} × {h} px | GeoJSON: {'on' if self._tile_popup_include_geojson() else 'off'}")
+            popup.set_tiles(views, f"Tile: X={x}, Y={y}, size={w} × {h} px | GeoJSON: {'on' if self._tile_popup_include_geojson() else 'off'} | Views: {len(views)}")
         except Exception as e:
-            popup.set_tile(None, f"Tile preview error: {e}")
+            popup.set_tiles([], f"Tile preview error: {e}")
 
-    def save_preview_tile_capture_jpg(self):
+    def save_preview_tile_capture_png(self):
         if self.preview_path is None:
             QMessageBox.warning(self, "No image", "Load an image first.")
             return
         try:
-            rgb, roi = self._render_current_preview_tile_rgb(include_geojson=self._tile_popup_include_geojson())
+            views, roi = self._render_preview_tile_views(include_geojson=self._tile_popup_include_geojson(), preview_max_side=None)
             x, y, w, h = roi
-            suffix = self.preview_suffix_edit.text().strip() or "tile"
-            out_path = self.preview_path.parent / f"{self.preview_path.stem}_tile_x{x}_y{y}_s{w}_{suffix}.jpg"
-            i = 2
-            while out_path.exists():
-                out_path = self.preview_path.parent / f"{self.preview_path.stem}_tile_x{x}_y{y}_s{w}_{suffix}_{i}.jpg"
-                i += 1
-            save_preview_jpg(out_path, rgb)
-            self.info_label.setText(f"Saved tile capture JPG: {out_path}")
-            QMessageBox.information(self, "Tile saved", f"Saved tile capture JPG:\n{out_path}")
+            suffix = self._tile_popup_suffix()
+            saved_paths = []
+            for item in views:
+                src_path = Path(item.get("path"))
+                out_path = src_path.parent / f"{src_path.stem}_tile_x{x}_y{y}_s{w}_{suffix}.png"
+                i = 2
+                while out_path.exists():
+                    out_path = src_path.parent / f"{src_path.stem}_tile_x{x}_y{y}_s{w}_{suffix}_{i}.png"
+                    i += 1
+                save_preview_png(out_path, item.get("rgb"))
+                saved_paths.append(str(out_path))
+            self.info_label.setText(f"Saved {len(saved_paths)} tile PNG file(s).")
+            QMessageBox.information(self, "Tile(s) saved", "Saved tile PNG file(s):\n" + "\n".join(saved_paths[:20]))
         except Exception as e:
             QMessageBox.critical(self, "Tile capture error", str(e))
 
@@ -9975,6 +10848,10 @@ class WSICropTileMergeGUI(QMainWindow):
         try:
             if getattr(self, "preview_backend", None) is not None:
                 self.preview_backend.close()
+        except Exception:
+            pass
+        try:
+            self._close_preview_linked_backends()
         except Exception:
             pass
         try:
@@ -10509,7 +11386,10 @@ class WSICropTileMergeGUI(QMainWindow):
 
     def _build_crop_page(self):
         page = QWidget()
+        page.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
 
         file_layout = QHBoxLayout()
         self.crop_file_label = QLabel("No file selected")
@@ -10562,11 +11442,19 @@ class WSICropTileMergeGUI(QMainWindow):
         self.crop_lossless_chk.setChecked(True)
         self.crop_preserve_channels_chk = QCheckBox("Preserve raw multichannel data for TIFF/OME-TIFF")
         self.crop_preserve_channels_chk.setChecked(True)
+        self.crop_pyramid_chk = QCheckBox("Save pyramidal TIFF (8 levels)")
+        self.crop_pyramid_chk.setChecked(True)
+        self.crop_pyramid_chk.setToolTip(
+            "Write the crop as a tiled pyramid with 8 total resolution levels "
+            "(or fewer only if the crop reaches 1 × 1 pixels first). TIFF/OME-TIFF only."
+        )
         self.crop_preview_chk = QCheckBox("Preview panel")
         self.crop_preview_chk.setChecked(True)
         self.crop_preview_chk.stateChanged.connect(self.refresh_crop_input_preview)
+        self.crop_out_combo.currentIndexChanged.connect(self._update_crop_pyramid_option)
         opt_layout.addWidget(self.crop_lossless_chk)
         opt_layout.addWidget(self.crop_preserve_channels_chk)
+        opt_layout.addWidget(self.crop_pyramid_chk)
         opt_layout.addWidget(self.crop_preview_chk)
         opt_layout.addStretch()
         layout.addWidget(opt)
@@ -10601,20 +11489,26 @@ class WSICropTileMergeGUI(QMainWindow):
         layout.addWidget(display_box)
 
         prev = QGroupBox("Preview - left-drag a rectangle; wheel zooms; right/middle-drag pans")
+        prev.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         prev_layout = QHBoxLayout(prev)
+        prev_layout.setContentsMargins(6, 8, 6, 6)
+        prev_layout.setSpacing(8)
+
         self.crop_thumb_in = CropSelectionLabel()
-        self.crop_thumb_in.setMinimumSize(300, 170)
-        self.crop_thumb_in.setMaximumHeight(260)
+        self.crop_thumb_in.setMinimumSize(300, 220)
+        # No maximum height: this panel must consume the extra vertical space
+        # when the main window is enlarged.
         self.crop_thumb_in.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.crop_thumb_out = QLabel("Crop preview")
-        self.crop_thumb_out.setAlignment(Qt.AlignCenter)
-        self.crop_thumb_out.setMinimumSize(300, 170)
-        self.crop_thumb_out.setMaximumHeight(260)
+
+        self.crop_thumb_out = ScalablePixmapLabel("Crop preview")
+        self.crop_thumb_out.setMinimumSize(300, 220)
         self.crop_thumb_out.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.crop_thumb_out.setStyleSheet("background: white; border: 1px solid #bdc3c7; border-radius: 6px;")
-        prev_layout.addWidget(self.crop_thumb_in)
-        prev_layout.addWidget(self.crop_thumb_out)
-        layout.addWidget(prev)
+
+        prev_layout.addWidget(self.crop_thumb_in, 1)
+        prev_layout.addWidget(self.crop_thumb_out, 1)
+        # Stretch factor 1 gives all additional page height to the preview.
+        layout.addWidget(prev, 1)
 
         btn_row = QHBoxLayout()
         preview_btn = QPushButton("Preview Crop")
@@ -10849,6 +11743,23 @@ class WSICropTileMergeGUI(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Preview Error", _exception_text(e))
 
+    def _update_crop_pyramid_option(self, *args):
+        """Enable pyramidal saving only for TIFF/OME-TIFF crop outputs."""
+        if not hasattr(self, "crop_pyramid_chk") or not hasattr(self, "crop_out_combo"):
+            return
+        is_tiff = _write_format_from_combo(self.crop_out_combo.currentText()) == "tiff"
+        if is_tiff:
+            self.crop_pyramid_chk.setEnabled(True)
+            self.crop_pyramid_chk.setChecked(
+                bool(getattr(self, "_crop_pyramid_preference", True))
+            )
+        else:
+            self._crop_pyramid_preference = self.crop_pyramid_chk.isChecked()
+            self.crop_pyramid_chk.setChecked(False)
+            self.crop_pyramid_chk.setEnabled(False)
+        if hasattr(self, "crop_preserve_channels_chk"):
+            self.crop_preserve_channels_chk.setEnabled(is_tiff)
+
     def _crop_output_settings(self):
         suffix = self.crop_suffix_edit.text().strip() or "final"
         downsample = float(self.crop_downsample_spin.value())
@@ -10869,6 +11780,11 @@ class WSICropTileMergeGUI(QMainWindow):
             suffix, raw_downsample, combo, output_format, write_ome, ext = self._crop_output_settings()
             out_path = self.backend.path_obj.parent / f"{self.backend.path_obj.stem}_crop_{suffix}{ext}"
             x, y, w, h = self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
+            pyramid_levels = (
+                PYRAMID_TOTAL_LEVELS
+                if output_format == "tiff" and hasattr(self, "crop_pyramid_chk") and self.crop_pyramid_chk.isChecked()
+                else 1
+            )
             visual_lowmem = False
             visual_est_rgb = None
 
@@ -10922,6 +11838,18 @@ class WSICropTileMergeGUI(QMainWindow):
                         return
                 if est_bytes is not None and est_bytes > MAX_INTERACTIVE_CROP_BYTES:
                     if raw_downsample == 1.0 and est_axes and "S" not in est_axes:
+                        if pyramid_levels > 1:
+                            QMessageBox.warning(
+                                self,
+                                "Raw pyramid too large",
+                                "This raw multichannel crop is larger than the safe in-memory limit and "
+                                "cannot currently be streamed into an 8-level scientific-data pyramid.\n\n"
+                                f"Estimated output: {_human_bytes(est_bytes)}\n"
+                                f"Shape: {est_shape}\nAxes: {est_axes}\n\n"
+                                "Reduce the crop, increase Downsample, or uncheck Preserve raw multichannel data "
+                                "to save a low-memory RGB pyramid."
+                            )
+                            return
                         self.info_label.setText(
                             f"Large raw crop detected ({_human_bytes(est_bytes)}). Saving with low-memory streaming..."
                         )
@@ -10986,10 +11914,12 @@ class WSICropTileMergeGUI(QMainWindow):
                     source_resolution=self.backend.source_resolution,
                     source_mpp=self.backend.source_mpp,
                     image_name=out_path.stem,
-                    pixel_scale=raw_downsample
+                    pixel_scale=raw_downsample,
+                    pyramid_levels=pyramid_levels
                 )
                 cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
-                saved_text = f"Saved raw multichannel crop: {out_path} | shape={tuple(roi.shape)} | axes={axes or 'unknown'} | dtype={roi.dtype}{cal_text}"
+                pyramid_text = f" | pyramid_levels={_effective_pyramid_levels(roi.shape, axes, pyramid_levels)}" if pyramid_levels > 1 else ""
+                saved_text = f"Saved raw multichannel crop: {out_path} | shape={tuple(roi.shape)} | axes={axes or 'unknown'} | dtype={roi.dtype}{pyramid_text}{cal_text}"
             else:
                 if visual_lowmem:
                     result = save_rgb_crop_lowmem(
@@ -11003,11 +11933,13 @@ class WSICropTileMergeGUI(QMainWindow):
                         progress_callback=lambda done, total: self.info_label.setText(
                             f"Saving large RGB crop by chunks: {done}/{total} blocks"
                         ),
+                        pyramid_levels=pyramid_levels,
                     )
                     cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
                     saved_text = (
                         f"Saved large RGB crop using low-memory tiled export: {out_path} | "
-                        f"shape={result.get('shape')} | downsample={result.get('downsample')}{cal_text}"
+                        f"shape={result.get('shape')} | downsample={result.get('downsample')} | "
+                        f"pyramid_levels={result.get('pyramid_levels', 1)}{cal_text}"
                     )
                 else:
                     roi, crop_meta = _read_visual_crop_for_save(self.backend, x, y, w, h, downsample=raw_downsample)
@@ -11020,11 +11952,13 @@ class WSICropTileMergeGUI(QMainWindow):
                         out_path, roi, output_format, write_ome, self.crop_lossless_chk.isChecked(),
                         self.backend.source_resolution, self.backend.source_mpp, out_path.stem,
                         self.backend.openslide_props if write_ome else None,
-                        pixel_scale=raw_downsample
+                        pixel_scale=raw_downsample,
+                        pyramid_levels=pyramid_levels
                     )
                     cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
                     reader_text = crop_meta.get("reader", self.backend.reader) if isinstance(crop_meta, dict) else self.backend.reader
-                    saved_text = f"Saved RGB crop: {out_path} | Reader: {reader_text} | output_shape={tuple(roi.shape)}{cal_text}"
+                    pyramid_text = f" | pyramid_levels={_effective_pyramid_levels(roi.shape, 'YXS', pyramid_levels)}" if pyramid_levels > 1 else ""
+                    saved_text = f"Saved RGB crop: {out_path} | Reader: {reader_text} | output_shape={tuple(roi.shape)}{pyramid_text}{cal_text}"
 
             # Display a reduced preview instead of converting the full saved crop.
             if self.crop_preview_chk.isChecked():
@@ -11205,12 +12139,7 @@ class WSICropTileMergeGUI(QMainWindow):
 
 
         if hasattr(self, "info_label"):
-            if is_fixed:
-                self.info_label.setText(
-                    "Tiles mode: fixed square tiles. Edge-aligned mode avoids tiny last sliver tiles; raw IF tiles are not normalized."
-                )
-            else:
-                self.info_label.setText("Tiles mode: divide image by rows and columns. Tiles may be rectangular.")
+            self.info_label.clear()
 
     def load_one_tile_image(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select image", "", _image_file_filter())
