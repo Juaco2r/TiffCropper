@@ -682,24 +682,233 @@ def _count_display_channels(arr: np.ndarray, axes: str = None) -> int:
     return 1
 
 
+def _sample_finite_channel_values(arr: np.ndarray, max_samples: int = 1_000_000) -> np.ndarray:
+    """Return a representative finite 1D sample for display-range estimation."""
+    source = np.asarray(arr)
+    if source.size == 0:
+        return np.empty((0,), dtype=np.float64)
+    flat = source.reshape(-1)
+    if flat.size > int(max_samples):
+        step = max(1, int(math.ceil(flat.size / float(max_samples))))
+        flat = flat[::step]
+    vals = np.asarray(flat, dtype=np.float64)
+    return vals[np.isfinite(vals)]
+
+
+def _infer_channel_allowed_range(arr: np.ndarray) -> Tuple[float, float]:
+    """Infer a stable full display range, including common lower acquisition bit depths.
+
+    A uint16 container does not necessarily mean that all 16 bits were acquired.
+    Microscopy images are commonly 10-, 12-, or 14-bit data stored in uint16.
+    Using 0..65535 blindly therefore makes many valid images unnecessarily dark.
+    """
+    source = np.asarray(arr)
+    vals = _sample_finite_channel_values(source)
+    if source.dtype == np.bool_:
+        return 0.0, 1.0
+
+    if np.issubdtype(source.dtype, np.integer):
+        info = np.iinfo(source.dtype)
+        if vals.size == 0:
+            return (0.0, float(info.max)) if info.min >= 0 else (float(info.min), float(info.max))
+        observed_min = float(vals.min())
+        observed_max = float(vals.max())
+        if observed_min >= 0:
+            dtype_bits = int(info.bits)
+            needed_bits = max(1, int(math.ceil(math.log2(max(1.0, observed_max + 1.0)))))
+            # Avoid underestimating a 10/12-bit microscopy acquisition merely
+            # because the downsampled overview did not contain saturated pixels.
+            if dtype_bits > 8 and dtype_bits <= 16:
+                needed_bits = max(12, needed_bits)
+            elif dtype_bits > 16:
+                needed_bits = max(16, needed_bits)
+            standard_bits = [8, 10, 12, 14, 16, 20, 24, 32, 64]
+            chosen_bits = next((b for b in standard_bits if b >= needed_bits and b <= dtype_bits), dtype_bits)
+            max_allowed = min(float(info.max), float((1 << chosen_bits) - 1)) if chosen_bits < 63 else float(info.max)
+            return 0.0, max(1.0, max_allowed)
+        return float(info.min), float(info.max)
+
+    if np.issubdtype(source.dtype, np.floating):
+        if vals.size == 0:
+            return 0.0, 1.0
+        lo = float(vals.min())
+        hi = float(vals.max())
+        if lo >= 0.0 and hi <= 1.0:
+            return 0.0, 1.0
+        if hi <= lo:
+            hi = lo + 1.0
+        return lo, hi
+
+    return 0.0, 1.0
+
+
+def _auto_channel_display_range(arr: np.ndarray, saturation_percent: float = 1.0) -> Tuple[float, float]:
+    """Calculate an ImageJ/QuPath-like histogram window without changing pixels.
+
+    ``saturation_percent`` is applied independently to the dark and bright tails.
+    The result should be calculated from a stable whole-image overview and then
+    retained while zooming or panning.
+    """
+    vals = _sample_finite_channel_values(arr)
+    allowed_min, allowed_max = _infer_channel_allowed_range(arr)
+    if vals.size == 0:
+        return allowed_min, allowed_max
+    sat = max(0.0, min(20.0, float(saturation_percent)))
+    lo = float(np.percentile(vals, sat)) if sat > 0 else float(vals.min())
+    hi = float(np.percentile(vals, 100.0 - sat)) if sat > 0 else float(vals.max())
+    lo = max(allowed_min, min(lo, allowed_max))
+    hi = max(allowed_min, min(hi, allowed_max))
+    if hi <= lo:
+        lo = max(allowed_min, float(vals.min()))
+        hi = min(allowed_max, float(vals.max()))
+    if hi <= lo:
+        return allowed_min, allowed_max
+    return lo, hi
+
+
+def _display_channel_plane(arr: np.ndarray, axes: str, channel: int) -> np.ndarray:
+    arr2, _ = _representative_yx_or_yxc(arr, axes)
+    if arr2.ndim == 2:
+        return arr2
+    if arr2.ndim == 3:
+        c = max(0, min(int(channel), arr2.shape[-1] - 1))
+        return arr2[:, :, c]
+    return np.asarray(arr2)
+
+
+def _channel_to_display_float(arr: np.ndarray, min_display=None, max_display=None,
+                              brightness_percent: float = 100.0, gamma: float = 1.0) -> np.ndarray:
+    """Map a raw channel display window to 0..1 without modifying source data.
+
+    ``gamma`` is a viewer-only control comparable to QuPath's Viewer gamma.
+    Values greater than 1 brighten mid-tones; values below 1 darken them.
+    """
+    source = np.asarray(arr)
+    if source.size == 0:
+        return np.zeros(source.shape, dtype=np.float32)
+    allowed_min, allowed_max = _infer_channel_allowed_range(source)
+    try:
+        lo = float(min_display) if min_display is not None else allowed_min
+    except Exception:
+        lo = allowed_min
+    try:
+        hi = float(max_display) if max_display is not None else allowed_max
+    except Exception:
+        hi = allowed_max
+    if not np.isfinite(lo):
+        lo = allowed_min
+    if not np.isfinite(hi) or hi <= lo:
+        hi = max(lo + 1e-12, allowed_max)
+    try:
+        brightness = max(0.0, float(brightness_percent)) / 100.0
+    except Exception:
+        brightness = 1.0
+    out = source.astype(np.float32, copy=False)
+    out = np.nan_to_num(out, nan=lo, posinf=hi, neginf=lo)
+    out = np.clip((out - lo) / (hi - lo), 0.0, 1.0)
+    try:
+        gamma = max(0.05, min(20.0, float(gamma)))
+    except Exception:
+        gamma = 1.0
+    if abs(gamma - 1.0) > 1e-6:
+        # QuPath-style viewer gamma: values > 1 brighten mid-tones.
+        out = np.power(out, 1.0 / gamma, dtype=np.float32)
+    if brightness != 1.0:
+        out = np.clip(out * brightness, 0.0, 1.0)
+    return out.astype(np.float32, copy=False)
+
+
+def _make_channel_brightness_widget(value: int = 100, on_change=None) -> QWidget:
+    """Create a compact display-only per-channel brightness slider."""
+    holder = QWidget()
+    row = QHBoxLayout(holder)
+    row.setContentsMargins(2, 0, 2, 0)
+    row.setSpacing(4)
+
+    slider = QSlider(Qt.Horizontal)
+    slider.setRange(0, 500)
+    slider.setSingleStep(5)
+    slider.setPageStep(25)
+    slider.setValue(max(0, min(500, int(value))))
+    slider.setToolTip(
+        "Display-only multiplier applied after the Min/Max display window. "
+        "100% is neutral and never changes raw OME-TIFF intensities."
+    )
+
+    label = QLabel(f"{slider.value()}%")
+    label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    label.setMinimumWidth(44)
+
+    def _update_label(v):
+        label.setText(f"{int(v)}%")
+
+    slider.valueChanged.connect(_update_label)
+    if on_change is not None:
+        slider.valueChanged.connect(lambda *_: on_change())
+
+    row.addWidget(slider, 1)
+    row.addWidget(label)
+    holder._brightness_slider = slider
+    holder._brightness_label = label
+    return holder
+
+
+def _brightness_percent_from_widget(widget, default: int = 100) -> int:
+    try:
+        return int(widget._brightness_slider.value())
+    except Exception:
+        return int(default)
+
+
+def _make_display_range_spin(value: float, allowed_min: float, allowed_max: float, on_change=None) -> QDoubleSpinBox:
+    spin = QDoubleSpinBox()
+    span = max(1.0, abs(float(allowed_max) - float(allowed_min)))
+    spin.setRange(float(allowed_min) - span, float(allowed_max) + span)
+    spin.setDecimals(0 if float(allowed_min).is_integer() and float(allowed_max).is_integer() else 4)
+    spin.setSingleStep(max(1.0, span / 1000.0))
+    spin.setValue(float(value))
+    spin.setToolTip("Display window only: values at/below Min are black; values at/above Max use full channel colour.")
+    spin._allowed_min = float(allowed_min)
+    spin._allowed_max = float(allowed_max)
+    if on_change is not None:
+        spin.valueChanged.connect(lambda *_: on_change())
+    return spin
+
+
+def _set_spin_safely(spin, value: float):
+    if spin is None:
+        return
+    old = spin.blockSignals(True)
+    spin.setValue(float(value))
+    spin.blockSignals(old)
+
+
+def _set_brightness_widget_safely(widget, value: int = 100):
+    try:
+        slider = widget._brightness_slider
+        old = slider.blockSignals(True)
+        slider.setValue(int(value))
+        slider.blockSignals(old)
+        widget._brightness_label.setText(f"{int(slider.value())}%")
+    except Exception:
+        pass
+
+
 def render_channel_composite(arr: np.ndarray, axes: str, channel_settings: List[Dict[str, Any]],
                              p_low: float = 1.0, p_high: float = 99.8) -> np.ndarray:
-    """Render scientific multichannel data or preserve true RGB for display.
+    """Render a stable per-channel Min/Max display window, like QuPath/ImageJ.
 
-    Important: RGB/H&E images must not be percentile-normalized channel-by-channel,
-    because that changes the colour balance and can create a strange appearance
-    when zooming out. If the source has an S/samples axis or is a normal RGB/RGBA
-    image, the preview preserves the original RGB values by default.
+    Min/Max and brightness are visualization settings only. No percentile is
+    recomputed from the current zoomed ROI, and raw export never calls this function.
     """
+    del p_low, p_high
     arr2, ax2 = _representative_yx_or_yxc(arr, axes)
 
-    # True RGB/RGBA image: preserve colour balance. Channel checkboxes can still
-    # hide individual RGB channels, but values are not re-normalized.
     if arr2.ndim == 3 and ax2 == "YXS" and arr2.shape[-1] in (3, 4):
         rgb = _to_uint8_rgb(arr2)
         if not channel_settings:
             return rgb
-        out = np.zeros_like(rgb)
+        out = np.zeros(rgb.shape, dtype=np.float32)
         default_rgb_colors = ["red", "green", "blue"]
         for st in channel_settings:
             if not st.get("visible", True):
@@ -708,32 +917,37 @@ def render_channel_composite(arr: np.ndarray, axes: str, channel_settings: List[
             if c < 0 or c >= min(3, rgb.shape[-1]):
                 continue
             color_name = str(st.get("color", default_rgb_colors[c] if c < 3 else "gray")).lower()
-            # Default RGB mapping keeps true RGB. Non-default choices are allowed
-            # for visual inspection, but still use raw 8-bit values rather than
-            # percentile normalization.
+            ch = _channel_to_display_float(
+                rgb[:, :, c], st.get("min_display", 0.0), st.get("max_display", 255.0),
+                st.get("brightness_percent", 100.0), st.get("gamma", 1.0)
+            )
             if c < 3 and color_name == default_rgb_colors[c]:
-                out[:, :, c] = rgb[:, :, c]
+                out[:, :, c] += ch
             else:
                 color_vec = np.asarray(COLOR_MAPS.get(color_name, COLOR_MAPS["gray"]), dtype=np.float32)
-                ch = rgb[:, :, c].astype(np.float32) / 255.0
-                out = np.clip(out.astype(np.float32) + ch[:, :, None] * color_vec[None, None, :] * 255.0, 0, 255).astype(np.uint8)
-        return out
+                out += ch[:, :, None] * color_vec[None, None, :]
+        return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
 
     if arr2.ndim == 2:
-        ch = _normalize_channel_float(arr2, p_low, p_high)
-        return np.clip(np.stack([ch, ch, ch], axis=-1) * 255, 0, 255).astype(np.uint8)
+        st = channel_settings[0] if channel_settings else {}
+        ch = _channel_to_display_float(
+            arr2, st.get("min_display"), st.get("max_display"), st.get("brightness_percent", 100.0),
+            st.get("gamma", 1.0)
+        )
+        return np.clip(np.stack([ch, ch, ch], axis=-1) * 255.0, 0, 255).astype(np.uint8)
 
     h, w = arr2.shape[:2]
     rgb = np.zeros((h, w, 3), dtype=np.float32)
     if not channel_settings:
-        n = arr2.shape[-1]
-        channel_settings = [
-            {"channel": i, "visible": True, "color": DEFAULT_CHANNEL_COLORS[i % len(DEFAULT_CHANNEL_COLORS)]}
-            for i in range(n)
-        ]
-    # Draw in natural channel order. Colors and visibility are user-controlled;
-    # order was intentionally removed from the GUI because it did not add much
-    # value for additive IF overlays.
+        channel_settings = []
+        for i in range(arr2.shape[-1]):
+            lo, hi = _auto_channel_display_range(arr2[:, :, i], saturation_percent=1.0)
+            channel_settings.append({
+                "channel": i, "visible": True,
+                "color": DEFAULT_CHANNEL_COLORS[i % len(DEFAULT_CHANNEL_COLORS)],
+                "min_display": lo, "max_display": hi, "brightness_percent": 100, "gamma": 1.0,
+            })
+
     for st in channel_settings:
         if not st.get("visible", True):
             continue
@@ -742,10 +956,12 @@ def render_channel_composite(arr: np.ndarray, axes: str, channel_settings: List[
             continue
         color_name = str(st.get("color", "gray")).lower()
         color_vec = np.asarray(COLOR_MAPS.get(color_name, COLOR_MAPS["gray"]), dtype=np.float32)
-        ch = _normalize_channel_float(arr2[:, :, c], p_low, p_high)
+        ch = _channel_to_display_float(
+            arr2[:, :, c], st.get("min_display"), st.get("max_display"),
+            st.get("brightness_percent", 100.0), st.get("gamma", 1.0)
+        )
         rgb += ch[:, :, None] * color_vec[None, None, :]
-    return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
-
+    return (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 def _placeholder_rgb(message: str, width: int = 900, height: int = 600) -> np.ndarray:
     """Small display-only placeholder used when a full-resolution preview would be unsafe."""
@@ -8035,7 +8251,7 @@ class TileCapturePopup(QDialog):
         layout.addLayout(self.grid_layout, 1)
 
         controls = QHBoxLayout()
-        self.include_geojson_chk = QCheckBox("Include visible GeoJSON")
+        self.include_geojson_chk = QCheckBox("Include visible GeoJSON in display PNG only")
         self.include_geojson_chk.setChecked(True)
         self.include_geojson_chk.stateChanged.connect(lambda *_: self.owner.schedule_preview_tile_popup_update())
         controls.addWidget(self.include_geojson_chk)
@@ -8047,14 +8263,36 @@ class TileCapturePopup(QDialog):
         except Exception:
             pass
         self.suffix_edit = QLineEdit(default_suffix)
-        self.suffix_edit.setPlaceholderText("Suffix for saved PNG tile(s)")
+        self.suffix_edit.setPlaceholderText("Suffix for saved tile file(s)")
         self.suffix_edit.setMinimumWidth(180)
         controls.addWidget(self.suffix_edit)
         controls.addStretch()
-        self.save_btn = QPushButton("Save visible tile(s) PNG")
-        self.save_btn.clicked.connect(self.owner.save_preview_tile_capture_png)
-        controls.addWidget(self.save_btn)
+
+        self.save_raw_btn = QPushButton("Save raw tile(s) OME-TIFF")
+        self.save_raw_btn.setToolTip(
+            "Scientific export: exact full-resolution source pixels, original dtype and channels. "
+            "No display normalization, colour mapping, zoom-level resampling, or GeoJSON overlay."
+        )
+        self.save_raw_btn.clicked.connect(self.owner.save_preview_tile_capture_raw_ome_tiff)
+        controls.addWidget(self.save_raw_btn)
+
+        self.save_png_btn = QPushButton("Save display PNG(s)")
+        self.save_png_btn.setToolTip(
+            "Visual export only: saves the colour-mapped 8-bit view shown in the popup, "
+            "including display-only channel brightness. This is not suitable for quantitative intensity analysis."
+        )
+        self.save_png_btn.clicked.connect(self.owner.save_preview_tile_capture_png)
+        controls.addWidget(self.save_png_btn)
         layout.addLayout(controls)
+
+        export_note = QLabel(
+            "Raw OME-TIFF preserves the original numeric intensities, dtype, channels, and pixel calibration. "
+            "Display PNG is an 8-bit visualization using the fixed raw dtype scale and the current "
+            "display-only per-channel brightness settings."
+        )
+        export_note.setWordWrap(True)
+        export_note.setStyleSheet("color: #555; padding: 2px 4px;")
+        layout.addWidget(export_note)
 
     def closeEvent(self, event):
         # Keep the dialog reusable and synchronize the checkbox in the main panel.
@@ -8083,6 +8321,485 @@ class TileCapturePopup(QDialog):
             else:
                 pane.setVisible(False)
                 pane.set_content("", None, "")
+
+
+
+class ChannelHistogramWidget(QWidget):
+    """Compact whole-image channel histogram used by the display popup."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(170)
+        self._counts = np.zeros(256, dtype=np.float64)
+        self._edges = np.linspace(0.0, 1.0, 257)
+        self._color = QColor(40, 180, 70)
+        self._log = False
+        self._display_min = 0.0
+        self._display_max = 1.0
+        self.setToolTip(
+            "Histogram calculated from the cached whole-image overview. "
+            "It is not recalculated from the current zoomed region."
+        )
+
+    def set_log(self, enabled: bool):
+        self._log = bool(enabled)
+        self.update()
+
+    def set_plane(self, plane, color=None, display_min=None, display_max=None):
+        vals = _sample_finite_channel_values(np.asarray(plane), max_samples=1_000_000)
+        if vals.size:
+            observed_min = float(vals.min())
+            observed_max = float(vals.max())
+            if observed_max <= observed_min:
+                observed_max = observed_min + 1.0
+            counts, edges = np.histogram(vals, bins=256, range=(observed_min, observed_max))
+            self._counts = counts.astype(np.float64)
+            self._edges = edges.astype(np.float64)
+        else:
+            self._counts = np.zeros(256, dtype=np.float64)
+            self._edges = np.linspace(0.0, 1.0, 257)
+        if color is not None:
+            self._color = QColor(color)
+        self._display_min = float(display_min if display_min is not None else self._edges[0])
+        self._display_max = float(display_max if display_max is not None else self._edges[-1])
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(250, 250, 250))
+        margin_l, margin_r, margin_t, margin_b = 36, 12, 12, 25
+        plot = QRect(margin_l, margin_t, max(1, self.width() - margin_l - margin_r),
+                     max(1, self.height() - margin_t - margin_b))
+        painter.setPen(QPen(QColor(190, 190, 190), 1))
+        painter.drawRect(plot)
+        counts = np.asarray(self._counts, dtype=np.float64)
+        if self._log:
+            counts = np.log1p(counts)
+        max_count = float(counts.max()) if counts.size else 0.0
+        if max_count > 0 and plot.width() > 1 and plot.height() > 1:
+            painter.setPen(QPen(self._color, 1))
+            n = len(counts)
+            last = None
+            for i, value in enumerate(counts):
+                x = plot.left() + int(round(i / max(1, n - 1) * (plot.width() - 1)))
+                y = plot.bottom() - int(round(float(value) / max_count * (plot.height() - 1)))
+                pt = QPoint(x, y)
+                if last is not None:
+                    painter.drawLine(last, pt)
+                last = pt
+        raw_min = float(self._edges[0]) if len(self._edges) else 0.0
+        raw_max = float(self._edges[-1]) if len(self._edges) else 1.0
+        painter.setPen(QColor(80, 80, 80))
+        painter.drawText(2, plot.bottom() + 18, f"{raw_min:g}")
+        max_txt = f"{raw_max:g}"
+        painter.drawText(max(plot.left(), self.width() - 8 * len(max_txt) - 8), plot.bottom() + 18, max_txt)
+        span = max(1e-12, raw_max - raw_min)
+        for value, pen_color in ((self._display_min, QColor(70, 170, 90)),
+                                 (self._display_max, QColor(90, 90, 90))):
+            frac = max(0.0, min(1.0, (float(value) - raw_min) / span))
+            x = plot.left() + int(round(frac * plot.width()))
+            painter.setPen(QPen(pen_color, 2))
+            painter.drawLine(x, plot.top(), x, plot.bottom())
+        painter.end()
+
+
+class QuPathBrightnessContrastDialog(QDialog):
+    """Non-modal QuPath-like brightness/contrast popup for Image Preview.
+
+    The histogram is always based on the cached whole-image overview. The dialog
+    edits only viewer settings stored in hidden main-table columns; raw OME-TIFF
+    exports bypass all these settings. New images open in Reset state; Auto is
+    applied only when the user presses Auto and never changes with zoom.
+    """
+    def __init__(self, owner, parent=None):
+        super().__init__(parent)
+        self.owner = owner
+        self.current_channel = 0
+        self._updating = False
+        self._raw_min = 0.0
+        self._raw_max = 1.0
+        self.setWindowTitle("Brightness & contrast")
+        self.setModal(False)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.resize(475, 720)
+
+        layout = QVBoxLayout(self)
+        self.channel_table = QTableWidget()
+        self.channel_table.setColumnCount(3)
+        self.channel_table.setHorizontalHeaderLabels(["Color", "Channel", "Show"])
+        self.channel_table.setColumnWidth(0, 72)
+        self.channel_table.setColumnWidth(1, 250)
+        self.channel_table.setColumnWidth(2, 70)
+        self.channel_table.verticalHeader().setVisible(False)
+        self.channel_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.channel_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.channel_table.setAlternatingRowColors(True)
+        self.channel_table.cellClicked.connect(self._channel_selected)
+        layout.addWidget(self.channel_table)
+
+        self.histogram = ChannelHistogramWidget()
+        layout.addWidget(self.histogram)
+
+        histogram_row = QHBoxLayout()
+        self.raw_range_label = QLabel("Raw range: —")
+        self.raw_range_label.setStyleSheet("font-weight: bold;")
+        histogram_row.addWidget(self.raw_range_label)
+        histogram_row.addStretch()
+        self.log_hist_chk = QCheckBox("Log histogram")
+        self.log_hist_chk.stateChanged.connect(lambda v: self.histogram.set_log(bool(v)))
+        histogram_row.addWidget(self.log_hist_chk)
+        layout.addLayout(histogram_row)
+
+        self.channel_name_label = QLabel("Channel")
+        font = self.channel_name_label.font()
+        font.setBold(True)
+        self.channel_name_label.setFont(font)
+        layout.addWidget(self.channel_name_label)
+
+        grid = QGridLayout()
+        self.min_slider = QSlider(Qt.Horizontal)
+        self.min_slider.setRange(0, 10000)
+        self.min_spin = QDoubleSpinBox()
+        self.min_spin.setDecimals(4)
+        self.max_slider = QSlider(Qt.Horizontal)
+        self.max_slider.setRange(0, 10000)
+        self.max_spin = QDoubleSpinBox()
+        self.max_spin.setDecimals(4)
+        self.gamma_slider = QSlider(Qt.Horizontal)
+        self.gamma_slider.setRange(10, 500)
+        self.gamma_slider.setValue(100)
+        self.gamma_spin = QDoubleSpinBox()
+        self.gamma_spin.setRange(0.1, 5.0)
+        self.gamma_spin.setDecimals(2)
+        self.gamma_spin.setSingleStep(0.05)
+        self.gamma_spin.setValue(1.0)
+        grid.addWidget(QLabel("Channel min"), 0, 0)
+        grid.addWidget(self.min_slider, 0, 1)
+        grid.addWidget(self.min_spin, 0, 2)
+        grid.addWidget(QLabel("Channel max"), 1, 0)
+        grid.addWidget(self.max_slider, 1, 1)
+        grid.addWidget(self.max_spin, 1, 2)
+        grid.addWidget(QLabel("Viewer gamma"), 2, 0)
+        grid.addWidget(self.gamma_slider, 2, 1)
+        grid.addWidget(self.gamma_spin, 2, 2)
+        layout.addLayout(grid)
+
+        auto_row = QHBoxLayout()
+        auto_row.addWidget(QLabel("Auto saturation:"))
+        self.saturation_spin = QDoubleSpinBox()
+        self.saturation_spin.setRange(0.0, 10.0)
+        self.saturation_spin.setDecimals(2)
+        self.saturation_spin.setSingleStep(0.25)
+        self.saturation_spin.setValue(1.0)
+        self.saturation_spin.setSuffix("% / tail")
+        auto_row.addWidget(self.saturation_spin)
+        layout.addLayout(auto_row)
+
+        button_row = QHBoxLayout()
+        self.auto_btn = QPushButton("Auto")
+        self.auto_btn.clicked.connect(self.auto_selected_channel)
+        self.reset_btn = QPushButton("Reset")
+        self.reset_btn.clicked.connect(self.reset_selected_channel)
+        button_row.addWidget(self.auto_btn)
+        button_row.addWidget(self.reset_btn)
+        layout.addLayout(button_row)
+
+        note = QLabel(
+            "Auto uses the cached whole-image histogram and remains fixed while zooming or panning. "
+            "Min, Max, gamma, channel colors and visibility are viewer-only. Raw tile OME-TIFF export is unchanged."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555; padding-top: 6px;")
+        layout.addWidget(note)
+
+        self.min_slider.valueChanged.connect(self._min_slider_changed)
+        self.max_slider.valueChanged.connect(self._max_slider_changed)
+        self.min_spin.valueChanged.connect(self._min_spin_changed)
+        self.max_spin.valueChanged.connect(self._max_spin_changed)
+        self.gamma_slider.valueChanged.connect(self._gamma_slider_changed)
+        self.gamma_spin.valueChanged.connect(self._gamma_spin_changed)
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+
+    def _owner_table(self):
+        return getattr(self.owner, "channel_table", None)
+
+    def _whole_image_plane(self, channel):
+        arr = getattr(self.owner, "preview_display_reference_arr", None)
+        axes = getattr(self.owner, "preview_display_reference_axes", None) or getattr(self.owner, "preview_axes", "")
+        if arr is None:
+            arr = getattr(self.owner, "preview_arr", None)
+        if arr is None:
+            return np.zeros((1, 1), dtype=np.uint8)
+        return _display_channel_plane(arr, axes, channel)
+
+    def _color_name(self, channel):
+        table = self._owner_table()
+        combo = table.cellWidget(channel, 2) if table is not None else None
+        return combo.currentText() if combo is not None else DEFAULT_CHANNEL_COLORS[channel % len(DEFAULT_CHANNEL_COLORS)]
+
+    def _color(self, channel):
+        vec = COLOR_MAPS.get(str(self._color_name(channel)).lower(), COLOR_MAPS["gray"])
+        return QColor(int(vec[0] * 255), int(vec[1] * 255), int(vec[2] * 255))
+
+    def refresh_from_owner(self):
+        table = self._owner_table()
+        if table is None:
+            return
+        self._updating = True
+        try:
+            n = table.rowCount()
+            self.channel_table.setRowCount(n)
+            for r in range(n):
+                color_combo = QComboBox()
+                color_combo.addItems(list(COLOR_MAPS.keys()))
+                color_combo.setCurrentText(self._color_name(r))
+                color_combo.currentTextChanged.connect(lambda value, rr=r: self._popup_color_changed(rr, value))
+                self.channel_table.setCellWidget(r, 0, color_combo)
+
+                item = table.item(r, 1)
+                name = item.text() if item is not None else f"Channel {r + 1}"
+                name_item = QTableWidgetItem(name)
+                name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+                self.channel_table.setItem(r, 1, name_item)
+
+                show = QCheckBox()
+                source_show = table.cellWidget(r, 0)
+                show.setChecked(source_show.isChecked() if source_show is not None else True)
+                show.stateChanged.connect(lambda value, rr=r: self._popup_show_changed(rr, value))
+                holder = QWidget()
+                row = QHBoxLayout(holder)
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setAlignment(Qt.AlignCenter)
+                row.addWidget(show)
+                self.channel_table.setCellWidget(r, 2, holder)
+            if n:
+                self.current_channel = max(0, min(self.current_channel, n - 1))
+                self.channel_table.selectRow(self.current_channel)
+                self._load_selected_controls()
+        finally:
+            self._updating = False
+
+    def _popup_show_changed(self, row, value):
+        if self._updating:
+            return
+        table = self._owner_table()
+        source = table.cellWidget(row, 0) if table is not None else None
+        if source is not None:
+            old = source.blockSignals(True)
+            source.setChecked(bool(value))
+            source.blockSignals(old)
+        self._apply_viewer_change()
+
+    def _popup_color_changed(self, row, value):
+        if self._updating:
+            return
+        table = self._owner_table()
+        source = table.cellWidget(row, 2) if table is not None else None
+        if source is not None:
+            old = source.blockSignals(True)
+            source.setCurrentText(str(value))
+            source.blockSignals(old)
+        if row == self.current_channel:
+            self._load_selected_controls()
+        self._apply_viewer_change()
+
+    def _channel_selected(self, row, column):
+        self.current_channel = int(row)
+        self._load_selected_controls()
+
+    def _observed_bounds(self, plane):
+        vals = _sample_finite_channel_values(plane, max_samples=1_000_000)
+        if vals.size:
+            lo, hi = float(vals.min()), float(vals.max())
+            if hi <= lo:
+                hi = lo + 1.0
+            return lo, hi
+        return _infer_channel_allowed_range(plane)
+
+    def _set_spin_range(self, spin, lo, hi):
+        span = max(1e-9, float(hi) - float(lo))
+        spin.setRange(float(lo), float(hi))
+        spin.setSingleStep(max(span / 1000.0, 1.0 if float(lo).is_integer() and float(hi).is_integer() else span / 1000.0))
+        spin.setDecimals(0 if float(lo).is_integer() and float(hi).is_integer() else 4)
+
+    def _raw_to_slider(self, value):
+        return int(round(max(0.0, min(1.0, (float(value) - self._raw_min) / max(1e-12, self._raw_max - self._raw_min))) * 10000.0))
+
+    def _slider_to_raw(self, value):
+        return self._raw_min + (float(value) / 10000.0) * (self._raw_max - self._raw_min)
+
+    def _gamma_widget(self, row):
+        table = self._owner_table()
+        return table.cellWidget(row, 6) if table is not None and table.columnCount() > 6 else None
+
+    def _load_selected_controls(self):
+        table = self._owner_table()
+        if table is None or table.rowCount() == 0:
+            return
+        r = max(0, min(self.current_channel, table.rowCount() - 1))
+        plane = self._whole_image_plane(r)
+        observed_min, observed_max = self._observed_bounds(plane)
+        # Match the default Reset state used by the main viewer. For example,
+        # 12-bit microscopy stored in uint16 resets to 0..4095 even when the
+        # sampled overview's brightest observed pixel is slightly below 4095.
+        self._raw_min, self._raw_max = _infer_channel_allowed_range(plane)
+        min_widget = table.cellWidget(r, 3)
+        max_widget = table.cellWidget(r, 4)
+        gamma_widget = self._gamma_widget(r)
+        current_min = float(min_widget.value()) if min_widget is not None else self._raw_min
+        current_max = float(max_widget.value()) if max_widget is not None else self._raw_max
+        current_gamma = float(gamma_widget.value()) if gamma_widget is not None else 1.0
+        current_min = max(self._raw_min, min(current_min, self._raw_max))
+        current_max = max(self._raw_min, min(current_max, self._raw_max))
+        if current_max <= current_min:
+            current_min, current_max = self._raw_min, self._raw_max
+
+        item = table.item(r, 1)
+        name = item.text() if item is not None else f"Channel {r + 1}"
+        self.channel_name_label.setText(name)
+        self.raw_range_label.setText(
+            f"Observed whole-image range: {observed_min:g} – {observed_max:g} | "
+            f"Reset range: {self._raw_min:g} – {self._raw_max:g}"
+        )
+        self._updating = True
+        try:
+            self._set_spin_range(self.min_spin, self._raw_min, self._raw_max)
+            self._set_spin_range(self.max_spin, self._raw_min, self._raw_max)
+            self.min_spin.setValue(current_min)
+            self.max_spin.setValue(current_max)
+            self.min_slider.setValue(self._raw_to_slider(current_min))
+            self.max_slider.setValue(self._raw_to_slider(current_max))
+            self.gamma_spin.setValue(current_gamma)
+            self.gamma_slider.setValue(int(round(current_gamma * 100.0)))
+            self.histogram.set_plane(plane, self._color(r), current_min, current_max)
+        finally:
+            self._updating = False
+
+    def _write_selected(self, lo=None, hi=None, gamma=None):
+        table = self._owner_table()
+        if table is None or table.rowCount() == 0:
+            return
+        r = max(0, min(self.current_channel, table.rowCount() - 1))
+        if lo is not None:
+            _set_spin_safely(table.cellWidget(r, 3), float(lo))
+        if hi is not None:
+            _set_spin_safely(table.cellWidget(r, 4), float(hi))
+        if gamma is not None:
+            _set_spin_safely(self._gamma_widget(r), float(gamma))
+        self.histogram._display_min = float(self.min_spin.value())
+        self.histogram._display_max = float(self.max_spin.value())
+        self.histogram.update()
+        self._apply_viewer_change()
+
+    def _apply_viewer_change(self):
+        if self._updating:
+            return
+        self.owner.schedule_preview_region_update(delay_ms=20)
+        try:
+            self.owner.schedule_preview_tile_popup_update(delay_ms=30)
+        except Exception:
+            pass
+
+    def _min_slider_changed(self, value):
+        if self._updating:
+            return
+        raw = min(self._slider_to_raw(value), float(self.max_spin.value()) - max(1e-12, (self._raw_max - self._raw_min) / 10000.0))
+        self._updating = True
+        self.min_spin.setValue(raw)
+        self._updating = False
+        self._write_selected(lo=raw)
+
+    def _max_slider_changed(self, value):
+        if self._updating:
+            return
+        raw = max(self._slider_to_raw(value), float(self.min_spin.value()) + max(1e-12, (self._raw_max - self._raw_min) / 10000.0))
+        self._updating = True
+        self.max_spin.setValue(raw)
+        self._updating = False
+        self._write_selected(hi=raw)
+
+    def _min_spin_changed(self, value):
+        if self._updating:
+            return
+        value = min(float(value), float(self.max_spin.value()) - max(1e-12, (self._raw_max - self._raw_min) / 10000.0))
+        self._updating = True
+        self.min_slider.setValue(self._raw_to_slider(value))
+        self._updating = False
+        self._write_selected(lo=value)
+
+    def _max_spin_changed(self, value):
+        if self._updating:
+            return
+        value = max(float(value), float(self.min_spin.value()) + max(1e-12, (self._raw_max - self._raw_min) / 10000.0))
+        self._updating = True
+        self.max_slider.setValue(self._raw_to_slider(value))
+        self._updating = False
+        self._write_selected(hi=value)
+
+    def _gamma_slider_changed(self, value):
+        if self._updating:
+            return
+        gamma = max(0.1, min(5.0, float(value) / 100.0))
+        self._updating = True
+        self.gamma_spin.setValue(gamma)
+        self._updating = False
+        self._write_selected(gamma=gamma)
+
+    def _gamma_spin_changed(self, value):
+        if self._updating:
+            return
+        gamma = max(0.1, min(5.0, float(value)))
+        self._updating = True
+        self.gamma_slider.setValue(int(round(gamma * 100.0)))
+        self._updating = False
+        self._write_selected(gamma=gamma)
+
+    def auto_selected_channel(self):
+        table = self._owner_table()
+        if table is None or table.rowCount() == 0:
+            return
+        r = max(0, min(self.current_channel, table.rowCount() - 1))
+        plane = self._whole_image_plane(r)
+        sat = float(self.saturation_spin.value())
+        lo, hi = _auto_channel_display_range(plane, saturation_percent=sat)
+        # Constrain to the displayed whole-image raw bounds shown by the sliders.
+        lo = max(self._raw_min, min(lo, self._raw_max))
+        hi = max(self._raw_min, min(hi, self._raw_max))
+        if hi <= lo:
+            lo, hi = self._raw_min, self._raw_max
+        self._updating = True
+        try:
+            self.min_spin.setValue(lo)
+            self.max_spin.setValue(hi)
+            self.min_slider.setValue(self._raw_to_slider(lo))
+            self.max_slider.setValue(self._raw_to_slider(hi))
+            self.gamma_spin.setValue(1.0)
+            self.gamma_slider.setValue(100)
+        finally:
+            self._updating = False
+        self._write_selected(lo=lo, hi=hi, gamma=1.0)
+        self.owner.info_label.setText(
+            f"Channel {r + 1} Auto calculated once from the whole-image histogram ({sat:g}% per tail). Raw pixels unchanged."
+        )
+
+    def reset_selected_channel(self):
+        lo, hi = self._raw_min, self._raw_max
+        self._updating = True
+        try:
+            self.min_spin.setValue(lo)
+            self.max_spin.setValue(hi)
+            self.min_slider.setValue(0)
+            self.max_slider.setValue(10000)
+            self.gamma_spin.setValue(1.0)
+            self.gamma_slider.setValue(100)
+        finally:
+            self._updating = False
+        self._write_selected(lo=lo, hi=hi, gamma=1.0)
+        self.owner.info_label.setText(
+            f"Channel {self.current_channel + 1} display reset to its whole-image raw range. Raw pixels unchanged."
+        )
 
 
 class AutoHideStatusLabel(QLabel):
@@ -8226,17 +8943,45 @@ class WSICropTileMergeGUI(QMainWindow):
         left = QVBoxLayout(left_panel)
         left.setContentsMargins(0, 0, 0, 0)
 
+        left_panel.setMinimumWidth(510)
+        left_panel.setMaximumWidth(580)
         self.if_channel_table = QTableWidget()
-        self.if_channel_table.setColumnCount(3)
-        self.if_channel_table.setHorizontalHeaderLabels(["On", "Channel", "Color"])
-        self.if_channel_table.setColumnWidth(0, 45)
-        self.if_channel_table.setColumnWidth(1, 75)
-        self.if_channel_table.setColumnWidth(2, 115)
+        self.if_channel_table.setColumnCount(6)
+        self.if_channel_table.setHorizontalHeaderLabels(["On", "Channel", "Color", "Min", "Max", "Brightness"])
+        self.if_channel_table.setColumnWidth(0, 38)
+        self.if_channel_table.setColumnWidth(1, 52)
+        self.if_channel_table.setColumnWidth(2, 76)
+        self.if_channel_table.setColumnWidth(3, 82)
+        self.if_channel_table.setColumnWidth(4, 82)
+        self.if_channel_table.setColumnWidth(5, 145)
         self.if_channel_table.verticalHeader().setVisible(False)
-        self.if_channel_table.verticalHeader().setDefaultSectionSize(24)
-        self.if_channel_table.setMaximumHeight(150)
-        left.addWidget(QLabel("IF display channels"))
+        self.if_channel_table.verticalHeader().setDefaultSectionSize(34)
+        self.if_channel_table.setMaximumHeight(225)
+        self.if_channel_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        if_channel_title = QLabel("IF channels - QuPath/ImageJ-style display window")
+        if_channel_title.setToolTip(
+            "Min maps to black and Max maps to full channel colour. Auto histogram is "
+            "calculated from the whole-image overview once and remains fixed while zooming."
+        )
+        left.addWidget(if_channel_title)
         left.addWidget(self.if_channel_table)
+        if_display_row = QHBoxLayout()
+        self.if_auto_saturation_spin = QDoubleSpinBox()
+        self.if_auto_saturation_spin.setRange(0.0, 10.0)
+        self.if_auto_saturation_spin.setDecimals(2)
+        self.if_auto_saturation_spin.setSingleStep(0.25)
+        self.if_auto_saturation_spin.setValue(1.0)
+        self.if_auto_saturation_spin.setSuffix("% / tail")
+        self.if_auto_saturation_spin.setToolTip("Percentage clipped from each dark and bright histogram tail when Auto is pressed.")
+        if_auto_btn = QPushButton("Auto histogram")
+        if_auto_btn.clicked.connect(self.auto_if_channel_display_ranges)
+        if_reset_btn = QPushButton("Reset display")
+        if_reset_btn.clicked.connect(self.reset_if_channel_display_ranges)
+        if_display_row.addWidget(QLabel("Auto saturation:"))
+        if_display_row.addWidget(self.if_auto_saturation_spin)
+        if_display_row.addWidget(if_auto_btn)
+        if_display_row.addWidget(if_reset_btn)
+        left.addLayout(if_display_row)
 
         threshold_box = QGroupBox("Thresholds and visible positivity")
         th_grid = QGridLayout(threshold_box)
@@ -8381,6 +9126,8 @@ class WSICropTileMergeGUI(QMainWindow):
                 max_side=900,
             )
             self.if_arr, self.if_axes, self.if_meta = arr, axes, meta
+            self.if_display_reference_arr = np.array(arr, copy=True)
+            self.if_display_reference_axes = axes
             if meta.get("full_dims"):
                 self.if_full_dims = tuple(meta["full_dims"])
             else:
@@ -8556,24 +9303,53 @@ class WSICropTileMergeGUI(QMainWindow):
     def populate_if_channel_table(self, settings: Optional[List[Dict[str, Any]]] = None):
         if self.if_arr is None or not hasattr(self, "if_channel_table"):
             return
-        n_total = _count_display_channels(self.if_arr, self.if_axes)
+        ref_arr = getattr(self, "if_display_reference_arr", None)
+        ref_axes = getattr(self, "if_display_reference_axes", None) or self.if_axes
+        source_arr = ref_arr if ref_arr is not None else self.if_arr
+        n_total = _count_display_channels(source_arr, ref_axes)
         n = min(int(n_total), 6)
         self.if_channel_table.setRowCount(n)
+        sat = float(self.if_auto_saturation_spin.value()) if hasattr(self, "if_auto_saturation_spin") else 1.0
         for i in range(n):
             st = settings[i] if settings and i < len(settings) else {}
+            plane = _display_channel_plane(source_arr, ref_axes, i)
+            allowed_min, allowed_max = _infer_channel_allowed_range(plane)
+            auto_min, auto_max = _auto_channel_display_range(plane, sat)
+            min_display = float(st.get("min_display", auto_min))
+            max_display = float(st.get("max_display", auto_max))
+
             chk = QCheckBox()
             chk.setChecked(bool(st.get("visible", True)))
             chk.stateChanged.connect(lambda *_: self.schedule_if_threshold_update())
             self.if_channel_table.setCellWidget(i, 0, chk)
+
             item = QTableWidgetItem(f"C{i + 1}")
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
             self.if_channel_table.setItem(i, 1, item)
+
             color_combo = QComboBox()
             color_combo.addItems(list(COLOR_MAPS.keys()))
             default_color = st.get("color", DEFAULT_CHANNEL_COLORS[i % len(DEFAULT_CHANNEL_COLORS)])
             color_combo.setCurrentText(default_color if default_color in COLOR_MAPS else "gray")
             color_combo.currentIndexChanged.connect(lambda *_: self.schedule_if_threshold_update())
             self.if_channel_table.setCellWidget(i, 2, color_combo)
+
+            min_spin = _make_display_range_spin(
+                min_display, allowed_min, allowed_max,
+                on_change=lambda: self.schedule_if_threshold_update(),
+            )
+            max_spin = _make_display_range_spin(
+                max_display, allowed_min, allowed_max,
+                on_change=lambda: self.schedule_if_threshold_update(),
+            )
+            self.if_channel_table.setCellWidget(i, 3, min_spin)
+            self.if_channel_table.setCellWidget(i, 4, max_spin)
+
+            brightness_widget = _make_channel_brightness_widget(
+                value=int(st.get("brightness_percent", 100)),
+                on_change=lambda: self.schedule_if_threshold_update(),
+            )
+            self.if_channel_table.setCellWidget(i, 5, brightness_widget)
 
     def get_if_channel_settings_from_table(self) -> List[Dict[str, Any]]:
         settings = []
@@ -8582,12 +9358,51 @@ class WSICropTileMergeGUI(QMainWindow):
         for r in range(self.if_channel_table.rowCount()):
             chk = self.if_channel_table.cellWidget(r, 0)
             color_combo = self.if_channel_table.cellWidget(r, 2)
+            min_spin = self.if_channel_table.cellWidget(r, 3)
+            max_spin = self.if_channel_table.cellWidget(r, 4)
+            brightness_widget = self.if_channel_table.cellWidget(r, 5)
+            lo = float(min_spin.value()) if min_spin else 0.0
+            hi = float(max_spin.value()) if max_spin else 1.0
+            if hi <= lo:
+                hi = lo + 1.0
             settings.append({
                 "channel": r,
                 "visible": chk.isChecked() if chk else True,
                 "color": color_combo.currentText() if color_combo else DEFAULT_CHANNEL_COLORS[r % len(DEFAULT_CHANNEL_COLORS)],
+                "min_display": lo,
+                "max_display": hi,
+                "brightness_percent": _brightness_percent_from_widget(brightness_widget, 100),
             })
         return settings
+
+    def auto_if_channel_display_ranges(self):
+        source_arr = getattr(self, "if_display_reference_arr", None)
+        axes = getattr(self, "if_display_reference_axes", None) or self.if_axes
+        if source_arr is None or not hasattr(self, "if_channel_table"):
+            return
+        sat = float(self.if_auto_saturation_spin.value()) if hasattr(self, "if_auto_saturation_spin") else 1.0
+        for r in range(self.if_channel_table.rowCount()):
+            plane = _display_channel_plane(source_arr, axes, r)
+            lo, hi = _auto_channel_display_range(plane, saturation_percent=sat)
+            _set_spin_safely(self.if_channel_table.cellWidget(r, 3), lo)
+            _set_spin_safely(self.if_channel_table.cellWidget(r, 4), hi)
+            _set_brightness_widget_safely(self.if_channel_table.cellWidget(r, 5), 100)
+        self.schedule_if_threshold_update(delay_ms=0)
+        self.info_label.setText(f"IF display auto-adjusted from whole-image histogram ({sat:g}% clipped per tail). Raw data unchanged.")
+
+    def reset_if_channel_display_ranges(self):
+        source_arr = getattr(self, "if_display_reference_arr", None)
+        axes = getattr(self, "if_display_reference_axes", None) or self.if_axes
+        if source_arr is None or not hasattr(self, "if_channel_table"):
+            return
+        for r in range(self.if_channel_table.rowCount()):
+            plane = _display_channel_plane(source_arr, axes, r)
+            lo, hi = _infer_channel_allowed_range(plane)
+            _set_spin_safely(self.if_channel_table.cellWidget(r, 3), lo)
+            _set_spin_safely(self.if_channel_table.cellWidget(r, 4), hi)
+            _set_brightness_widget_safely(self.if_channel_table.cellWidget(r, 5), 100)
+        self.schedule_if_threshold_update(delay_ms=0)
+        self.info_label.setText("IF display reset to the inferred full acquisition range. Raw data unchanged.")
 
     def if_threshold_values(self) -> List[float]:
         vals = [0.0] * IF_MAX_CHANNELS
@@ -8855,6 +9670,8 @@ class WSICropTileMergeGUI(QMainWindow):
         self.preview_arr = None
         self.preview_axes = None
         self.preview_meta = {}
+        self.preview_display_reference_arr = None
+        self.preview_display_reference_axes = None
         self.preview_full_dims = None
         self.preview_center = None
         self.preview_zoom = 1.0
@@ -8868,6 +9685,8 @@ class WSICropTileMergeGUI(QMainWindow):
         self.preview_tile_center = None
         self.preview_tile_mode = False
         self.preview_tile_popup = None
+        self.preview_brightness_dialog = None
+        self.preview_global_brightness_percent = 100
         self._preview_tile_popup_timer = QTimer(self)
         self._preview_tile_popup_timer.setSingleShot(True)
         self._preview_tile_popup_timer.timeout.connect(self.update_preview_tile_popup_now)
@@ -8886,6 +9705,8 @@ class WSICropTileMergeGUI(QMainWindow):
         self.if_arr = None
         self.if_axes = None
         self.if_meta = {}
+        self.if_display_reference_arr = None
+        self.if_display_reference_axes = None
         self.if_full_dims = None
         self.if_center = None
         self.if_zoom = 1.0
@@ -9787,6 +10608,8 @@ class WSICropTileMergeGUI(QMainWindow):
                 viewport_size=(max(640, self.preview_image_label.width()), max(420, self.preview_image_label.height())),
                 max_side=900,
             )
+            self.preview_display_reference_arr = np.array(self.preview_arr, copy=True)
+            self.preview_display_reference_axes = self.preview_axes
             full_dims = self.preview_meta.get("full_dims")
             if full_dims:
                 self.preview_full_dims = tuple(full_dims)
@@ -9800,6 +10623,7 @@ class WSICropTileMergeGUI(QMainWindow):
             self.preview_file_label.setText(
                 f"{self.preview_path.name} | axes={self.preview_axes} | reader={self.preview_meta.get('reader')} | full={self.preview_full_dims[0]} × {self.preview_full_dims[1]}"
             )
+            self._reset_global_preview_brightness(refresh=False)
             self.populate_channel_table()
             self.update_channel_preview()
             self.info_label.setText(f"Loaded from Explorer into Image Preview: {path.name}")
@@ -9896,6 +10720,12 @@ class WSICropTileMergeGUI(QMainWindow):
         rect_zoom_btn = QPushButton("Zoom to rectangle")
         rect_zoom_btn.setToolTip("Click this, then drag a rectangle on the current preview to zoom to that region.")
         rect_zoom_btn.clicked.connect(self.start_preview_rectangle_zoom)
+        brightness_contrast_btn = QPushButton("Brightness && contrast…")
+        brightness_contrast_btn.setToolTip(
+            "Open QuPath-like per-channel histogram, Min/Max, gamma, Auto and Reset controls. "
+            "All controls are display-only and never change raw tile exports."
+        )
+        brightness_contrast_btn.clicked.connect(self.open_brightness_contrast_dialog)
         self.preview_zoom_label = QLabel("Zoom: 100%")
         save_row.addWidget(QLabel("Suffix:"))
         save_row.addWidget(self.preview_suffix_edit)
@@ -9905,6 +10735,7 @@ class WSICropTileMergeGUI(QMainWindow):
         save_row.addWidget(zoom_in_btn)
         save_row.addWidget(zoom_fit_btn)
         save_row.addWidget(rect_zoom_btn)
+        save_row.addWidget(brightness_contrast_btn)
         save_row.addWidget(self.preview_zoom_label)
         layout.addWidget(save_box)
 
@@ -9912,29 +10743,50 @@ class WSICropTileMergeGUI(QMainWindow):
         main.setSpacing(10)
 
         left_panel = QWidget()
-        left_panel.setMinimumWidth(340)
-        left_panel.setMaximumWidth(410)
+        left_panel.setMinimumWidth(390)
+        left_panel.setMaximumWidth(480)
         left_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         left = QVBoxLayout(left_panel)
         left.setContentsMargins(0, 0, 0, 0)
 
         self.channel_table = QTableWidget()
-        self.channel_table.setColumnCount(3)
-        self.channel_table.setHorizontalHeaderLabels(["On", "Channel", "Color"])
-        self.channel_table.setColumnWidth(0, 45)
-        self.channel_table.setColumnWidth(1, 80)
-        self.channel_table.setColumnWidth(2, 140)
-        self.channel_table.setMinimumWidth(300)
-        self.channel_table.setMaximumHeight(190)
+        # Keep hidden storage columns for the non-destructive display model, but
+        # permanently show only the simple channel controls requested for the
+        # main Image Preview panel: On, Channel and Color. Min/Max and gamma live
+        # exclusively in the QuPath-like Brightness & contrast popup.
+        self.channel_table.setColumnCount(7)
+        self.channel_table.setHorizontalHeaderLabels(["On", "Channel", "Color", "Min", "Max", "Brightness", "Gamma"])
+        self.channel_table.setColumnWidth(0, 42)
+        self.channel_table.setColumnWidth(1, 105)
+        self.channel_table.setColumnWidth(2, 110)
+        for hidden_col in (3, 4, 5, 6):
+            self.channel_table.setColumnHidden(hidden_col, True)
+        self.channel_table.setMinimumWidth(275)
+        self.channel_table.setMaximumHeight(245)
         self.channel_table.verticalHeader().setVisible(False)
-        self.channel_table.verticalHeader().setDefaultSectionSize(24)
+        self.channel_table.verticalHeader().setDefaultSectionSize(34)
         self.channel_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.channel_table.setAlternatingRowColors(True)
-        left.addWidget(QLabel("Channels / display mapping (max. 6 shown)"))
+        channel_title = QLabel("Channels (max. 6 shown)")
+        channel_title.setToolTip(
+            "Use On/Off and Color here. Open Brightness & contrast for the whole-image "
+            "histogram, per-channel Min/Max, gamma, Auto and Reset."
+        )
+        left.addWidget(channel_title)
         left.addWidget(self.channel_table, 0)
-        update_btn = QPushButton("Update preview")
-        update_btn.clicked.connect(self.update_channel_preview)
-        left.addWidget(update_btn)
+
+        global_brightness_row = QHBoxLayout()
+        global_brightness_row.addWidget(QLabel("Sample brightness:"))
+        self.preview_global_brightness_widget = _make_channel_brightness_widget(
+            value=100,
+            on_change=self.preview_global_brightness_changed,
+        )
+        self.preview_global_brightness_widget.setToolTip(
+            "Display-only brightness for the complete sample/composite. 100% is neutral. "
+            "It never changes saved raw OME-TIFF intensities."
+        )
+        global_brightness_row.addWidget(self.preview_global_brightness_widget, 1)
+        left.addLayout(global_brightness_row)
 
         geo_box = QGroupBox("GeoJSON annotations / lightweight annotator")
         geo_layout = QGridLayout(geo_box)
@@ -10033,7 +10885,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.preview_tile_info_label = QLabel("Tile: not set")
         self.preview_tile_info_label.setWordWrap(True)
         tile_layout.addWidget(self.preview_tile_info_label, 2, 0, 1, 2)
-        note = QLabel("When enabled, left-drag on the main preview moves the blue square. Right-drag pans the view. The pop-up updates and can show up to 4 synchronized registered/colocalized images and save each tile as a separate PNG.")
+        note = QLabel("When enabled, left-drag on the main preview moves the blue square. Right-drag pans the view. The pop-up can show up to 4 synchronized registered/colocalized images. Save raw OME-TIFF for exact source intensities; save display PNG only for presentation.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #555;")
         tile_layout.addWidget(note, 3, 0, 1, 2)
@@ -10067,6 +10919,19 @@ class WSICropTileMergeGUI(QMainWindow):
         layout.addLayout(main, 1)
         return page
 
+    def open_brightness_contrast_dialog(self):
+        if self.preview_path is None or self.preview_arr is None:
+            QMessageBox.warning(self, "No image", "Load an image in Image Preview first.")
+            return
+        if self.preview_brightness_dialog is None:
+            self.preview_brightness_dialog = QuPathBrightnessContrastDialog(self, self)
+        # Saturation belongs exclusively to the popup. Keep its last popup value
+        # rather than coupling it to permanent left-panel controls.
+        self.preview_brightness_dialog.refresh_from_owner()
+        self.preview_brightness_dialog.show()
+        self.preview_brightness_dialog.raise_()
+        self.preview_brightness_dialog.activateWindow()
+
     def load_preview_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select image to preview", "", _image_file_filter())
         if not path:
@@ -10087,6 +10952,10 @@ class WSICropTileMergeGUI(QMainWindow):
                 viewport_size=(max(640, self.preview_image_label.width()), max(420, self.preview_image_label.height())),
                 max_side=900,
             )
+            # Stable whole-image histogram/reference: calculated once on load and
+            # never replaced by the current zoomed ROI.
+            self.preview_display_reference_arr = np.array(self.preview_arr, copy=True)
+            self.preview_display_reference_axes = self.preview_axes
             full_dims = self.preview_meta.get("full_dims")
             if full_dims:
                 self.preview_full_dims = tuple(full_dims)
@@ -10100,8 +10969,11 @@ class WSICropTileMergeGUI(QMainWindow):
             self.preview_file_label.setText(
                 f"{self.preview_path.name} | axes={self.preview_axes} | reader={self.preview_meta.get('reader')} | full={self.preview_full_dims[0]} × {self.preview_full_dims[1]}"
             )
+            self._reset_global_preview_brightness(refresh=False)
             self.populate_channel_table()
             self.update_channel_preview()
+            if self.preview_brightness_dialog is not None and self.preview_brightness_dialog.isVisible():
+                self.preview_brightness_dialog.refresh_from_owner()
         except Exception as e:
             QMessageBox.critical(self, "Preview load error", str(e))
 
@@ -10186,23 +11058,33 @@ class WSICropTileMergeGUI(QMainWindow):
     def populate_channel_table(self, settings: Optional[List[Dict[str, Any]]] = None):
         if self.preview_arr is None:
             return
-        n_total = _count_display_channels(self.preview_arr, self.preview_axes)
+        ref_arr = getattr(self, "preview_display_reference_arr", None)
+        ref_axes = getattr(self, "preview_display_reference_axes", None) or self.preview_axes
+        source_arr = ref_arr if ref_arr is not None else self.preview_arr
+        n_total = _count_display_channels(source_arr, ref_axes)
         n = min(int(n_total), 6)
         self.channel_table.setRowCount(n)
         try:
             h = self.channel_table.horizontalHeader().height() + n * self.channel_table.verticalHeader().defaultSectionSize() + 8
-            self.channel_table.setMaximumHeight(max(90, min(190, h)))
+            self.channel_table.setMaximumHeight(max(110, min(245, h)))
         except Exception:
             pass
 
-        # For normal RGB images, default mapping should preserve RGB appearance.
-        _, ax2 = _representative_yx_or_yxc(self.preview_arr, self.preview_axes)
-        rgb_sample = (ax2 == "YXS" and np.asarray(self.preview_arr).ndim == 3 and np.asarray(self.preview_arr).shape[-1] in (3, 4))
+        _, ax2 = _representative_yx_or_yxc(source_arr, ref_axes)
+        rgb_sample = (ax2 == "YXS" and np.asarray(source_arr).ndim == 3 and np.asarray(source_arr).shape[-1] in (3, 4))
         rgb_names = ["R", "G", "B", "A"]
         rgb_colors = ["red", "green", "blue", "gray"]
 
         for i in range(n):
             st = settings[i] if settings and i < len(settings) else {}
+            plane = _display_channel_plane(source_arr, ref_axes, i)
+            allowed_min, allowed_max = _infer_channel_allowed_range(plane)
+            # New images always open in Reset state. Auto is an explicit popup
+            # action and is never run automatically on load or when zoom changes.
+            default_min, default_max = allowed_min, allowed_max
+            min_display = float(st.get("min_display", default_min))
+            max_display = float(st.get("max_display", default_max))
+
             chk = QCheckBox()
             chk.setChecked(bool(st.get("visible", True)))
             chk.stateChanged.connect(self.update_channel_preview)
@@ -10220,17 +11102,119 @@ class WSICropTileMergeGUI(QMainWindow):
             color_combo.currentIndexChanged.connect(self.update_channel_preview)
             self.channel_table.setCellWidget(i, 2, color_combo)
 
+            min_spin = _make_display_range_spin(min_display, allowed_min, allowed_max, on_change=self.update_channel_preview)
+            max_spin = _make_display_range_spin(max_display, allowed_min, allowed_max, on_change=self.update_channel_preview)
+            self.channel_table.setCellWidget(i, 3, min_spin)
+            self.channel_table.setCellWidget(i, 4, max_spin)
+
+            brightness_widget = _make_channel_brightness_widget(
+                value=int(st.get("brightness_percent", getattr(self, "preview_global_brightness_percent", 100))),
+                on_change=self.update_channel_preview,
+            )
+            self.channel_table.setCellWidget(i, 5, brightness_widget)
+
+            gamma_spin = QDoubleSpinBox()
+            gamma_spin.setRange(0.1, 5.0)
+            gamma_spin.setDecimals(2)
+            gamma_spin.setSingleStep(0.05)
+            gamma_spin.setValue(float(st.get("gamma", 1.0)))
+            gamma_spin.setToolTip("Viewer-only gamma; 1.0 is neutral. Raw pixels are unchanged.")
+            gamma_spin.valueChanged.connect(self.update_channel_preview)
+            self.channel_table.setCellWidget(i, 6, gamma_spin)
+
+        if getattr(self, "preview_brightness_dialog", None) is not None and self.preview_brightness_dialog.isVisible():
+            self.preview_brightness_dialog.refresh_from_owner()
+
+    def preview_global_brightness_changed(self):
+        """Apply one display-only brightness multiplier to the full sample.
+
+        The main panel intentionally exposes one global brightness slider rather
+        than per-channel brightness controls. The hidden channel settings remain
+        synchronized so all existing preview/tile-popup rendering paths continue
+        to use the same non-destructive display model.
+        """
+        widget = getattr(self, "preview_global_brightness_widget", None)
+        value = _brightness_percent_from_widget(widget, 100)
+        self.preview_global_brightness_percent = int(value)
+        if hasattr(self, "channel_table"):
+            for r in range(self.channel_table.rowCount()):
+                _set_brightness_widget_safely(self.channel_table.cellWidget(r, 5), value)
+        self.schedule_preview_region_update(delay_ms=20)
+        try:
+            self.schedule_preview_tile_popup_update(delay_ms=30)
+        except Exception:
+            pass
+
+    def _reset_global_preview_brightness(self, refresh: bool = False):
+        self.preview_global_brightness_percent = 100
+        widget = getattr(self, "preview_global_brightness_widget", None)
+        if widget is not None:
+            _set_brightness_widget_safely(widget, 100)
+        if hasattr(self, "channel_table"):
+            for r in range(self.channel_table.rowCount()):
+                _set_brightness_widget_safely(self.channel_table.cellWidget(r, 5), 100)
+        if refresh:
+            self.schedule_preview_region_update(delay_ms=20)
+
     def get_channel_settings_from_table(self) -> List[Dict[str, Any]]:
         settings = []
         for r in range(self.channel_table.rowCount()):
             chk = self.channel_table.cellWidget(r, 0)
             color_combo = self.channel_table.cellWidget(r, 2)
+            min_spin = self.channel_table.cellWidget(r, 3)
+            max_spin = self.channel_table.cellWidget(r, 4)
+            brightness_widget = self.channel_table.cellWidget(r, 5)
+            gamma_spin = self.channel_table.cellWidget(r, 6) if self.channel_table.columnCount() > 6 else None
+            lo = float(min_spin.value()) if min_spin else 0.0
+            hi = float(max_spin.value()) if max_spin else 1.0
+            if hi <= lo:
+                hi = lo + 1.0
             settings.append({
                 "channel": r,
                 "visible": chk.isChecked() if chk else True,
                 "color": color_combo.currentText() if color_combo else DEFAULT_CHANNEL_COLORS[r % len(DEFAULT_CHANNEL_COLORS)],
+                "min_display": lo,
+                "max_display": hi,
+                "brightness_percent": _brightness_percent_from_widget(brightness_widget, 100),
+                "gamma": float(gamma_spin.value()) if gamma_spin else 1.0,
             })
         return settings
+
+    def auto_channel_display_ranges(self):
+        source_arr = getattr(self, "preview_display_reference_arr", None)
+        axes = getattr(self, "preview_display_reference_axes", None) or self.preview_axes
+        if source_arr is None or not hasattr(self, "channel_table"):
+            return
+        sat = float(self.preview_brightness_dialog.saturation_spin.value()) if getattr(self, "preview_brightness_dialog", None) is not None else 1.0
+        for r in range(self.channel_table.rowCount()):
+            plane = _display_channel_plane(source_arr, axes, r)
+            lo, hi = _auto_channel_display_range(plane, saturation_percent=sat)
+            _set_spin_safely(self.channel_table.cellWidget(r, 3), lo)
+            _set_spin_safely(self.channel_table.cellWidget(r, 4), hi)
+            _set_brightness_widget_safely(self.channel_table.cellWidget(r, 5), 100)
+            _set_spin_safely(self.channel_table.cellWidget(r, 6), 1.0)
+        self.update_channel_preview()
+        if getattr(self, "preview_brightness_dialog", None) is not None and self.preview_brightness_dialog.isVisible():
+            self.preview_brightness_dialog.refresh_from_owner()
+        self.info_label.setText(f"Display auto-adjusted from the whole-image histogram ({sat:g}% clipped per tail). Raw pixels unchanged.")
+
+    def reset_channel_display_ranges(self):
+        source_arr = getattr(self, "preview_display_reference_arr", None)
+        axes = getattr(self, "preview_display_reference_axes", None) or self.preview_axes
+        if source_arr is None or not hasattr(self, "channel_table"):
+            return
+        for r in range(self.channel_table.rowCount()):
+            plane = _display_channel_plane(source_arr, axes, r)
+            lo, hi = _infer_channel_allowed_range(plane)
+            _set_spin_safely(self.channel_table.cellWidget(r, 3), lo)
+            _set_spin_safely(self.channel_table.cellWidget(r, 4), hi)
+            _set_brightness_widget_safely(self.channel_table.cellWidget(r, 5), 100)
+            _set_spin_safely(self.channel_table.cellWidget(r, 6), 1.0)
+        self._reset_global_preview_brightness(refresh=False)
+        self.update_channel_preview()
+        if getattr(self, "preview_brightness_dialog", None) is not None and self.preview_brightness_dialog.isVisible():
+            self.preview_brightness_dialog.refresh_from_owner()
+        self.info_label.setText("Display reset to the inferred full acquisition range. Raw pixels unchanged.")
 
     def update_channel_preview(self):
         if self.preview_path is None:
@@ -10253,6 +11237,10 @@ class WSICropTileMergeGUI(QMainWindow):
                 self.preview_full_dims = tuple(meta["full_dims"])
             self.preview_last_rgb = render_channel_composite(arr, axes, self.get_channel_settings_from_table())
             self._update_preview_pixmap()
+            if getattr(self, "preview_brightness_dialog", None) is not None and self.preview_brightness_dialog.isVisible():
+                # Do not recompute the histogram from this zoomed ROI; only update
+                # the displayed Min/Max markers using the cached whole-image plane.
+                self.preview_brightness_dialog._load_selected_controls()
             roi = meta.get("roi")
             self.info_label.setText(
                 f"Preview loaded at {int(self.preview_zoom * 100)}% | ROI={roi} | reader={meta.get('reader')}"
@@ -10820,7 +11808,105 @@ class WSICropTileMergeGUI(QMainWindow):
         except Exception as e:
             popup.set_tiles([], f"Tile preview error: {e}")
 
+    def save_preview_tile_capture_raw_ome_tiff(self):
+        """Save the selected tile from each synchronized source with exact source intensities.
+
+        This scientific export is deliberately independent of the preview renderer:
+        - the ROI is read at full source resolution with ``crop_raw``;
+        - original dtype and all stored channels are preserved;
+        - no percentile normalization, RGB colour mapping, brightness adjustment,
+          zoom-level/pyramid resampling, or GeoJSON rasterization is applied;
+        - OME-TIFF physical pixel calibration is inherited when available.
+        """
+        if self.preview_path is None:
+            QMessageBox.warning(self, "No image", "Load an image first.")
+            return
+
+        roi = self._current_preview_tile_roi()
+        if roi is None:
+            QMessageBox.warning(self, "No tile", "Define the tile position first.")
+            return
+
+        x, y, w, h = roi
+        suffix = self._tile_popup_suffix()
+        saved_paths = []
+        saved_details = []
+
+        try:
+            sources = self._get_preview_tile_sources()
+            if not sources:
+                raise RuntimeError("No image sources are loaded.")
+
+            for source in sources:
+                src_path = Path(source.get("path"))
+                backend = source.get("backend")
+                close_after = False
+                if backend is None:
+                    backend = ImageBackend().load(str(src_path))
+                    close_after = True
+
+                try:
+                    # Exact full-resolution scientific crop. Do not use the popup RGB,
+                    # preview pyramid level, or render_channel_composite here.
+                    raw, axes, _ = backend.crop_raw(int(x), int(y), int(w), int(h))
+
+                    base_name = src_path.name
+                    low_name = base_name.lower()
+                    if low_name.endswith(".ome.tiff"):
+                        clean_stem = base_name[:-9]
+                    elif low_name.endswith(".ome.tif"):
+                        clean_stem = base_name[:-8]
+                    else:
+                        clean_stem = src_path.stem
+
+                    out_path = src_path.parent / (
+                        f"{clean_stem}_tile_x{x}_y{y}_s{w}_{suffix}_raw.ome.tif"
+                    )
+                    i = 2
+                    while out_path.exists():
+                        out_path = src_path.parent / (
+                            f"{clean_stem}_tile_x{x}_y{y}_s{w}_{suffix}_raw_{i}.ome.tif"
+                        )
+                        i += 1
+
+                    save_multichannel_image(
+                        out_path,
+                        raw,
+                        axes=axes,
+                        write_ome=True,
+                        lossless=True,
+                        source_resolution=backend.source_resolution,
+                        source_mpp=backend.source_mpp,
+                        image_name=out_path.stem,
+                        pixel_scale=1.0,
+                    )
+                    saved_paths.append(str(out_path))
+                    saved_details.append(
+                        f"{out_path.name}: shape={tuple(raw.shape)}, axes={axes or 'unknown'}, "
+                        f"dtype={raw.dtype}, mpp={_format_mpp_text(backend.source_mpp)}"
+                    )
+                finally:
+                    if close_after:
+                        backend.close()
+
+            self.info_label.setText(
+                f"Saved {len(saved_paths)} raw OME-TIFF tile file(s) with original intensities."
+            )
+            QMessageBox.information(
+                self,
+                "Raw tile(s) saved",
+                "Saved scientific OME-TIFF tile file(s). No display normalization or overlay was applied.\n\n"
+                + "\n".join(saved_details[:20]),
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Raw tile export error", str(e))
+
     def save_preview_tile_capture_png(self):
+        """Save the current colour-mapped 8-bit display view as PNG.
+
+        This is intentionally a presentation export, not a quantitative scientific
+        export. Use ``save_preview_tile_capture_raw_ome_tiff`` for original values.
+        """
         if self.preview_path is None:
             QMessageBox.warning(self, "No image", "Load an image first.")
             return
@@ -10838,8 +11924,13 @@ class WSICropTileMergeGUI(QMainWindow):
                     i += 1
                 save_preview_png(out_path, item.get("rgb"))
                 saved_paths.append(str(out_path))
-            self.info_label.setText(f"Saved {len(saved_paths)} tile PNG file(s).")
-            QMessageBox.information(self, "Tile(s) saved", "Saved tile PNG file(s):\n" + "\n".join(saved_paths[:20]))
+            self.info_label.setText(f"Saved {len(saved_paths)} display PNG file(s) (8-bit visualization).")
+            QMessageBox.information(
+                self,
+                "Display tile(s) saved",
+                "Saved 8-bit display PNG file(s). These contain the visual colour mapping/contrast, "
+                "not the original quantitative intensities.\n\n" + "\n".join(saved_paths[:20]),
+            )
         except Exception as e:
             QMessageBox.critical(self, "Tile capture error", str(e))
 
