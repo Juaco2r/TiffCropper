@@ -1,6 +1,6 @@
 @echo off
 echo ===============================
-echo Building TiffCropper EXE
+echo Building PathoImage Toolkit
 echo ===============================
 
 REM Activate venv
@@ -15,7 +15,7 @@ if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 
 REM Build using spec file
-pyinstaller --clean --noconfirm TiffCropper.spec
+pyinstaller --clean --noconfirm PathoImageToolkit.spec
 if errorlevel 1 (
     echo ===============================
     echo BUILD FAILED

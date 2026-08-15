@@ -1,14 +1,14 @@
-# TiffCropper
+# PathoImage Toolkit
 
 ### WSI Crop, Tile and Merge Tool for Digital Pathology Images
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20316535.svg)](https://doi.org/10.5281/zenodo.20316535)
 
-TiffCropper is a standalone application for working with large digital pathology and microscopy images. It supports high-resolution ROI cropping, fixed-size tiling, row/column-based image division, and reconstruction of tiled images.
+PathoImage Toolkit is a standalone application for working with large digital pathology and microscopy images. It supports high-resolution ROI cropping, fixed-size tiling, row/column-based image division, and reconstruction of tiled images.
 
 The Windows release is designed to run without a separate Python installation. Linux and macOS artifacts may also be generated through the GitHub Actions build workflow.
 
-![TiffCropper main interface](assets/screenshots/WSICropper.png)
+![PathoImage Toolkit main interface](assets/screenshots/WSICropper.png)
 
 ---
 
@@ -98,9 +98,9 @@ On Windows, unsigned executables downloaded from GitHub may trigger a security w
 1. Download the release artifact for your operating system.
 2. Extract the archive.
 3. Launch the application:
-   - Windows: run `TiffCropper.exe`
-   - Linux: run the `TiffCropper` executable inside the extracted folder
-   - macOS: open `TiffCropper.app`, if provided
+   - Windows: run `PathoImageToolkit.exe`
+   - Linux: run the `PathoImage Toolkit` executable inside the extracted folder
+   - macOS: open `PathoImageToolkit.app`, if provided
 4. Select a mode from the top menu:
    - `Crop`
    - `Tiles`
@@ -184,7 +184,7 @@ Columns use letters (`A`, `B`, `C`, ...), rows use numbers (`1`, `2`, `3`, ...).
 
 ### Divide image by rows/columns
 
-In addition to fixed square tiles, TiffCropper can divide an image into a user-defined number of rows and columns.
+In addition to fixed square tiles, PathoImage Toolkit can divide an image into a user-defined number of rows and columns.
 
 This mode:
 
@@ -216,7 +216,7 @@ Merge mode reconstructs a tiled image.
 
 ### Auto mode
 
-Use auto mode when tiles follow the TiffCropper naming convention:
+Use auto mode when tiles follow the PathoImage Toolkit naming convention:
 
 ```text
 ImageName_A1.tif
@@ -271,7 +271,7 @@ Merged TIFF outputs reuse calibration metadata from the first tile when availabl
 
 ## Performance Notes
 
-TiffCropper is designed for large WSI workflows.
+PathoImage Toolkit is designed for large WSI workflows.
 
 The application uses:
 
@@ -310,8 +310,8 @@ This helps track successful and failed images during large batch jobs.
 Clone the repository:
 
 ```bash
-git clone https://github.com/Juaco2r/TiffCropper.git
-cd TiffCropper
+git clone https://github.com/Juaco2r/PathoImage-Toolkit.git
+cd PathoImage-Toolkit
 ```
 
 Create and activate a virtual environment:
@@ -342,13 +342,13 @@ Run the app:
 ### Windows
 
 ```bat
-python src\tiffcropper\app.py
+python src\pathoimage_toolkit\app.py
 ```
 
 ### Linux / macOS
 
 ```bash
-python src/tiffcropper/app.py
+python src/pathoimage_toolkit/app.py
 ```
 
 ---
@@ -367,13 +367,13 @@ build_windows.bat
 The executable will be created at:
 
 ```text
-dist\TiffCropper.exe
+dist\PathoImageToolkit.exe
 ```
 
 Alternative using the spec file:
 
 ```bat
-pyinstaller --noconfirm --clean TiffCropper.spec
+pyinstaller --noconfirm --clean PathoImageToolkit.spec
 ```
 
 The build script/spec bundles required dependencies, including OpenSlide support and compiled imagecodecs components where configured.
@@ -397,9 +397,9 @@ v*
 Artifacts are uploaded from GitHub Actions as compressed files such as:
 
 ```text
-TiffCropper-Windows.zip
-TiffCropper-Linux.tar.gz
-TiffCropper-macOS.zip
+PathoImageToolkit-Windows.zip
+PathoImageToolkit-Linux.tar.gz
+PathoImageToolkit-macOS.zip
 ```
 
 ---
@@ -409,13 +409,13 @@ TiffCropper-macOS.zip
 ```text
 requirements.txt
 build_windows.bat
-TiffCropper.spec
+PathoImageToolkit.spec
 README.md
 LICENSE
 CITATION.cff
 THIRD_PARTY_NOTICES.md
-src/tiffcropper/app.py
-assets/icon/cropper.ico
+src/pathoimage_toolkit/app.py
+assets/icon/pathoimage.ico
 assets/screenshots/
 .github/workflows/build-release.yml
 ```

@@ -1,4 +1,4 @@
-# TiffCropper Protocol
+# PathoImage Toolkit Protocol
 Version: 0.1.0  
 Author: Jose Rodriguez-Rojas  
 License: MIT  
@@ -8,7 +8,7 @@ Last updated: 2026
 
 # 1. Overview
 
-TiffCropper is a standalone Windows application designed for digital pathology and microscopy workflows to extract high-resolution Regions of Interest (ROIs) from large Whole Slide Images (WSI).
+PathoImage Toolkit is a standalone Windows application designed for digital pathology and microscopy workflows to extract high-resolution Regions of Interest (ROIs) from large Whole Slide Images (WSI).
 
 Supported input formats:
 

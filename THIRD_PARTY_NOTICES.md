@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-TiffCropper depends on the following third-party libraries:
+PathoImage Toolkit depends on the following third-party libraries:
 
 ## Core Python Libraries
 

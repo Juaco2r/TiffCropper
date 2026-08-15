@@ -34,15 +34,15 @@ from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QIcon, Q
 # App metadata
 # ============================================================
 
-APP_NAME = "TiffCropper"
-APP_VERSION = "1.3"
-APP_TITLE = "PathoImage Toolkit: WSI, IF, OME-TIFF and LIF Image Utility"
-APP_DOI = "10.5281/zenodo.20316535"
-APP_GITHUB = "https://github.com/Juaco2r/TiffCropper"
+APP_NAME = "PathoImage Toolkit"
+APP_VERSION = "2.0.0"
+APP_TITLE = "PathoImage Toolkit: Digital Pathology and Microscopy Image Utility"
+APP_DOI = ""
+APP_GITHUB = "https://github.com/Juaco2r/PathoImage-Toolkit"
 APP_AUTHOR = "José Rodriguez-Rojas"
 APP_YEAR = "2026"
 APP_LICENSE = "MIT License"
-APP_ICON_PATH = "assets/icon/cropper.ico"
+APP_ICON_PATH = "assets/icon/pathoimage.ico"
 
 
 def resource_path(relative_path):
@@ -59,8 +59,8 @@ def resource_path(relative_path):
     return str(base_path / relative_path)
 APP_CITATION = (
     f"Rodriguez-Rojas J. {APP_TITLE}. "
-    f"Version {APP_VERSION}. Zenodo; {APP_YEAR}. "
-    f"doi:{APP_DOI}"
+    f"Version {APP_VERSION}. {APP_YEAR}."
+    + (f" doi:{APP_DOI}" if APP_DOI else " Zenodo DOI pending.")
 )
 
 
@@ -1298,7 +1298,7 @@ def _read_tiff_series_via_temporary_memmap(series, axes: str, roi: Tuple[int, in
     shape = tuple(getattr(series, "shape", ()) or ())
     dtype = np.dtype(getattr(series, "dtype", np.uint8))
     estimated_bytes = _safe_int_product(shape) * dtype.itemsize if shape else 0
-    cache_dir = Path(tempfile.gettempdir()) / "tiffcropper_preview_cache"
+    cache_dir = Path(tempfile.gettempdir()) / "pathoimage_toolkit_preview_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     try:
         free_bytes = shutil.disk_usage(str(cache_dir)).free
@@ -2702,7 +2702,7 @@ def save_geojson_annotations(path: str, annotations: List[Dict[str, Any]], image
                 "name": cls,
                 "colorRGB": _qcolor_to_qupath_color_rgb(color),
             },
-            "source": props.get("source", "TiffCropper manual annotation"),
+            "source": props.get("source", "PathoImage Toolkit manual annotation"),
         })
         feature_id = ann.get("feature_id", ann.get("id", f"annotation_{i + 1:04d}"))
         features.append({
@@ -4887,7 +4887,7 @@ class ImageBackend:
         dtype = np.dtype(getattr(series, "dtype", np.uint8))
         estimated_bytes = _safe_int_product(shape) * dtype.itemsize if shape else 0
 
-        cache_dir = Path(tempfile.gettempdir()) / "tiffcropper_preview_cache"
+        cache_dir = Path(tempfile.gettempdir()) / "pathoimage_toolkit_preview_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         try:
             free_bytes = shutil.disk_usage(str(cache_dir)).free
@@ -5482,7 +5482,7 @@ def _write_pyramidal_tiff(output_path: Path, arr, axes: str, write_ome: bool,
     level_count = _effective_pyramid_levels(arr.shape, axes, requested_levels)
     compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="tiffcropper_pyramid_")) if low_memory_levels and level_count > 1 else None
+    temp_dir = Path(tempfile.mkdtemp(prefix="pathoimage_toolkit_pyramid_")) if low_memory_levels and level_count > 1 else None
     current = arr
     current_temp = None
     try:
@@ -5717,7 +5717,7 @@ def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: 
             mpp_x_um = None
             mpp_y_um = None
 
-    temp_dir = tempfile.mkdtemp(prefix="tiffcropper_rgb_crop_")
+    temp_dir = tempfile.mkdtemp(prefix="pathoimage_toolkit_rgb_crop_")
     temp_path = Path(temp_dir) / "rgb_crop_memmap.npy"
     mm = None
     try:
@@ -6321,7 +6321,7 @@ def _tile_bulk_job(cancel_event, progress_cb, message_cb, image_paths, params, l
                     })
                 progress_cb(done, len(image_paths))
     log_base = image_paths[0].parent if image_paths else Path.cwd()
-    log_path = log_base / f"TiffCropper_batch_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    log_path = log_base / f"PathoImageToolkit_batch_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     fieldnames = ["timestamp", "operation", "status", "image", "reader", "output_folder", "tiles_expected", "tiles_written", "message"]
     with open(log_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -6374,7 +6374,7 @@ def _downsample_bulk_job(cancel_event, progress_cb, message_cb, image_paths, out
 
     log_dir = out_dir or (paths[0].parent if paths else Path.cwd())
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"TiffCropper_downsample_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    log_path = log_dir / f"PathoImageToolkit_downsample_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     with open(log_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["input", "output", "status", "message"])
         writer.writeheader()
@@ -9930,7 +9930,7 @@ class WSICropTileMergeGUI(QMainWindow):
         output_folder = Path(output_folder)
         output_folder.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = output_folder / f"TiffCropper_batch_log_{stamp}.csv"
+        log_path = output_folder / f"PathoImageToolkit_batch_log_{stamp}.csv"
         fieldnames = [
             "timestamp", "operation", "status", "image", "reader",
             "output_folder", "tiles_expected", "tiles_written", "message"
@@ -9990,6 +9990,11 @@ class WSICropTileMergeGUI(QMainWindow):
 
     def _help_about_html(self):
         supported = ", ".join(SUPPORTED_EXTENSIONS)
+        doi_html = (
+            f'{doi_html}'
+            if APP_DOI
+            else "<b>DOI:</b> Pending Zenodo DOI<br>"
+        )
         return f"""
         <html>
         <body style="font-family: Arial, sans-serif; font-size: 10pt;">
@@ -9997,7 +10002,7 @@ class WSICropTileMergeGUI(QMainWindow):
           <p><b>{APP_TITLE}</b></p>
 
           <p>
-            TiffCropper is a standalone Windows application for cropping, tiling,
+            PathoImage Toolkit is a standalone application for cropping, tiling,
             and reconstructing large digital pathology and microscopy images.
           </p>
 
@@ -10036,7 +10041,7 @@ class WSICropTileMergeGUI(QMainWindow):
 
           <h3>Performance and logs</h3>
           <p>
-            For repeated WSI tiling, TiffCropper keeps OpenSlide and TIFF/zarr readers
+            For repeated WSI tiling, PathoImage Toolkit keeps OpenSlide and TIFF/zarr readers
             open during each image job to reduce repeated file-opening overhead. Batch
             tiling also writes a CSV log with status, expected tile counts, written tile
             counts, output folders, and error messages when failures occur.
@@ -10046,7 +10051,7 @@ class WSICropTileMergeGUI(QMainWindow):
           <p>{APP_CITATION}</p>
 
           <p>
-            <b>DOI:</b> <a href="https://doi.org/{APP_DOI}">https://doi.org/{APP_DOI}</a><br>
+            {doi_html}
             <b>GitHub:</b> <a href="{APP_GITHUB}">{APP_GITHUB}</a><br>
             <b>License:</b> {APP_LICENSE}<br>
             <b>Author:</b> {APP_AUTHOR}
@@ -11405,7 +11410,7 @@ class WSICropTileMergeGUI(QMainWindow):
             "properties": {
                 "objectType": "annotation",
                 "name": class_name,
-                "source": f"TiffCropper {source}",
+                "source": f"PathoImage Toolkit {source}",
                 "classification": {
                     "name": class_name,
                     "colorRGB": _qcolor_to_qupath_color_rgb(color),
@@ -12059,7 +12064,7 @@ class WSICropTileMergeGUI(QMainWindow):
                 rows.append({"input": str(p), "output": "", "status": "failed", "message": f"{e}\n{traceback.format_exc()}"})
             self.progress.setValue(i)
             QApplication.processEvents()
-        log_path = out_dir / f"TiffCropper_channel_preview_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        log_path = out_dir / f"PathoImageToolkit_channel_preview_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         with open(log_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["input", "output", "status", "message"])
             writer.writeheader()
@@ -13739,7 +13744,7 @@ class WSICropTileMergeGUI(QMainWindow):
         """
         Compute merged canvas size and tile placements.
 
-        When tiles include _X#_Y# coordinate metadata generated by TiffCropper,
+        When tiles include _X#_Y# coordinate metadata generated by PathoImage Toolkit,
         the merge uses those coordinates. This is safer than relying only on
         row/column labels because it handles partial edge tiles and downsampled
         tiles more robustly. If coordinates are missing, it falls back to the

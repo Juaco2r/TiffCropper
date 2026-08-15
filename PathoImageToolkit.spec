@@ -17,7 +17,7 @@ block_cipher = None
 project_root = os.path.abspath(".")
 openslide_path = os.path.join(project_root, "openslide_bin")
 assets_path = os.path.join(project_root, "assets")
-icon_path = os.path.join(assets_path, "icon", "cropper.ico")
+icon_path = os.path.join(assets_path, "icon", "pathoimage.ico")
 
 # ============================================================
 # Collect compiled / package dependencies
@@ -128,7 +128,7 @@ hiddenimports = list(dict.fromkeys(hiddenimports))
 # ============================================================
 
 a = Analysis(
-    ["src/tiffcropper/app.py"],
+    ["src/pathoimage_toolkit/app.py"],
     pathex=[project_root],
     binaries=binaries,
     datas=datas,
@@ -155,7 +155,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="TiffCropper",
+    name="PathoImageToolkit",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

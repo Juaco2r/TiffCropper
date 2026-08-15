@@ -1,5 +1,5 @@
 """
-TiffCropper - Whole Slide Image (WSI) ROI cropping tool.
+PathoImage Toolkit - Whole Slide Image (WSI) ROI cropping tool.
 
 Supports:
 - TIFF

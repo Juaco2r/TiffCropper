@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 type: software
-title: "TiffCropper: WSI Crop, Tile and Merge Tool for Digital Pathology Images"
+title: "PathoImage Toolkit: Digital Pathology and Microscopy Image Utility"
 keywords:
   - digital pathology
   - whole-slide imaging
@@ -15,18 +15,17 @@ keywords:
   - image tiling
   - tile merging
   - Python
-abstract: "TiffCropper is a standalone Windows application for working with large digital pathology and microscopy images. It supports ROI cropping, fixed-size tiling, row/column-based image division, and reconstruction of tiled images, with support for TIFF, pyramidal TIFF, OME-TIFF, SVS, NDPI, MRXS, JPEG and PNG inputs."
+abstract: "PathoImage Toolkit is an open-source desktop application for digital pathology and microscopy image workflows, including image visualization, ROI cropping, tiling, reconstruction, downsampling, multichannel image handling, OME-TIFF support, Leica LIF conversion, metadata preservation, and GeoJSON annotation workflows."
 message: "If you use this software, please cite it as below."
 authors:
   - given-names: José
     family-names: Rodriguez-Rojas
     orcid: "https://orcid.org/0000-0003-4373-5480"
-version: 1.2
+version: "2.0.0"
 date-released: 2026-05-20
-doi: 10.5281/zenodo.20316535
-url: "https://github.com/Juaco2r/TiffCropper"
-repository-code: "https://github.com/Juaco2r/TiffCropper"
-repository-artifact: "https://github.com/Juaco2r/TiffCropper/releases"
+url: "https://github.com/Juaco2r/PathoImage-Toolkit"
+repository-code: "https://github.com/Juaco2r/PathoImage-Toolkit"
+repository-artifact: "https://github.com/Juaco2r/PathoImage-Toolkit/releases"
 license: MIT
 
 preferred-citation:
@@ -35,7 +34,6 @@ preferred-citation:
     - given-names: José
       family-names: Rodriguez-Rojas
       orcid: "https://orcid.org/0000-0003-4373-5480"
-  title: "TiffCropper: WSI Crop, Tile and Merge Tool for Digital Pathology Images"
-  version: 1.2
-  doi: 10.5281/zenodo.20316535
+  title: "PathoImage Toolkit: Digital Pathology and Microscopy Image Utility"
+  version: "2.0.0"
   year: 2026

@@ -1,4 +1,4 @@
-name: Build TiffCropper
+name: Build PathoImage Toolkit
 
 on:
   workflow_dispatch:
@@ -79,7 +79,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          pyinstaller --clean --noconfirm .\TiffCropper.spec
+          pyinstaller --clean --noconfirm .\PathoImageToolkit.spec
 
       - name: Build Linux
         if: runner.os == 'Linux'
@@ -88,14 +88,14 @@ jobs:
             --onedir \
             --console \
             --noupx \
-            --name TiffCropper \
+            --name PathoImageToolkit \
             --collect-all imagecodecs \
             --collect-all numcodecs \
             --collect-all zarr \
             --hidden-import imagecodecs._shared \
             --hidden-import imagecodecs._imcd \
             --add-data "assets:assets" \
-            src/tiffcropper/app.py
+            src/pathoimage_toolkit/app.py
 
       - name: Build macOS
         if: runner.os == 'macOS'
@@ -104,14 +104,14 @@ jobs:
             --onedir \
             --windowed \
             --noupx \
-            --name TiffCropper \
+            --name PathoImageToolkit \
             --collect-all imagecodecs \
             --collect-all numcodecs \
             --collect-all zarr \
             --hidden-import imagecodecs._shared \
             --hidden-import imagecodecs._imcd \
             --add-data "assets:assets" \
-            src/tiffcropper/app.py
+            src/pathoimage_toolkit/app.py
 
       # -----------------------------
       # Packaging
@@ -123,13 +123,13 @@ jobs:
           Write-Host "Listing dist contents:"
           Get-ChildItem -Recurse dist
 
-          if (Test-Path "dist\TiffCropper.exe") {
-            New-Item -ItemType Directory -Path "TiffCropper-Windows" -Force
-            Copy-Item "dist\TiffCropper.exe" "TiffCropper-Windows\TiffCropper.exe"
-            Compress-Archive -Path "TiffCropper-Windows\*" -DestinationPath "TiffCropper-Windows.zip" -Force
+          if (Test-Path "dist\PathoImageToolkit.exe") {
+            New-Item -ItemType Directory -Path "PathoImageToolkit-Windows" -Force
+            Copy-Item "dist\PathoImageToolkit.exe" "PathoImageToolkit-Windows\PathoImageToolkit.exe"
+            Compress-Archive -Path "PathoImageToolkit-Windows\*" -DestinationPath "PathoImageToolkit-Windows.zip" -Force
           }
-          elseif (Test-Path "dist\TiffCropper\TiffCropper.exe") {
-            Compress-Archive -Path "dist\TiffCropper\*" -DestinationPath "TiffCropper-Windows.zip" -Force
+          elseif (Test-Path "dist\PathoImageToolkit\PathoImageToolkit.exe") {
+            Compress-Archive -Path "dist\PathoImageToolkit\*" -DestinationPath "PathoImageToolkit-Windows.zip" -Force
           }
           else {
             Write-Host "Could not find Windows PyInstaller output."
@@ -143,11 +143,11 @@ jobs:
           echo "Listing dist contents:"
           find dist -maxdepth 3 -type f -o -type d
 
-          if [ -d "dist/TiffCropper" ]; then
+          if [ -d "dist/PathoImageToolkit" ]; then
             cd dist
-            tar -czf ../TiffCropper-Linux.tar.gz TiffCropper
+            tar -czf ../PathoImageToolkit-Linux.tar.gz PathoImageToolkit
           else
-            echo "Could not find dist/TiffCropper."
+            echo "Could not find dist/PathoImageToolkit."
             find dist -maxdepth 3 -type f -o -type d
             exit 1
           fi
@@ -158,12 +158,12 @@ jobs:
           echo "Listing dist contents:"
           find dist -maxdepth 3 -type f -o -type d
 
-          if [ -d "dist/TiffCropper.app" ]; then
+          if [ -d "dist/PathoImageToolkit.app" ]; then
             cd dist
-            zip -r ../TiffCropper-macOS.zip TiffCropper.app
-          elif [ -d "dist/TiffCropper" ]; then
+            zip -r ../PathoImageToolkit-macOS.zip PathoImageToolkit.app
+          elif [ -d "dist/PathoImageToolkit" ]; then
             cd dist
-            zip -r ../TiffCropper-macOS.zip TiffCropper
+            zip -r ../PathoImageToolkit-macOS.zip PathoImageToolkit
           else
             echo "Could not find expected macOS output."
             find dist -maxdepth 3 -type f -o -type d
@@ -176,7 +176,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TiffCropper-${{ runner.os }}
+          name: PathoImageToolkit-${{ runner.os }}
           path: |
-            TiffCropper-*.zip
-            TiffCropper-*.tar.gz
+            PathoImageToolkit-*.zip
+            PathoImageToolkit-*.tar.gz
