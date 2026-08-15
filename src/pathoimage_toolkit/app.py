@@ -1,4 +1,4 @@
-
+﻿
 import os
 import sys
 import re
@@ -37,7 +37,7 @@ from PyQt5.QtGui import QFont, QPixmap, QImage, QPainter, QPen, QColor, QIcon, Q
 APP_NAME = "PathoImage Toolkit"
 APP_VERSION = "2.0.0"
 APP_TITLE = "PathoImage Toolkit: Digital Pathology and Microscopy Image Utility"
-APP_DOI = ""
+APP_DOI = "10.5281/zenodo.21956932"
 APP_GITHUB = "https://github.com/Juaco2r/PathoImage-Toolkit"
 APP_AUTHOR = "José Rodriguez-Rojas"
 APP_YEAR = "2026"
@@ -9991,7 +9991,7 @@ class WSICropTileMergeGUI(QMainWindow):
     def _help_about_html(self):
         supported = ", ".join(SUPPORTED_EXTENSIONS)
         doi_html = (
-            f'{doi_html}'
+            f'<b>DOI:</b> <a href="https://doi.org/{APP_DOI}">https://doi.org/{APP_DOI}</a><br>'
             if APP_DOI
             else "<b>DOI:</b> Pending Zenodo DOI<br>"
         )

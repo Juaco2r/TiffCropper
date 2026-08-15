@@ -22,6 +22,7 @@ authors:
     family-names: Rodriguez-Rojas
     orcid: "https://orcid.org/0000-0003-4373-5480"
 version: "2.0.0"
+doi: "10.5281/zenodo.21956932"
 date-released: 2026-05-20
 url: "https://github.com/Juaco2r/PathoImage-Toolkit"
 repository-code: "https://github.com/Juaco2r/PathoImage-Toolkit"
