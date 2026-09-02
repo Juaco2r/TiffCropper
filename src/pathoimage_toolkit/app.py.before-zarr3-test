@@ -1348,54 +1348,6 @@ def _read_tiff_series_via_temporary_memmap(series, axes: str, roi: Tuple[int, in
             pass
 
 
-def _open_tiff_zarr_array(series):
-    """Open a tifffile series as a Zarr array, including pyramidal TIFFs.
-
-    tifffile + Zarr 3 can expose a non-pyramidal series directly as an
-    Array, while a pyramidal series is exposed as a Group whose "0" entry
-    is the full-resolution level. Scientific paths must always use that
-    level and must not silently fall back to a reduced pyramid level.
-    """
-    import zarr
-
-    store = series.aszarr()
-    root = zarr.open(store, mode="r")
-
-    # Non-pyramidal TIFF: the store opens directly as an Array.
-    if hasattr(root, "shape") and hasattr(root, "ndim"):
-        array = root
-    else:
-        # Pyramidal TIFF: select the explicit full-resolution level.
-        try:
-            array = root["0"]
-        except Exception as exc:
-            raise RuntimeError(
-                "TIFF Zarr store opened as a Group but full-resolution "
-                "level '0' could not be accessed."
-            ) from exc
-
-    # Scientific safety checks: the selected array must represent exactly
-    # the tifffile series requested by the caller.
-    expected_shape = tuple(getattr(series, "shape", ()) or ())
-    if expected_shape and tuple(array.shape) != expected_shape:
-        raise RuntimeError(
-            "Zarr level 0 shape does not match TIFF source series: "
-            f"{tuple(array.shape)} != {expected_shape}"
-        )
-
-    expected_dtype = getattr(series, "dtype", None)
-    if expected_dtype is not None:
-        expected_dtype = np.dtype(expected_dtype)
-        actual_dtype = np.dtype(array.dtype)
-        if actual_dtype != expected_dtype:
-            raise RuntimeError(
-                "Zarr level 0 dtype does not match TIFF source series: "
-                f"{actual_dtype} != {expected_dtype}"
-            )
-
-    return array
-
-
 def read_preview_array_from_file(path: str, max_side: int = 1200, allow_full_fallback: bool = False) -> Tuple[np.ndarray, str, Dict[str, Any]]:
     """Read a memory-light representative preview array from RGB, TIFF, or OME-TIFF.
 
@@ -1453,7 +1405,9 @@ def read_preview_array_from_file(path: str, max_side: int = 1200, allow_full_fal
 
             # Preferred path for tiled/compressed OME-TIFF: zarr region stepping.
             try:
-                za = _open_tiff_zarr_array(s)
+                z = s.aszarr()
+                import zarr
+                za = zarr.open(z, mode="r")
                 if axes and len(axes) == za.ndim and "Y" in axes and "X" in axes:
                     y_axis = axes.index("Y")
                     x_axis = axes.index("X")
@@ -1612,7 +1566,9 @@ def _downsample_tiff_raw_lowmem(input_path: Path, output_path: Path, downsample:
                                     image_name=output_path.stem, pixel_scale=downsample)
             return
         try:
-            za = _open_tiff_zarr_array(s)
+            z = s.aszarr()
+            import zarr
+            za = zarr.open(z, mode="r")
         except Exception:
             arr = s.asarray()
             arr, axes = _resize_spatial_array(arr, axes, downsample)
@@ -3915,7 +3871,9 @@ def read_zoom_region_from_file(path: str, center_xy=None, zoom: float = 1.0,
             target_ds = max(1.0, max(float(w), float(h)) / float(max(1, max_side)))
             step = max(1, int(math.ceil(max(w, h) / float(max_side))))
             try:
-                za = _open_tiff_zarr_array(s0)
+                z = s0.aszarr()
+                import zarr
+                za = zarr.open(z, mode="r")
                 if axes and len(axes) == za.ndim and "Y" in axes and "X" in axes:
                     slicer = []
                     kept = []
@@ -4135,7 +4093,8 @@ def _read_tiff_level_region_any(level, level_axes: str, roi, full_w: int, full_h
 
     # Fast path: if the overview can expose zarr chunks, read only the visible part.
     try:
-        lza = _open_tiff_zarr_array(level)
+        import zarr
+        lza = zarr.open(level.aszarr(), mode="r")
         arr, out_axes = _slice_preview_zarr_region(
             lza, level_axes, roi, step=step, level_downsample=level_downsample
         )
@@ -4894,7 +4853,9 @@ class ImageBackend:
 
         if self._zarr_array is None and self._zarr_error is None:
             try:
-                self._zarr_array = _open_tiff_zarr_array(self._tif_series)
+                z = self._tif_series.aszarr()
+                import zarr
+                self._zarr_array = zarr.open(z, mode="r")
                 self._zarr_error = None
             except Exception as e:
                 self._zarr_array = None
